@@ -1115,7 +1115,7 @@
 "流程图": "Fluxograma",
 "流程模板": "Modelos de fluxo",
 "浅色": "Claro",
-"测试验证": "Testes de validação",
+"测试验证": "Testes e verificação",
 "浏览器": "Navegador",
 "浏览器存储空间不足，当前内容仍保留在页面中；移除较大的附件后可以继续保存。": "Espaço de armazenamento do navegador insuficiente; o conteúdo atual continua na página. Remova anexos grandes para continuar salvando.",
 "浏览器存储空间不足，草稿仍保留在当前页面。请移除较大的附件后重试。": "Espaço de armazenamento do navegador insuficiente; o rascunho continua nesta página. Remova anexos maiores e tente novamente.",
@@ -1497,7 +1497,7 @@
 "选择此会话持续讨论的主需求。关联后每轮读取最新内容，会话的可见范围不变。": "Escolha o requisito principal que esta conversa vai discutir continuamente. Depois de vinculado, o conteúdo mais recente é lido a cada rodada e a visibilidade da conversa não muda.",
 "选择项目": "Selecionar projeto",
 "选用 SOP 与角色": "Escolher SOP e papéis",
-"通用后端交付 SOP": "SOP genérico de entrega de backend",
+"通用后端交付 SOP": "SOP de entrega back-end",
 "通用模板不可删除，平台管理员请直接保存修改": "O modelo geral não pode ser excluído; administradores da plataforma, salvem as alterações diretamente",
 "通用模板为只读，请先复制到本项目再修改": "O modelo geral é somente leitura. Copie-o primeiro para este projeto e depois edite",
 "通用模板必须复制到具体项目后才能使用": "O modelo geral só pode ser usado depois de copiado para um projeto específico",
@@ -1622,5 +1622,11 @@
 "；preview/test 这类共享分支才可以直推，基线请走 PR/MR": "; apenas branches compartilhadas como preview/test aceitam push direto; para a base, use PR/MR",
 "；不通过可打回到": "; se reprovado, retorna para ",
 "；分类：": "; categoria: ",
-"；需要处理：": "; precisa de tratamento: "
+"；需要处理：": "; precisa de tratamento: ",
+"通用前端交付 SOP": "SOP de entrega front-end",
+"通用缺陷修复 SOP": "SOP de correção de defeitos",
+"通用产品方案 SOP": "SOP de proposta de produto",
+"开发实现": "Implementação",
+"人工验收": "Aceite manual",
+"平台验收 · 脚本与审批": "Validação da plataforma · script e aprovação"
 }
