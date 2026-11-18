@@ -53,6 +53,7 @@ const patterns = [
   [/(\d+)\s*天前/g, "há $1 dias"],
   [/(\d+(?:\.\d+)?)\s*(毫秒|秒|分钟|小时)/g, (_, n, u) => `${n} ${{ 毫秒: "ms", 秒: "s", 分钟: "min", 小时: "h" }[u]}`],
   [/(\d+)\s*行(?![㐀-鿿])/g, "$1 linhas"],
+  [/(?<=[\x21-\x7e]) 与 (?=[\x21-\x7e])/g, " e "],
   // Search placeholders are built as `搜索${label}` at runtime.
   [/搜索([㐀-鿿]+)/g, (m, term) => (has(term) ? `Pesquisar ${dict[term].toLowerCase()}` : m)],
   [/(\d+(?:\.\d+)?)\s*(次|步|个|台|条|项)(?![㐀-鿿])/g, (_, n, u) => {
