@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -104,6 +105,17 @@ func TestMaterializeMCPDefinitionsWritesAndLinks(t *testing.T) {
 	raw, err := os.ReadFile(link)
 	if err != nil || !strings.Contains(string(raw), `"docs"`) {
 		t.Fatalf("mcp definition not reachable through binding: %s %v", raw, err)
+	}
+}
+
+func TestMCPConfigEntriesStdioWithoutArgsRendersEmptyArray(t *testing.T) {
+	entries, err := mcpConfigEntries([]domain.MCPServerDefinition{{ID: "gate", Command: "bin"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(entries["gate"])
+	if err != nil || !strings.Contains(string(raw), `"args":[]`) {
+		t.Fatalf("entry = %s %v", raw, err)
 	}
 }
 

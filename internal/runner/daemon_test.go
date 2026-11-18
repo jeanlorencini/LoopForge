@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -59,6 +60,35 @@ func TestBindSandboxPrivateHomeUsesContainerPaths(t *testing.T) {
 	}
 	if env["CODEX_API_KEY"] != "secret" {
 		t.Fatal("credential environment was lost")
+	}
+}
+
+func TestBindSandboxPrivateHomeCodexWindowsSandboxConfig(t *testing.T) {
+	cfg := func(workspace string) string {
+		return filepath.Join(workspace, ".agentflow", "private-home", "codex", ".codex", "config.toml")
+	}
+	workspace := t.TempDir()
+	if _, err := bindSandboxPrivateHome(workspace, "local", "codex", nil); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(cfg(workspace))
+	if goruntime.GOOS != "windows" {
+		if err == nil {
+			t.Fatalf("unexpected config.toml: %s", raw)
+		}
+		return
+	}
+	if err != nil || string(raw) != "[windows]\nsandbox = \"unelevated\"\n" {
+		t.Fatalf("config.toml = %q %v", raw, err)
+	}
+	if err := os.WriteFile(cfg(workspace), []byte("custom"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bindSandboxPrivateHome(workspace, "local", "codex", nil); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(cfg(workspace)); string(raw) != "custom" {
+		t.Fatalf("existing config.toml overwritten: %q", raw)
 	}
 }
 

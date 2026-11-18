@@ -254,6 +254,10 @@ func RestoreWorkspaceCheckpointFrom(root string, source io.Reader) error {
 	if limited.N == 0 || compressed.N == 0 {
 		return fmt.Errorf("checkpoint expanded size exceeds limit")
 	}
+	// Windows cannot rename a directory while a handle on it is open.
+	if err = base.Close(); err != nil {
+		return err
+	}
 	return os.Rename(stage, root)
 }
 

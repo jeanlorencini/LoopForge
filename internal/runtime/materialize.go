@@ -466,7 +466,11 @@ func mcpConfigEntries(servers []domain.MCPServerDefinition) (map[string]any, err
 			}
 		} else {
 			entry["command"] = m.Command
-			entry["args"] = m.Args
+			args := m.Args
+			if args == nil {
+				args = []string{} // Claude Code ignores servers whose args is null
+			}
+			entry["args"] = args
 			if cwd := MCPRuntimeWorkingDirectory(m); cwd != "" {
 				entry["cwd"] = cwd
 			}

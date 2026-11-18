@@ -46,6 +46,14 @@ func TestCodexMCPServerArgsMinimalStdio(t *testing.T) {
 	}
 }
 
+func TestCodexMCPServerArgsAutoApprovesOnlyGate(t *testing.T) {
+	got := codexMCPServerArgs(domain.MCPServerDefinition{ID: gateMCPServerID, Command: "gate"})
+	want := []string{"-c", `mcp_servers.agentflow-gate.command="gate"`, "-c", `mcp_servers.agentflow-gate.default_tools_approval_mode="approve"`}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %q\nwant %q", got, want)
+	}
+}
+
 func TestCodexConfigArgsAppendsEachMCPServer(t *testing.T) {
 	servers := []domain.MCPServerDefinition{
 		{ID: "docs", Transport: "http", URL: "https://mcp.example/x"},

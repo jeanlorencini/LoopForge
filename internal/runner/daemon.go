@@ -1034,6 +1034,20 @@ func bindSandboxPrivateHome(workspace, driver, provider string, env map[string]s
 		if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 			return nil, err
 		}
+		if goruntime.GOOS == "windows" && !strings.EqualFold(driver, "docker") {
+			// An empty CODEX_HOME has no windows.sandbox, so codex-cli on Windows
+			// treats workspace-write as read-only.
+			cfg, err := os.OpenFile(filepath.Join(home, ".codex", "config.toml"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if err == nil {
+				_, err = cfg.WriteString("[windows]\nsandbox = \"unelevated\"\n")
+				if cerr := cfg.Close(); err == nil {
+					err = cerr
+				}
+			}
+			if err != nil && !errors.Is(err, os.ErrExist) {
+				return nil, err
+			}
+		}
 		env["CODEX_HOME"] = filepath.ToSlash(filepath.Join(env["HOME"], ".codex"))
 	case "claude-code":
 		if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
