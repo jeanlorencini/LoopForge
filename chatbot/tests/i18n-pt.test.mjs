@@ -18,6 +18,8 @@ describe("chat pt-BR overlay", () => {
     const out = translate("当前会话执行机器：jean-win11。会话已绑定，后续运行始终使用此机器。");
     expect(out).toContain("jean-win11");
     expect(out).not.toMatch(HAN);
+    expect(translate("7秒")).toBe("7 s");
+    expect(translate(" · 输出 38/0 行")).not.toMatch(HAN);
     expect(translate("搜索项目")).toBe(`Pesquisar ${dict["项目"].toLowerCase()}`);
     expect(translate("Key 只能在创建它的站点使用：当前选择国际站（codebuddy.ai）。")).not.toMatch(HAN);
   });
