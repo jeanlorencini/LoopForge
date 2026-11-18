@@ -51,6 +51,8 @@ const patterns = [
   [/(\d+)\s*分钟前/g, "há $1 min"],
   [/(\d+)\s*小时前/g, "há $1 h"],
   [/(\d+)\s*天前/g, "há $1 dias"],
+  // Search placeholders are built as `搜索${label}` at runtime.
+  [/搜索([㐀-鿿]+)/g, (m, term) => (has(term) ? `Pesquisar ${dict[term].toLowerCase()}` : m)],
   [/(\d+(?:\.\d+)?)\s*(次|步|个|台|条|项)(?![㐀-鿿])/g, (_, n, u) => {
     const word = UNITS[u][Number(n) === 1 ? 0 : 1];
     return word ? `${n} ${word}` : n;
@@ -72,6 +74,8 @@ export function translate(text) {
     for (const [re, rep] of patterns) out = out.replace(re, rep);
     if (fragmentRE) out = out.replace(fragmentRE, (m) => dict[m]);
     if (sentenceRE && HAN.test(out)) out = out.replace(sentenceRE, (m) => dict[m]);
+    // A sentence swap can free a neighbouring fragment, e.g. a Chinese dynamic value.
+    if (fragmentRE && HAN.test(out)) out = out.replace(fragmentRE, (m) => dict[m]);
   }
   if (out !== text) {
     for (const [re, rep] of punct) out = out.replace(re, rep);
