@@ -181,9 +181,11 @@ describe("App", () => {
     // With no project the picker is highlighted so newcomers notice it.
     expect(screen.getByLabelText("选择项目")).toHaveClass("is-unset");
     await user.click(screen.getByText("接入测试环境"));
-    expect(screen.getByRole("textbox").value).toMatch(/^带我一步步接入测试环境/);
+    // Starter prompts go into the composer in pt-BR (i18n-pt.js localize).
+    expect(screen.getByRole("textbox").value).toMatch(/^Guie-me passo a passo/);
     await user.click(screen.getByText("选用 SOP 与角色"));
-    expect(screen.getByRole("textbox").value).toMatch(/产品、前端、后端交付 SOP/);
+    expect(screen.getByRole("textbox").value).toMatch(/^Vou escrever um requisito/);
+    expect(screen.getByRole("textbox").value).not.toMatch(/[一-鿿]/);
   });
 
   test("questions and replies show when they were sent, and the header switches project", async () => {

@@ -1,4 +1,4 @@
-import "./i18n-pt.js";
+import { enabled as chatPt, startChatTranslation } from "./i18n-pt.js";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
@@ -30,6 +30,7 @@ class Boundary extends React.Component {
     );
   }
 }
+if (chatPt()) startChatTranslation();
 createRoot(document.getElementById("root")).render(
   <Boundary>
     <App />

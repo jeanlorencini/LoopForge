@@ -5,7 +5,7 @@
 // Set localStorage "loopforge.chat.lang" to "zh" to turn it off.
 import dict from "./i18n-pt-dict.json";
 
-function enabled() {
+export function enabled() {
   try {
     return localStorage.getItem("loopforge.chat.lang") !== "zh";
   } catch {
@@ -88,6 +88,9 @@ export function translate(text) {
   return out;
 }
 
+// For text the app writes into the composer, which the overlay never rewrites.
+export const localize = (text) => (enabled() ? translate(text) : text);
+
 function skipped(el) {
   return !el || SKIP.has(el.tagName) || (el.closest && el.closest(SKIP_SEL));
 }
@@ -157,5 +160,3 @@ export function startChatTranslation() {
   window.alert = (message) => nativeAlert(translate(String(message ?? "")));
   window.prompt = (message, value) => nativePrompt(translate(String(message ?? "")), value);
 }
-
-if (typeof document !== "undefined" && enabled()) startChatTranslation();

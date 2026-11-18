@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import dict from "../src/i18n-pt-dict.json";
-import { translate } from "../src/i18n-pt.js";
+import { startChatTranslation, translate } from "../src/i18n-pt.js";
+
+startChatTranslation();
 
 const HAN = /[㐀-鿿]/;
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));

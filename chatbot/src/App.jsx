@@ -81,6 +81,7 @@ import QuickAccessWizard from "./QuickAccessWizard";
 import HarnessSelect from "./HarnessSelect";
 import SandboxPicker from "./SandboxPicker";
 import ExecutionMachinePicker from "./ExecutionMachinePicker";
+import { enabled as chatPt, localize } from "./i18n-pt.js";
 import { shouldRevealTitle, titleRevealTiming } from "./title-reveal.js";
 import {
   THEME_KEY,
@@ -481,7 +482,7 @@ export default function App() {
     void chat.selectProject(id);
   }
   function useStarter(prompt) {
-    setText(prompt);
+    setText(localize(prompt));
     setMention(null);
     requestAnimationFrame(() => {
       input.current?.focus();
@@ -1695,7 +1696,9 @@ export default function App() {
                 }
                 onAsk={(item) => {
                   setText(
-                    `运行 ${item.runId} 的「${item.nodeName}」节点${item.kind === "failed" ? "失败了" : "在等待人工确认"}，帮我分析具体卡在哪里、原因是什么、需要谁做什么。`,
+                    chatPt()
+                      ? `O nó "${item.nodeName}" da execução ${item.runId} ${item.kind === "failed" ? "falhou" : "está aguardando aprovação"}. Analise onde travou, qual é a causa e quem precisa fazer o quê.`
+                      : `运行 ${item.runId} 的「${item.nodeName}」节点${item.kind === "failed" ? "失败了" : "在等待人工确认"}，帮我分析具体卡在哪里、原因是什么、需要谁做什么。`,
                   );
                   document
                     .querySelector('textarea[aria-label="消息"]')
