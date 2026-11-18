@@ -870,7 +870,7 @@ func (d *Daemon) executeInvocation(ctx context.Context, task domain.RunnerTask) 
 			return execResult{status: domain.RunnerTaskFailed, errMsg: err.Error()}, nil
 		}
 	}
-	argv, credentialEnv, err := bindInvocationCredentials(inv, prepared.Command.CredentialBindings, argv)
+	argv, credentialEnv, err := bindInvocationCredentials(inv, prepared.Command.CredentialBindings, argv, sandbox != nil && strings.EqualFold(task.Sandbox.Profile.Driver, "docker"))
 	if err != nil {
 		return execResult{status: domain.RunnerTaskFailed, errMsg: err.Error()}, nil
 	}
@@ -1061,7 +1061,7 @@ func bindSandboxPrivateHome(workspace, driver, provider string, env map[string]s
 // bindInvocationCredentials maps the closed credential bindings onto the
 // task process. Local mode leaves the CLI login state untouched; personal
 // mode injects only the selected provider's saved credential.
-func bindInvocationCredentials(inv *domain.RunnerInvocation, bindings []runtime.CredentialBinding, argv []string) ([]string, map[string]string, error) {
+func bindInvocationCredentials(inv *domain.RunnerInvocation, bindings []runtime.CredentialBinding, argv []string, docker bool) ([]string, map[string]string, error) {
 	env := map[string]string{}
 	personal := inv.CredentialSource == domain.RuntimeAuthPersonal
 	for _, binding := range bindings {
@@ -1084,7 +1084,11 @@ func bindInvocationCredentials(inv *domain.RunnerInvocation, bindings []runtime.
 				return nil, nil, errors.New("Codex 个人 API Key 未配置")
 			}
 			env["CODEX_API_KEY"] = key
-			withProvider, err := runtime.CodexUserProviderArgv(argv, inv.CodexBaseURL)
+			codexBaseURL := inv.CodexBaseURL
+			if docker {
+				codexBaseURL = runtime.ContainerBaseURL(codexBaseURL)
+			}
+			withProvider, err := runtime.CodexUserProviderArgv(argv, codexBaseURL)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1101,6 +1105,9 @@ func bindInvocationCredentials(inv *domain.RunnerInvocation, bindings []runtime.
 			baseURL := strings.TrimSpace(inv.ClaudeCodeBaseURL)
 			if baseURL == "" {
 				baseURL = "https://api.anthropic.com"
+			}
+			if docker {
+				baseURL = runtime.ContainerBaseURL(baseURL)
 			}
 			env["ANTHROPIC_BASE_URL"] = baseURL
 		case runtime.BindGit, runtime.BindMCP, runtime.BindAgentCLI:

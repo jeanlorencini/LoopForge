@@ -24,14 +24,14 @@ import (
 func TestBindInvocationCredentials(t *testing.T) {
 	t.Run("local login leaves codex invocation unchanged", func(t *testing.T) {
 		argv := []string{"codex", "exec", "prompt"}
-		gotArgv, env, err := bindInvocationCredentials(&domain.RunnerInvocation{CredentialSource: domain.RuntimeAuthLocal}, []runtime.CredentialBinding{runtime.BindCodex}, argv)
+		gotArgv, env, err := bindInvocationCredentials(&domain.RunnerInvocation{CredentialSource: domain.RuntimeAuthLocal}, []runtime.CredentialBinding{runtime.BindCodex}, argv, false)
 		if err != nil || len(env) != 0 || strings.Join(gotArgv, "|") != strings.Join(argv, "|") {
 			t.Fatalf("argv=%v env=%v err=%v", gotArgv, env, err)
 		}
 	})
 	t.Run("personal codex injects key and provider config", func(t *testing.T) {
 		inv := &domain.RunnerInvocation{CredentialSource: domain.RuntimeAuthPersonal, CodexAPIKey: "codex-secret", CodexBaseURL: "https://gateway.example/v1"}
-		argv, env, err := bindInvocationCredentials(inv, []runtime.CredentialBinding{runtime.BindCodex}, []string{"codex", "exec", "prompt"})
+		argv, env, err := bindInvocationCredentials(inv, []runtime.CredentialBinding{runtime.BindCodex}, []string{"codex", "exec", "prompt"}, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -42,9 +42,21 @@ func TestBindInvocationCredentials(t *testing.T) {
 	})
 	t.Run("personal claude injects key and base URL", func(t *testing.T) {
 		inv := &domain.RunnerInvocation{CredentialSource: domain.RuntimeAuthPersonal, ClaudeCodeAPIKey: "claude-secret", ClaudeCodeBaseURL: "https://claude.example"}
-		_, env, err := bindInvocationCredentials(inv, []runtime.CredentialBinding{runtime.BindClaudeCode}, []string{"claude", "-p", "prompt"})
+		_, env, err := bindInvocationCredentials(inv, []runtime.CredentialBinding{runtime.BindClaudeCode}, []string{"claude", "-p", "prompt"}, false)
 		if err != nil || env["ANTHROPIC_API_KEY"] != "claude-secret" || env["ANTHROPIC_BASE_URL"] != "https://claude.example" {
 			t.Fatalf("env=%v err=%v", env, err)
+		}
+	})
+	t.Run("loopback base URL is rewritten only for docker", func(t *testing.T) {
+		inv := &domain.RunnerInvocation{CredentialSource: domain.RuntimeAuthPersonal, ClaudeCodeAPIKey: "claude-secret", ClaudeCodeBaseURL: "http://127.0.0.1:8317"}
+		bindings := []runtime.CredentialBinding{runtime.BindClaudeCode}
+		_, dockerEnv, err := bindInvocationCredentials(inv, bindings, []string{"claude", "-p", "prompt"}, true)
+		if err != nil || dockerEnv["ANTHROPIC_BASE_URL"] != "http://host.docker.internal:8317" {
+			t.Fatalf("docker env=%v err=%v", dockerEnv, err)
+		}
+		_, hostEnv, err := bindInvocationCredentials(inv, bindings, []string{"claude", "-p", "prompt"}, false)
+		if err != nil || hostEnv["ANTHROPIC_BASE_URL"] != "http://127.0.0.1:8317" {
+			t.Fatalf("host env=%v err=%v", hostEnv, err)
 		}
 	})
 }

@@ -3,11 +3,31 @@ package runtime
 import (
 	"agentflow/internal/observability"
 	"fmt"
+	"net"
 	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+// ContainerBaseURL rewrites a loopback host to host.docker.internal because
+// 127.0.0.1 inside a Docker container is the container itself, not the host proxy.
+func ContainerBaseURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
+		return raw
+	}
+	if port := u.Port(); port != "" {
+		u.Host = net.JoinHostPort("host.docker.internal", port)
+	} else {
+		u.Host = "host.docker.internal"
+	}
+	return u.String()
+}
 
 func upsertEnv(env []string, key, value string) []string {
 	prefix := key + "="
@@ -106,7 +126,11 @@ func bindCommand(sandbox Sandbox, workspace string, command CommandSpec, credent
 			if bound.environment["CODEX_API_KEY"] == "" {
 				return CommandSpec{}, fmt.Errorf("需求责任人未配置 Codex API Key，请在个人配置中配置")
 			}
-			argv, err := CodexUserProviderArgv(bound.Argv, credentials.Codex.BaseURL)
+			codexBaseURL := credentials.Codex.BaseURL
+			if _, ok := unwrapSandbox(sandbox).(*dockerSandbox); ok {
+				codexBaseURL = ContainerBaseURL(codexBaseURL)
+			}
+			argv, err := CodexUserProviderArgv(bound.Argv, codexBaseURL)
 			if err != nil {
 				return CommandSpec{}, err
 			}
@@ -119,6 +143,9 @@ func bindCommand(sandbox Sandbox, workspace string, command CommandSpec, credent
 			baseURL := strings.TrimSpace(credentials.ClaudeCode.BaseURL)
 			if baseURL == "" {
 				baseURL = "https://api.anthropic.com"
+			}
+			if _, ok := unwrapSandbox(sandbox).(*dockerSandbox); ok {
+				baseURL = ContainerBaseURL(baseURL)
 			}
 			bound.environment["ANTHROPIC_BASE_URL"] = baseURL
 		case BindAgentCLI:

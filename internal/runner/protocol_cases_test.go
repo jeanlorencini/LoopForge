@@ -208,7 +208,7 @@ func TestRunnerCredentialArtifactAndRepositoryHelpers(t *testing.T) {
 		{domain.RunnerInvocation{CredentialSource: domain.RuntimeAuthPersonal}, flowruntime.BindClaudeCode, []string{"claude"}, true},
 		{domain.RunnerInvocation{CredentialSource: domain.RuntimeAuthPersonal, ClaudeCodeAPIKey: "k"}, flowruntime.BindClaudeCode, []string{"claude"}, false},
 	} {
-		_, _, err := bindInvocationCredentials(&tc.inv, []flowruntime.CredentialBinding{tc.binding}, tc.argv)
+		_, _, err := bindInvocationCredentials(&tc.inv, []flowruntime.CredentialBinding{tc.binding}, tc.argv, false)
 		if (err != nil) != tc.wantErr {
 			t.Fatalf("binding=%v err=%v wantErr=%v", tc.binding, err, tc.wantErr)
 		}
