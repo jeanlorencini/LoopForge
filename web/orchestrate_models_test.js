@@ -26,6 +26,7 @@ Object.assign(dom.window, {
   AbortController,
   fetch: async (url, options) => {
     if (url === '/api/assistant/models') return {ok: true, json: async () => catalog};
+    if (url === '/api/runners/default') return {ok: true, json: async () => ({runnerId: 'runner-1'})};
     assert.equal(url, '/api/assistant/chat');
     requests.push(JSON.parse(options.body));
     dom.document.querySelectorAll('[data-model-toggle]').forEach(toggle => assert.equal(toggle.disabled, true));
@@ -112,8 +113,10 @@ dom.run(`
   let request = await send();
   assert.equal(request.model, 'codex:gpt-test');
   assert.equal(request.sessionId, '');
+  assert.deepEqual(request.executionTarget, {pool: 'runner', runnerId: 'runner-1'}, 'new chat runs on the default runner');
   request = await send();
   assert.equal(request.sessionId, 'session-1', 'same CLI resumes the conversation');
+  assert.equal(request.executionTarget, undefined, 'resumed chat keeps the target the server pinned');
   assert.equal(request.messages[1].model, 'codex:gpt-test', 'history retains CLI identity');
   pick('codex:gpt-other');
   request = await send();

@@ -977,11 +977,17 @@ async function runAIOrchestrator() {
   const messages = history.messages.concat([{role: 'user', content: aiOrchestratePrompt(goal, canvas, referenced)}]);
   aiAbort = new AbortController();
   try {
+    // A new chat runs on the user's default runner, like the main chat. The server pins the target per session.
+    let executionTarget;
+    if (!history.sessionId) {
+      const def = await fetch('/api/runners/default').then(r => r.ok ? r.json() : {}).catch(() => ({}));
+      if (def.runnerId) executionTarget = {pool: 'runner', runnerId: def.runnerId};
+    }
     const res = await fetch('/api/assistant/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json', 'Accept': 'text/event-stream'},
       signal: aiAbort.signal,
-      body: JSON.stringify({projectId: project, sessionId: history.sessionId, model, approvalMode: 'confirm', messages})
+      body: JSON.stringify({projectId: project, sessionId: history.sessionId, model, approvalMode: 'confirm', executionTarget, messages})
     });
     if (!res.ok) {
       let msg = 'HTTP ' + res.status;
