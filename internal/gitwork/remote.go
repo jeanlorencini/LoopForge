@@ -3,6 +3,7 @@ package gitwork
 import (
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"strings"
 )
 
@@ -84,6 +85,10 @@ func isTransportName(s string) bool {
 func scpHost(s string) (string, bool) {
 	colon := strings.Index(s, ":")
 	if colon < 0 {
+		return "", false
+	}
+	// Git reads a Windows drive path such as C:\repo as local, never as host "C".
+	if filepath.VolumeName(s) != "" {
 		return "", false
 	}
 	if slash := strings.Index(s, "/"); slash >= 0 && slash < colon {

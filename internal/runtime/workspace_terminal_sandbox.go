@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"agentflow/internal/domain"
 )
 
 // TerminalResult describes a terminal response shared with the runner protocol.
@@ -20,6 +22,14 @@ type TerminalResult struct {
 	ID     string `json:"id"`
 	Data   []byte `json:"data,omitempty"`
 	Exited bool   `json:"exited"`
+}
+
+var terminalGitRelays sync.Map
+
+// TerminalGitCredentials contains only the credentials of the terminal's caller.
+type TerminalGitCredentials struct {
+	HTTPS   map[string]domain.GitHTTPExecutionCredential
+	SSHKeys map[string]string
 }
 
 func terminalBaseEnvironment(home string) []string {
@@ -50,10 +60,10 @@ exec "$SHELL" -i
 // sandboxTerminalCommand deliberately supports only concrete platform drivers.
 // An unknown Sandbox must fail closed instead of silently opening a host shell.
 func sandboxTerminalCommand(ctx context.Context, sandbox Sandbox) (*exec.Cmd, string, error) {
-	return sandboxTerminalCommandWithBinding(ctx, sandbox, nil)
+	return sandboxTerminalCommandWithBinding(ctx, sandbox, nil, nil)
 }
 
-func sandboxTerminalCommandWithBinding(ctx context.Context, sandbox Sandbox, bind func(*CommandSpec) error) (*exec.Cmd, string, error) {
+func sandboxTerminalCommandWithBinding(ctx context.Context, sandbox Sandbox, https map[string]domain.GitHTTPExecutionCredential, bind func(*CommandSpec) error) (*exec.Cmd, string, error) {
 	if sandbox == nil {
 		return nil, "", fmt.Errorf("工作区执行环境不可用")
 	}
@@ -88,7 +98,7 @@ func sandboxTerminalCommandWithBinding(ctx context.Context, sandbox Sandbox, bin
 printf '%s\n' "$$" > "$HOME/.terminal-pid" || exit
 ` + terminalShellLaunch
 	}
-	cmd, err := sandboxTerminalCommandBound(ctx, sandbox, command, terminalBaseEnvironment(home), bind)
+	cmd, err := sandboxTerminalCommandBound(ctx, sandbox, command, terminalBaseEnvironment(home), https, bind)
 	if err != nil {
 		_ = removeTerminalHome(home)
 		return nil, "", err
@@ -100,20 +110,31 @@ printf '%s\n' "$$" > "$HOME/.terminal-pid" || exit
 	return cmd, home, nil
 }
 
-func sandboxTerminalCommandBound(ctx context.Context, sandbox Sandbox, command CommandSpec, base []string, bind func(*CommandSpec) error) (*exec.Cmd, error) {
-	// A terminal is user-directed and needs the run's Git binding, never its model
-	// provider keys. Overlay variables are the same explicit sandbox configuration
-	// that SOP commands receive; unrelated server environment is not inherited.
-	if s, ok := sandbox.(*managedSandbox); ok {
-		s.credentialsMu.RLock()
-		credentials := s.credentials
-		s.credentialsMu.RUnlock()
+func sandboxTerminalCommandBound(ctx context.Context, sandbox Sandbox, command CommandSpec, base []string, https map[string]domain.GitHTTPExecutionCredential, bind func(*CommandSpec) error) (*exec.Cmd, error) {
+	// Share the run's environment and Git author defaults. Authentication comes
+	// from the terminal caller, independently of the shared sandbox credentials.
+	credentials := RunCredentials{GitHTTPCredentials: https}
+	managed, isManaged := sandbox.(*managedSandbox)
+	if isManaged {
+		managed.credentialsMu.RLock()
+		credentials.GitUserName = managed.credentials.GitUserName
+		credentials.GitUserEmail = managed.credentials.GitUserEmail
+		managed.credentialsMu.RUnlock()
+		sandbox = managed.Sandbox
+	}
+	if isManaged || len(https) > 0 {
 		command.CredentialBindings = []CredentialBinding{BindGit}
-		bound, err := bindCommand(s.Sandbox, s.workspace, command, credentials)
+		prepared, closeGit, err := prepareRunGitBinding(context.Background(), sandbox, command, credentials)
 		if err != nil {
 			return nil, err
 		}
-		return sandboxTerminalCommandBound(ctx, s.Sandbox, bound, base, bind)
+		credentials.GitHTTPHosts = runGitHosts(credentials)
+		command, err = bindCommand(sandbox, sandbox.Workspace(), prepared, credentials)
+		if err != nil {
+			closeGit()
+			return nil, err
+		}
+		terminalGitRelays.Store(command.environment["AGENTFLOW_TERMINAL_ID"], closeGit)
 	}
 	if bind != nil {
 		if err := bind(&command); err != nil {
@@ -165,7 +186,16 @@ func SandboxEnvironmentIdentity(ctx context.Context, sandbox Sandbox) (string, e
 		if err := s.ensureStarted(ctx); err != nil {
 			return "", err
 		}
-		if err := s.ensureScriptContainer(ctx); err != nil {
+		identity, err := ReadSandboxEnvironmentIdentity(ctx, s)
+		if err == nil || ctx.Err() != nil {
+			return identity, err
+		}
+		// The started flag is a process-local cache. A container stopped or
+		// removed outside this process (daemon restart, prune, manual cleanup)
+		// must be revalidated here, or every later preparation keeps failing.
+		// Restarting or recreating changes the identity, so preparation replays.
+		s.invalidate()
+		if err := s.ensureStarted(ctx); err != nil {
 			return "", err
 		}
 	}
@@ -186,13 +216,6 @@ func ReadSandboxEnvironmentIdentity(ctx context.Context, sandbox Sandbox) (strin
 		}
 		if !strings.HasPrefix(strings.TrimSpace(string(output)), "true|") {
 			return "", fmt.Errorf("workspace execution environment is not running")
-		}
-		companion, companionErr := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.State.Running}}|{{.Id}}|{{.State.StartedAt}}", dockerScriptContainerName(s.name)).CombinedOutput()
-		if companionErr != nil && !dockerObjectGone(string(companion), companionErr) {
-			return "", fmt.Errorf("inspect script environment: %w", companionErr)
-		}
-		if companionErr == nil {
-			output = append(output, companion...)
 		}
 		overlay, err := json.Marshal(s.profile.Environment)
 		if err != nil {
@@ -236,6 +259,9 @@ func filesystemEnvironmentIdentity(workspace, driver string, environment map[str
 // Root-scoped deletion prevents a workspace shell from replacing .agentflow or
 // private-home with a symlink and turning terminal cleanup into a host deletion.
 func removeTerminalHome(home string) error {
+	if closeGit, ok := terminalGitRelays.LoadAndDelete(filepath.Base(home)); ok {
+		closeGit.(func())()
+	}
 	if home == "" {
 		return nil
 	}

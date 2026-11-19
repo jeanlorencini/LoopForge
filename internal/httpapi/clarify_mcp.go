@@ -75,7 +75,7 @@ func clarifyPlatformClaudeModels(user domain.User) []assistantModel {
 	}
 	var out []assistantModel
 	for _, model := range assistantEngineBuiltinModels(assistantEngineClaude) {
-		out = append(out, assistantModel{ID: assistantEngineClaude + ":" + model.ID, Name: model.Name, Family: assistantModelFamily(model.ID), Engine: assistantEngineClaude})
+		out = append(out, assistantModel{ID: assistantEngineClaude + ":" + model.ID, Name: model.Name, Family: assistantModelFamily(model.ID, assistantEngineClaude), Engine: assistantEngineClaude})
 	}
 	return out
 }
@@ -554,7 +554,7 @@ func (h *streamHandlers) clarifyMCPUser(issue domain.Issue, responsible domain.U
 		return responsible
 	}
 	owner, ok := h.repo.User(project.OwnerID)
-	if !ok || strings.TrimSpace(owner.GitToken) == "" {
+	if !ok || len(h.repo.GitHTTPWorkspaceHosts(owner.ID)) == 0 {
 		return responsible
 	}
 	return owner

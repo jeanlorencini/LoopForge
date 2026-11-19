@@ -191,7 +191,7 @@ time.sleep(30)
 	if err := sandbox.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for _, container := range []string{name, dockerScriptContainerName(name)} {
+	for _, container := range []string{name} {
 		if output, err := exec.CommandContext(ctx, "docker", "inspect", container).CombinedOutput(); err == nil || !dockerObjectGone(string(output), err) {
 			t.Fatalf("real Docker test leaked %s: %s: %v", container, output, err)
 		}

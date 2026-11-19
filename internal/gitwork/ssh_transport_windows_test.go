@@ -114,7 +114,7 @@ func TestWindowsGitSSHNativeTransportLongPathsAndIsolation(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			out, err := command(ctx, workspace, "", operation.env, []string{"ls-remote", operation.remote}).CombinedOutput()
+			out, err := command(ctx, workspace, operation.env, []string{"ls-remote", operation.remote}).CombinedOutput()
 			if err != nil {
 				t.Errorf("native Git SSH task: %v %s", err, out)
 			}
@@ -122,7 +122,7 @@ func TestWindowsGitSSHNativeTransportLongPathsAndIsolation(t *testing.T) {
 	}
 	wg.Wait()
 	stopFirst()
-	if out, err := command(ctx, workspace, "", secondEnvironment, []string{"ls-remote", secondRemote}).CombinedOutput(); err != nil {
+	if out, err := command(ctx, workspace, secondEnvironment, []string{"ls-remote", secondRemote}).CombinedOutput(); err != nil {
 		t.Fatalf("stopping one operation disrupted another: %v %s", err, out)
 	}
 	stopSecond()
@@ -243,5 +243,19 @@ func TestWindowsGitSSHRejectsInvalidSocketCookie(t *testing.T) {
 	case <-accepted:
 	case <-time.After(5 * time.Second):
 		t.Fatal("closing agent did not stop its accept loop")
+	}
+}
+
+func TestWindowsDrivePathIsNotSSHReference(t *testing.T) {
+	for _, path := range []string{`C:\Users\dev\remote.git`, `c:/repo/remote.git`} {
+		if IsSSHReference(path) {
+			t.Fatalf("%s is a local drive path, not an SSH address", path)
+		}
+		if ValidateRemoteURL(path, false) == nil {
+			t.Fatalf("%s must need local-path permission", path)
+		}
+	}
+	if !IsSSHReference("git@github.com:org/repo.git") {
+		t.Fatal("scp-style SSH address must still be detected")
 	}
 }

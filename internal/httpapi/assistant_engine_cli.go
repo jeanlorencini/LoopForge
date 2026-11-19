@@ -37,7 +37,7 @@ type assistantCLIInvocation struct {
 
 type assistantEngineInvocationOpts struct {
 	Bin, Root, Config, Prompt, Model, Effort, SessionID, SystemPrompt string
-	Resume, Workspace                                                 bool
+	Resume, Workspace, RunnerLogin                                    bool
 	// ReviewOnly is a one-shot call without MCP servers or session history,
 	// such as a title summary.
 	ReviewOnly bool
@@ -131,6 +131,10 @@ func (e assistantCredentialError) Is(target error) bool {
 	return target == errAssistantCredentialRejected
 }
 
+func assistantRunnerLoginError(engine string) error {
+	return fmt.Errorf("执行机器上的 %s 本机登录态无效或已过期，请检查 Runner 账户的 CLI 登录", assistantEngineLabel(engine))
+}
+
 var assistantAuthFailureRe = regexp.MustCompile(`(?i)\b(401|403)\b|unauthorized|invalid api key|invalid x-api-key|authentication_error|incorrect api key`)
 
 func assistantAuthFailureText(text string) bool {
@@ -205,8 +209,10 @@ func prepareAssistantClaudeInvocation(o assistantEngineInvocationOpts) (assistan
 	argv := []string{o.Bin, "-p", "--verbose", "--output-format", "stream-json", "--include-partial-messages",
 		"--max-turns", nativeAssistantUnlimitedTurns, "--system-prompt-file", systemPath,
 		"--mcp-config", mcpPath, "--strict-mcp-config", "--settings", settingsPath, "--setting-sources", "user",
-		"--permission-mode", "bypassPermissions",
-		"--model", o.Model}
+		"--permission-mode", "bypassPermissions"}
+	if o.Model != "" {
+		argv = append(argv, "--model", o.Model)
+	}
 	if !o.Workspace {
 		argv = append(argv, "--disallowedTools", claudeAssistantDisallowedTools)
 	}
@@ -221,8 +227,9 @@ func prepareAssistantClaudeInvocation(o assistantEngineInvocationOpts) (assistan
 	} else {
 		argv = append(argv, "--session-id", sessionID)
 	}
-	// With no positional prompt, claude -p reads it from stdin.
-	command := runtime.CommandSpec{Argv: argv, Provider: "claude-code", CredentialBindings: []runtime.CredentialBinding{runtime.BindClaudeCode}, Stdin: strings.NewReader(o.Prompt)}
+	// With no positional prompt, claude -p reads it from stdin. Always stdin:
+	// the Windows command line stops at 32K, below runtime.PromptFitsArgv.
+	command := runtime.CommandSpec{Argv: append(argv, "--"),Provider: "claude-code", CredentialBindings: []runtime.CredentialBinding{runtime.BindClaudeCode}, Stdin: strings.NewReader(o.Prompt)}
 	return assistantCLIInvocation{
 		command:     command.WithClaudeBypassAccepted(),
 		credentials: runtime.RunCredentials{ClaudeCode: o.User},

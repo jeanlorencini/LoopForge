@@ -20,11 +20,14 @@ func (p *TerminalPool) HandleSandbox(ctx context.Context, sandbox Sandbox, scope
 	return p.Handle("", scope, req, release)
 }
 
-// HandleSandboxWithGitSSH matches the non-Windows API; Windows has no PTY, so
-// the Git SSH identity is unused and the request is rejected like HandleSandbox.
-func (p *TerminalPool) HandleSandboxWithGitSSH(ctx context.Context, sandbox Sandbox, scope string, req domain.WorkspaceTerminalRequest, release func(), keys map[string]string) (TerminalResult, error) {
+// HandleSandboxWithGit matches the non-Windows API; Windows has no PTY, so
+// the Git credentials are unused and the request is rejected like HandleSandbox.
+func (p *TerminalPool) HandleSandboxWithGit(ctx context.Context, sandbox Sandbox, scope string, req domain.WorkspaceTerminalRequest, release func(), credentials TerminalGitCredentials) (TerminalResult, error) {
 	return p.HandleSandbox(ctx, sandbox, scope, req, release)
 }
+
+// Active reports that Windows never holds an interactive terminal session.
+func (p *TerminalPool) Active() bool { return false }
 
 // CloseScope has no sessions to close because Windows terminal creation is rejected.
 func (p *TerminalPool) CloseScope(scope string) {}

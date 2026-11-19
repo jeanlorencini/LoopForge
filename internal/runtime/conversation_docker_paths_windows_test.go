@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"agentflow/internal/domain"
-	"agentflow/internal/scriptview"
 )
 
 // A copy of this test executable records Docker argv without a daemon or a
@@ -34,16 +33,12 @@ func init() {
 		switch {
 		case strings.Contains(joined, "{{json .}}"):
 			fmt.Println(`{"Id":"fixture-container","Image":"fixture-image","State":{"Running":true,"StartedAt":"now"}}`)
-		case strings.Contains(joined, "{{json .Mounts}}"):
-			fmt.Println("[]")
 		default:
 			fmt.Fprintln(os.Stderr, "Error: No such container")
 			os.Exit(1)
 		}
 	case strings.Contains(joined, "{{.Architecture}}"):
 		fmt.Println("amd64")
-	case containsArg(os.Args, scriptview.ProbeArgument):
-		fmt.Println(scriptview.Version)
 	case strings.Contains(joined, "id -u; id -g"):
 		fmt.Print("0\n0\n")
 	case strings.Contains(joined, "loopforge-cli-setup"):
@@ -122,13 +117,6 @@ func TestWindowsDockerConversationSeparatesHostAndContainerPaths(t *testing.T) {
 	}
 	sandbox := &dockerSandbox{name: "windows-conversation", workspace: workspace,
 		requirements: SandboxRequirements{ConversationRoot: root}, dockerfile: domain.DockerfileDefinition{Content: "FROM fixture"}}
-	masks, err := sandbox.currentAgentMasks()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(masks, []string{"/workspace/AGENTS.md", "/loopforge/conversation/ws/AGENTS.md"}) {
-		t.Fatalf("conversation masks must use Linux execution paths: %v", masks)
-	}
 	if err := sandbox.ensureStarted(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -215,31 +203,6 @@ func TestWindowsDockerConversationAssetsAndApprovalUseExecutionRoot(t *testing.T
 	settings, err := os.ReadFile(filepath.Join(root, "native-settings.json"))
 	if err != nil || !strings.Contains(string(settings), "/loopforge/conversation/native-approval.py") || strings.Contains(string(settings), filepath.ToSlash(root)) {
 		t.Fatalf("approval settings reference host paths: %s: %v", settings, err)
-	}
-}
-
-func TestWindowsDockerScriptHelperSetsContainerExecuteMode(t *testing.T) {
-	log := installWindowsDockerRecorder(t)
-	sandbox := &dockerSandbox{name: "windows-script-mode", workspace: t.TempDir(), started: true}
-	if err := sandbox.ensureScriptContainer(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	copyIndex, startIndex, modeIndex, probeIndex := -1, -1, -1, -1
-	name := dockerScriptContainerName(sandbox.name)
-	for index, call := range readWindowsDockerCalls(t, log) {
-		switch {
-		case call[0] == "cp":
-			copyIndex = index
-		case reflect.DeepEqual(call, []string{"start", name}):
-			startIndex = index
-		case reflect.DeepEqual(call, []string{"exec", "--user", "0:0", name, "chmod", "0755", scriptViewBinary}):
-			modeIndex = index
-		case containsArg(call, scriptview.ProbeArgument):
-			probeIndex = index
-		}
-	}
-	if copyIndex < 0 || startIndex <= copyIndex || modeIndex <= startIndex || probeIndex <= modeIndex {
-		t.Fatalf("Windows helper must be copied, started, chmodded as root, then probed: cp=%d start=%d chmod=%d probe=%d", copyIndex, startIndex, modeIndex, probeIndex)
 	}
 }
 
