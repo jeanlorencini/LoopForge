@@ -73,8 +73,13 @@ const ctx = {
         { id: 'model-a', name: 'Model A', family: 'claude', credits: 'x1.00' },
         { id: 'model-b', name: 'Model B', family: 'glm', credits: 'x0.06' },
         { id: 'codex:gpt-5.5', name: 'GPT-5.5', family: 'gpt', engine: 'codex' },
+        { id: 'claude-code:claude-opus-5-5', name: 'Claude Opus 5.5', family: 'claude', engine: 'claude-code' },
       ],
-      engines: [{ id: 'codebuddy', name: 'CodeBuddy' }, { id: 'codex', name: 'Codex' }],
+      engines: [{ id: 'codebuddy', name: 'CodeBuddy' }, { id: 'codex', name: 'Codex' }, { id: 'claude-code', name: 'Claude Code' }],
+      clarifyModels: [
+        { id: 'claude-code:claude-opus-5-5', name: 'Claude Opus 5.5', family: 'claude', engine: 'claude-code' },
+        { id: 'claude-code:claude-sonnet-5-5', name: 'Claude Sonnet 5.5', family: 'claude', engine: 'claude-code' },
+      ],
     }),
   }),
 };
@@ -100,10 +105,13 @@ vm.runInContext(moduleSource, ctx);
 
   await api.load();
   assert.equal(api.catalog().default, 'model-b');
-  assert.equal(api.catalog().models.length, 3, 'catalog adopts /api/assistant/models');
-  // Issue #228: clarification runs on CodeBuddy only, so CodeBuddy-only
-  // pickers hide other CLIs and a saved "codex:…" id falls back.
+  assert.equal(api.catalog().models.length, 4, 'catalog adopts /api/assistant/models');
+  // Issue #228: CodeBuddy-only pickers hide other CLIs and a saved "codex:…"
+  // id falls back. Clarification also lists Claude Code models.
   assert.deepEqual(api.codeBuddyModels().map(m => m.id), ['model-a', 'model-b']);
+  assert.deepEqual(api.clarifyModels().map(m => m.id), ['model-a', 'model-b', 'claude-code:claude-opus-5-5', 'claude-code:claude-sonnet-5-5']);
+  assert.equal(api.clarifyModel('claude-code:claude-sonnet-5-5'), 'claude-code:claude-sonnet-5-5');
+  assert.equal(api.clarifyModel('codex:gpt-5.5'), 'default');
   assert.equal(api.codeBuddyModel('codex:gpt-5.5'), 'default');
   assert.equal(api.codeBuddyModel(''), 'default');
   assert.equal(api.codeBuddyModel('model-a'), 'model-a');
@@ -121,7 +129,7 @@ vm.runInContext(moduleSource, ctx);
 
   toggle.onclick({ stopPropagation() {} });
   assert.equal(menu.hidden, false, 'clicking 选择模型 must open the menu');
-  assert.equal(menu.children.length, 2, 'menu lists only CodeBuddy models');
+  assert.equal(menu.children.length, 4, 'menu lists CodeBuddy and Claude Code models');
   assert.ok(!menu.children.some(opt => opt.dataset.id.startsWith('codex:')), 'clarify menu hides Codex models');
   assert.ok(menu.children[0].className.includes('is-active'), 'stored model is marked active');
 
@@ -134,5 +142,7 @@ vm.runInContext(moduleSource, ctx);
   // A Codex id saved before this fix must not reach chat-clarify.
   store.set('agentflow.clarifyModel', 'codex:gpt-5.5');
   assert.equal(ctx.selectedClarifyModel(), 'default');
+  store.set('agentflow.clarifyModel', 'claude-code:claude-sonnet-5-5');
+  assert.equal(ctx.selectedClarifyModel(), 'claude-code:claude-sonnet-5-5');
   console.log('assistant models ok');
 })().catch(err => { console.error(err); process.exit(1); });

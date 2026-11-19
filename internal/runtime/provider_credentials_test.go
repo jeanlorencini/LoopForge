@@ -86,3 +86,24 @@ func TestProviderCredentialBindingIsolation(t *testing.T) {
 		t.Fatal("process telemetry leaked provider credentials")
 	}
 }
+
+// A Claude subscription token is bound only when the user has no API key.
+func TestClaudeCodeOAuthTokenBinding(t *testing.T) {
+	command := CommandSpec{Argv: []string{"true"}, Provider: "claude-code", CredentialBindings: []CredentialBinding{BindClaudeCode}}
+	for _, tc := range []struct {
+		name             string
+		cred             ProviderCredential
+		wantKey, wantTok string
+	}{
+		{"token only", ProviderCredential{OAuthToken: "sk-ant-oat01-x"}, "", "sk-ant-oat01-x"},
+		{"key wins", ProviderCredential{APIKey: "user-key", OAuthToken: "sk-ant-oat01-x"}, "user-key", ""},
+	} {
+		bound, err := bindCommand(&localSandbox{workspace: t.TempDir()}, t.TempDir(), command, RunCredentials{ClaudeCode: tc.cred})
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if bound.environment["ANTHROPIC_API_KEY"] != tc.wantKey || bound.environment["CLAUDE_CODE_OAUTH_TOKEN"] != tc.wantTok {
+			t.Fatalf("%s: ANTHROPIC_API_KEY=%q CLAUDE_CODE_OAUTH_TOKEN=%q", tc.name, bound.environment["ANTHROPIC_API_KEY"], bound.environment["CLAUDE_CODE_OAUTH_TOKEN"])
+		}
+	}
+}

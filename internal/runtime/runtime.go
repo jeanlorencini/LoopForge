@@ -52,9 +52,12 @@ type RunCredentials struct {
 }
 
 type ProviderCredential struct {
-	APIKey   string
-	BaseURL  string
-	Protocol string
+	APIKey  string
+	BaseURL string
+	// OAuthToken is a Claude subscription token (claude setup-token). Only
+	// BindClaudeCode reads it, and only when APIKey is empty.
+	OAuthToken string
+	Protocol   string
 	// Models is the user's saved model catalog for an agent CLI; Cursor
 	// resolves folded families from it (CursorModelID).
 	Models []domain.CLIModel

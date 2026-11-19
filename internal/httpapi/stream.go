@@ -475,7 +475,8 @@ func (h *streamHandlers) executeClarify(ctx context.Context, issue domain.Issue,
 	}
 	prompt.WriteString(clarifyRoundBudgetHint(clarifyAssistantRounds(request.History)))
 	prompt.WriteString("\n请基于以上对话继续澄清，只围绕「## 需求」本身，完成后调用 submit_clarification。")
-	cbPath, cbErr := resolveCodeBuddyBin()
+	engine, _ := assistantModelEngine(request.Model)
+	cbPath, cbErr := resolveClarifyBin(ctx, engine)
 	if cbErr != nil {
 		return nil, "", nil, cbErr
 	}
@@ -550,7 +551,7 @@ func (h *streamHandlers) executeClarify(ctx context.Context, issue domain.Issue,
 		sessionID = strings.TrimSpace(issue.Clarification.SessionID)
 	}
 	resume := sessionID != ""
-	if resume && !canResumeClarifySession(homeDir, sessionID, issue.Clarification.SessionUserID, responsible.ID) {
+	if resume && !canResumeClarifySession(homeDir, assistantEngineConfigDir(engine), sessionID, issue.Clarification.SessionUserID, responsible.ID) {
 		emit("thought", map[string]string{"kind": "status", "text": "分析环境已变化，正在结合已有回答重新分析…"})
 		sessionID = ""
 	}
@@ -647,6 +648,11 @@ func (h *streamHandlers) executeClarify(ctx context.Context, issue domain.Issue,
 		CodeBuddy: runtime.CodeBuddyCredential{APIKey: strings.TrimSpace(responsible.CodeBuddyAPIKey), InternetEnvironment: strings.TrimSpace(responsible.CodeBuddyInternetEnvironment)},
 		GitToken:  strings.TrimSpace(h.repo.GitCredential(ctx, responsible.ID)),
 	}
+	if engine == assistantEngineClaude {
+		modelID = strings.TrimSpace(request.Model)
+		// The responsible user's own key wins, as in chat; otherwise the platform's subscription token.
+		credentials.ClaudeCode = runtime.ProviderCredential{APIKey: strings.TrimSpace(responsible.ClaudeCodeAPIKey), BaseURL: strings.TrimSpace(responsible.ClaudeCodeBaseURL), OAuthToken: claudeCodePlatformOAuthToken()}
+	}
 	turnPrompt := userMsg
 	if resume {
 		turnPrompt = clarifyResumeTurnPrompt(issue.Title, request.Message, clarifyAssistantRounds(request.History))
@@ -667,6 +673,15 @@ func (h *streamHandlers) executeClarify(ctx context.Context, issue domain.Issue,
 	emit("open", map[string]any{"repository": repoInfo, "model": modelID, "sessionId": sessionID})
 	emit("thought", map[string]string{"kind": "status", "text": "正在分析需求…"})
 	turnOpts := clarifyTurnOpts{Native: true, MCPConfig: toolFiles.MCPConfig, Settings: toolFiles.Settings}
+	if engine == assistantEngineClaude {
+		claudeMCP := filepath.Join(toolFiles.Dir, "claude-mcp.json")
+		if err := writeClaudeMCPConfig(toolFiles.MCPConfig, claudeMCP); err != nil {
+			return nil, "", repoInfo, err
+		}
+		// Runs before files.Cleanup, which removes the directory only when empty.
+		defer os.Remove(claudeMCP)
+		turnOpts.MCPConfig = claudeMCP
+	}
 	jsonRetries := 0
 	var recoveredParsed any
 	var recoveredRaw string

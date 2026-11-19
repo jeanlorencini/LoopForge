@@ -44,6 +44,9 @@ type assistantModelCatalog struct {
 	SponsoredModels []string `json:"sponsoredModels,omitempty"`
 	// Engines lists the CLIs a signed-in user can switch between.
 	Engines []assistantEngineOption `json:"engines,omitempty"`
+	// ClarifyModels are extra models only requirement clarification offers
+	// (Claude Code on the platform's subscription token).
+	ClarifyModels []assistantModel `json:"clarifyModels,omitempty"`
 }
 
 func prefetchAssistantModels() {}
@@ -225,6 +228,7 @@ func (h *assistantHandlers) models(c *gin.Context) {
 		catalog.Models = append(catalog.Models, assistantEngineModels(c.Request.Context(), user)...)
 		h.saveCursorCatalog(user)
 		catalog.Engines = assistantEngineOptions(user, shared && strings.TrimSpace(user.CodeBuddyAPIKey) == "")
+		catalog.ClarifyModels = clarifyPlatformClaudeModels(user)
 	}
 	c.JSON(200, catalog)
 }

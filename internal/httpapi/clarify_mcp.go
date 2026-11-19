@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -28,17 +29,37 @@ func clarifyAllowedModel(id string) string {
 }
 
 // errClarifyNeedsCodeBuddy is returned when a clarification asks for a model of
-// another CLI: clarification runs on CodeBuddy only, so a "codex:…" id must be
-// refused instead of being swapped for the CodeBuddy default.
-var errClarifyNeedsCodeBuddy = errors.New("需求澄清目前只支持 CodeBuddy 模型，请在模型列表中改选 CodeBuddy 模型")
+// another CLI: clarification runs on CodeBuddy and Claude Code only, so a
+// "codex:…" id must be refused instead of being swapped for the CodeBuddy default.
+var errClarifyNeedsCodeBuddy = errors.New("需求澄清目前只支持 CodeBuddy 和 Claude Code 模型，请在模型列表中改选 CodeBuddy 或 Claude Code 模型")
 
 // clarifyModelEngineError reports whether id names a model of a CLI that
 // requirement clarification cannot run.
 func clarifyModelEngineError(id string) error {
-	if engine, _ := assistantModelEngine(id); engine != assistantEngineCodeBuddy {
+	if engine, _ := assistantModelEngine(id); engine != assistantEngineCodeBuddy && engine != assistantEngineClaude {
 		return errClarifyNeedsCodeBuddy
 	}
 	return nil
+}
+
+// claudeCodePlatformOAuthToken is the platform's Claude subscription token
+// (claude setup-token). Clarification falls back to it when the responsible
+// user has no Claude Code API key; chat never uses it.
+func claudeCodePlatformOAuthToken() string {
+	return strings.TrimSpace(os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"))
+}
+
+// clarifyPlatformClaudeModels lists the built-in Claude Code models that
+// clarification can run on the platform token for a user without a key.
+func clarifyPlatformClaudeModels(user domain.User) []assistantModel {
+	if claudeCodePlatformOAuthToken() == "" || strings.TrimSpace(user.ClaudeCodeAPIKey) != "" {
+		return nil
+	}
+	var out []assistantModel
+	for _, model := range assistantEngineBuiltinModels(assistantEngineClaude) {
+		out = append(out, assistantModel{ID: assistantEngineClaude + ":" + model.ID, Name: model.Name, Family: assistantModelFamily(model.ID), Engine: assistantEngineClaude})
+	}
+	return out
 }
 
 func asStringKeyMap(v any) map[string]any {

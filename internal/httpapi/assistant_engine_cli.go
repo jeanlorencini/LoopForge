@@ -167,24 +167,29 @@ func readAssistantMCPServers(path string) (map[string]map[string]any, error) {
 	return config.MCPServers, nil
 }
 
-func prepareAssistantClaudeInvocation(o assistantEngineInvocationOpts) (assistantCLIInvocation, error) {
-	servers, err := readAssistantMCPServers(o.Config)
+// writeClaudeMCPConfig copies a session MCP config to path for Claude Code.
+func writeClaudeMCPConfig(src, path string) error {
+	servers, err := readAssistantMCPServers(src)
 	if err != nil {
-		return assistantCLIInvocation{}, err
+		return err
 	}
 	// Claude Code rejects CodeBuddy's per-tool defer_loading extension.
 	for _, server := range servers {
 		delete(server, "tools")
 	}
+	mcp, _ := json.Marshal(map[string]any{"mcpServers": servers})
+	return os.WriteFile(path, mcp, 0o600)
+}
+
+func prepareAssistantClaudeInvocation(o assistantEngineInvocationOpts) (assistantCLIInvocation, error) {
 	mcpPath := filepath.Join(o.Root, "claude-mcp.json")
 	settingsPath := filepath.Join(o.Root, "claude-settings.json")
-	mcp, _ := json.Marshal(map[string]any{"mcpServers": servers})
 	settingsDoc := map[string]any{"permissions": map[string]any{"deny": strings.Split(claudeAssistantDisallowedTools, ",")}}
 	if o.Workspace {
 		settingsDoc = map[string]any{}
 	}
 	settings, _ := json.Marshal(settingsDoc)
-	if err := os.WriteFile(mcpPath, mcp, 0o600); err != nil {
+	if err := writeClaudeMCPConfig(o.Config, mcpPath); err != nil {
 		return assistantCLIInvocation{}, err
 	}
 	if err := os.WriteFile(settingsPath, settings, 0o600); err != nil {

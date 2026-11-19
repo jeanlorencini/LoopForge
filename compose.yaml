@@ -48,6 +48,9 @@ services:
       AGENTFLOW_GATE_MCP_BINARY: /app/bin/agentflow-gate-mcp-{os}-{arch}
       # Claude Code is not bundled; it is installed from npm here on first use.
       AGENTFLOW_RUNTIME_CLI_DIR: ${LOOPFORGE_DATA_DIR}/cli
+      # Optional Claude subscription token (claude setup-token). Requirement
+      # clarification uses it for Claude Code models when the user has no key.
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
     command: ["-workspaces", "${LOOPFORGE_DATA_DIR}/workspaces"]
     volumes:
       - platform-data:/data

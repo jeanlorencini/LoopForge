@@ -48,7 +48,7 @@
     return (catalog.engines || []).some(e => e.id === prefix) ? prefix : 'codebuddy';
   }
   function modelMeta(id) {
-    return (catalog.models || []).find(m => m.id === id) || {id: id || DEFAULT_MODEL, family: familyOf(id), name: id || DEFAULT_MODEL};
+    return (catalog.models || []).concat(catalog.clarifyModels || []).find(m => m.id === id) || {id: id || DEFAULT_MODEL, family: familyOf(id), name: id || DEFAULT_MODEL};
   }
   function fillModelIcon(el, family, id) {
     if (!el) return;
@@ -123,8 +123,8 @@
   function renderList(menu, selectedId, onPick) {
     renderOptions(menu, catalog.models || [], selectedId, onPick);
   }
-  // Requirement clarification, Bot replies, run evals and the SOP preview
-  // build run on CodeBuddy only, so their pickers list CodeBuddy models and
+  // Bot replies, run evals and the SOP preview build run on CodeBuddy only
+  // (clarification uses clarifyModels), so their pickers list CodeBuddy models and
   // never offer a "codex:…" id the server would have to refuse.
   function codeBuddyModels() {
     return (catalog.models || []).filter(m => (m.engine || 'codebuddy') === 'codebuddy');
@@ -140,6 +140,21 @@
     if (!value || /^(codex|claude-code):/.test(value) || engineOf(value) !== 'codebuddy') return DEFAULT_MODEL;
     return value;
   }
+  // Requirement clarification also runs on Claude Code: the user's own models
+  // plus clarifyModels, which the platform's Claude subscription serves.
+  function clarifyModels() {
+    const listed = (catalog.models || []).filter(m => ['codebuddy', 'claude-code'].includes(m.engine || 'codebuddy'));
+    const extra = (catalog.clarifyModels || []).filter(m => !listed.some(l => l.id === m.id));
+    return listed.concat(extra);
+  }
+  function renderClarifyList(menu, selectedId, onPick) {
+    renderOptions(menu, clarifyModels(), selectedId, onPick);
+  }
+  function clarifyModel(id) {
+    const value = String(id || '').trim();
+    if (/^claude-code:/.test(value)) return value;
+    return codeBuddyModel(value);
+  }
   async function fetchCatalog() {
     const resp = await fetch('/api/assistant/models', {headers: {Accept: 'application/json'}, credentials: 'same-origin'});
     if (!resp.ok) throw new Error(`模型列表加载失败（${resp.status}）`);
@@ -150,7 +165,7 @@
   function load() {
     if (!loading) {
       loading = fetchCatalog().then(data => {
-        if (data?.models?.length) catalog = {default: data.default || DEFAULT_MODEL, models: data.models, engines: data.engines || []};
+        if (data?.models?.length) catalog = {default: data.default || DEFAULT_MODEL, models: data.models, engines: data.engines || [], clarifyModels: data.clarifyModels || []};
         return catalog;
       }).catch(() => catalog).finally(() => { loading = null; });
     }
@@ -159,12 +174,15 @@
   window.AgentFlowAssistantModels = {
     DEFAULT: DEFAULT_MODEL,
     catalog: () => catalog,
+    clarifyModel,
+    clarifyModels,
     codeBuddyModel,
     codeBuddyModels,
     engineOf,
     load,
     paint,
     paintItem,
+    renderClarifyList,
     renderCodeBuddyList,
     renderList,
     renderOptions

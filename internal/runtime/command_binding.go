@@ -136,6 +136,11 @@ func bindCommand(sandbox Sandbox, workspace string, command CommandSpec, credent
 			}
 			bound.Argv = argv
 		case BindClaudeCode:
+			if token := strings.TrimSpace(credentials.ClaudeCode.OAuthToken); token != "" && strings.TrimSpace(credentials.ClaudeCode.APIKey) == "" {
+				// A subscription token authenticates against Anthropic's own endpoint.
+				bound.environment["CLAUDE_CODE_OAUTH_TOKEN"] = token
+				break
+			}
 			bound.environment["ANTHROPIC_API_KEY"] = strings.TrimSpace(credentials.ClaudeCode.APIKey)
 			if bound.environment["ANTHROPIC_API_KEY"] == "" {
 				return CommandSpec{}, fmt.Errorf("需求责任人未配置 Claude Code API Key，请在个人配置中配置")

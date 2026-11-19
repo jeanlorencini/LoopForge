@@ -132,13 +132,13 @@ func TestCanResumeClarifySessionUsesResponsibleUserHome(t *testing.T) {
 		{"owner mismatch even with file", ownerHome, 13, 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := canResumeClarifySession(tc.home, "old-session", tc.owner, tc.user); got != tc.want {
+			if got := canResumeClarifySession(tc.home, ".codebuddy", "old-session", tc.owner, tc.user); got != tc.want {
 				t.Fatalf("canResume=%v, want %v", got, tc.want)
 			}
 		})
 	}
 	for _, id := range []string{"", "../old-session", "*", "old-session?", ".."} {
-		if canResumeClarifySession(ownerHome, id, 1, 1) {
+		if canResumeClarifySession(ownerHome, ".codebuddy", id, 1, 1) {
 			t.Fatalf("invalid session ID accepted: %q", id)
 		}
 	}

@@ -1,12 +1,15 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -31,14 +34,15 @@ func clarifyCLIHome(userID int64) string {
 
 // Older assessments have no owner metadata. Only resume those when the
 // conversation actually exists inside the current responsible user's HOME.
-func canResumeClarifySession(homeDir, sessionID string, sessionUserID, userID int64) bool {
+// configDir is the CLI's config directory there (.codebuddy or .claude).
+func canResumeClarifySession(homeDir, configDir, sessionID string, sessionUserID, userID int64) bool {
 	if sessionUserID != 0 && sessionUserID != userID {
 		return false
 	}
 	if sessionID == "" || strings.ContainsAny(sessionID, `/\\*?[]`) || sessionID == "." || sessionID == ".." {
 		return false
 	}
-	files, err := filepath.Glob(filepath.Join(homeDir, ".codebuddy", "projects", "*", sessionID+".jsonl"))
+	files, err := filepath.Glob(filepath.Join(homeDir, configDir, "projects", "*", sessionID+".jsonl"))
 	if err != nil {
 		return false
 	}
@@ -215,6 +219,9 @@ func prepareClarifyCommand(bin, model, prompt, runID, sessionID string, resume b
 }
 
 func prepareClarifyCommandWith(opts clarifyCommandOpts) (runtime.CommandSpec, error) {
+	if engine, _ := assistantModelEngine(opts.Model); engine == assistantEngineClaude {
+		return prepareClarifyClaudeCommand(opts)
+	}
 	args := []string{"-p", "--max-turns", "500", "--output-format", "stream-json", "--include-partial-messages"}
 	if strings.TrimSpace(opts.MCPConfig) != "" {
 		args = append(args, "--mcp-config", opts.MCPConfig, "--strict-mcp-config")
@@ -260,6 +267,61 @@ func appendDisallowedTools(argv []string, extra string) []string {
 		}
 	}
 	return append(argv, "--disallowedTools", extra)
+}
+
+var clarifyUUIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// prepareClarifyClaudeCommand runs clarification on Claude Code. Only Read,
+// Grep and Glob are available as built-in tools; MCP tools (submit_clarification,
+// TAPD/工蜂 through the session gateway) are not affected by --tools.
+func prepareClarifyClaudeCommand(opts clarifyCommandOpts) (runtime.CommandSpec, error) {
+	_, model := assistantModelEngine(opts.Model)
+	// Repository .claude settings (hooks) must not load: only the private HOME's user settings.
+	argv := []string{opts.Bin, "-p", "--verbose", "--output-format", "stream-json", "--include-partial-messages",
+		"--max-turns", "500", "--setting-sources", "user", "--permission-mode", "bypassPermissions",
+		"--tools", "Read,Grep,Glob", "--disallowedTools", claudeAssistantDisallowedTools + ",Task,Agent", "--strict-mcp-config"}
+	if strings.TrimSpace(opts.MCPConfig) != "" {
+		argv = append(argv, "--mcp-config", opts.MCPConfig)
+		if strings.TrimSpace(opts.Settings) != "" {
+			argv = append(argv, "--settings", opts.Settings)
+		}
+	}
+	if model != "" && model != "default" {
+		if !assistantValidEngineModel(model) {
+			return runtime.CommandSpec{}, fmt.Errorf("模型 ID 无效")
+		}
+		argv = append(argv, "--model", model)
+	}
+	// Claude Code needs a UUID; a captured one is kept, a platform "af…" ID is mapped.
+	if sid := strings.TrimSpace(opts.SessionID); sid != "" {
+		if !clarifyUUIDRe.MatchString(sid) {
+			sid = assistantClaudeSessionID(sid)
+		}
+		if opts.Resume {
+			argv = append(argv, "--resume", sid)
+		} else {
+			argv = append(argv, "--session-id", sid)
+		}
+	}
+	if opts.SubmitOnly {
+		argv = appendDisallowedTools(argv, "Read,Grep,Glob")
+	}
+	// The prompt goes on stdin: claude -p reads it there when no positional prompt is given.
+	command := runtime.CommandSpec{Argv: argv, Provider: "claude-code", CredentialBindings: []runtime.CredentialBinding{runtime.BindClaudeCode}, PrivateHome: true, Stdin: strings.NewReader(opts.Prompt)}
+	return command.WithClaudeBypassAccepted(), nil
+}
+
+// resolveClarifyBin finds the CLI for a clarification model. Published images
+// do not bundle Claude Code, so a missing claude is installed on first use.
+func resolveClarifyBin(ctx context.Context, engine string) (string, error) {
+	if engine != assistantEngineClaude {
+		return resolveCodeBuddyBin()
+	}
+	bin, err := resolveAssistantEngineBin(engine)
+	if errors.Is(err, errAssistantCLIMissing) {
+		return runtime.EnsureClaudeCode(ctx)
+	}
+	return bin, err
 }
 
 func captureClarifySessionID(line string) string {

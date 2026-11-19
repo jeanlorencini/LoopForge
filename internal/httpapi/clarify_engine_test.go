@@ -6,23 +6,26 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"agentflow/internal/domain"
 	"agentflow/internal/repo"
+	"agentflow/internal/runtime"
 )
 
-// Issue #228: clarification and run evals run on CodeBuddy only. A model of
-// another CLI ("codex:…") must be refused up front, not silently swapped for
-// the CodeBuddy default.
+// Issue #228: clarification runs on CodeBuddy and Claude Code, run evals on
+// CodeBuddy only. A model of another CLI ("codex:…") must be refused up front,
+// not silently swapped for the CodeBuddy default.
 func TestClarifyModelEngineError(t *testing.T) {
-	for _, id := range []string{"", "default", "glm-5.1", "public-model"} {
+	for _, id := range []string{"", "default", "glm-5.1", "public-model", "claude-code:sonnet", "claude-code:claude-opus-5-5"} {
 		if err := clarifyModelEngineError(id); err != nil {
-			t.Fatalf("CodeBuddy model %q refused: %v", id, err)
+			t.Fatalf("model %q refused: %v", id, err)
 		}
 	}
-	for _, id := range []string{"codex:gpt-5.5", "claude-code:sonnet"} {
+	for _, id := range []string{"codex:gpt-5.5"} {
 		if err := clarifyModelEngineError(id); err != errClarifyNeedsCodeBuddy {
 			t.Fatalf("model %q = %v, want errClarifyNeedsCodeBuddy", id, err)
 		}
@@ -70,5 +73,59 @@ func TestRunEvalRefusesOtherCLIModel(t *testing.T) {
 	}
 	if _, busy := f.s.ActiveRunEval(done.ID); busy {
 		t.Fatal("a Codex model must not start a run eval")
+	}
+}
+
+func TestPrepareClarifyClaudeCommand(t *testing.T) {
+	command, err := prepareClarifyCommandWith(clarifyCommandOpts{
+		Bin: "claude", Model: "claude-code:claude-opus-5-5", Prompt: "澄清这条需求", RunID: "clarify-test", SessionID: "af1",
+		Native: true, MCPConfig: "/tmp/claude-mcp.json", Settings: "/tmp/settings.json",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv := command.Argv
+	if command.Provider != "claude-code" || argv[0] != "claude" || command.Stdin == nil || len(command.CredentialBindings) != 1 || command.CredentialBindings[0] != runtime.BindClaudeCode {
+		t.Fatalf("not a claude command: provider=%q bindings=%v argv=%v", command.Provider, command.CredentialBindings, argv)
+	}
+	for flag, want := range map[string]string{
+		"--output-format": "stream-json", "--model": "claude-opus-5-5", "--tools": "Read,Grep,Glob",
+		"--mcp-config": "/tmp/claude-mcp.json", "--settings": "/tmp/settings.json", "--setting-sources": "user",
+		"--session-id": assistantClaudeSessionID("af1"), "--permission-mode": "bypassPermissions",
+	} {
+		if got, _ := argvFlagValue(argv, flag); got != want {
+			t.Fatalf("%s = %q, want %q: %v", flag, got, want, argv)
+		}
+	}
+	for _, flag := range []string{"-p", "--verbose", "--include-partial-messages", "--strict-mcp-config"} {
+		if !slices.Contains(argv, flag) {
+			t.Fatalf("missing %s: %v", flag, argv)
+		}
+	}
+	if denied, _ := argvFlagValue(argv, "--disallowedTools"); !strings.Contains(denied, "Bash") || !strings.Contains(denied, "Task") || strings.Contains(denied, "Read") {
+		t.Fatalf("--disallowedTools = %q", denied)
+	}
+	if slices.Contains(argv, "澄清这条需求") {
+		t.Fatalf("prompt must go on stdin: %v", argv)
+	}
+	// A captured Claude session UUID is resumed as is; submit-only denies reading.
+	uuid := assistantClaudeSessionID("af1")
+	command, err = prepareClarifyCommandWith(clarifyCommandOpts{Bin: "claude", Model: "claude-code:claude-opus-5-5", Prompt: "submit", SessionID: uuid, Resume: true, SubmitOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := argvFlagValue(command.Argv, "--resume"); got != uuid || slices.Contains(command.Argv, "--session-id") {
+		t.Fatalf("resume argv = %v", command.Argv)
+	}
+	if denied, _ := argvFlagValue(command.Argv, "--disallowedTools"); !strings.Contains(denied, "Read") || !strings.Contains(denied, "Glob") {
+		t.Fatalf("submit-only --disallowedTools = %q", denied)
+	}
+}
+
+func TestCanResumeClarifySessionClaudeHome(t *testing.T) {
+	home := t.TempDir()
+	mustWriteClarifyFile(t, filepath.Join(home, ".claude", "projects", "repo", "old-session.jsonl"), "conversation\n")
+	if !canResumeClarifySession(home, ".claude", "old-session", 1, 1) || canResumeClarifySession(home, ".codebuddy", "old-session", 1, 1) {
+		t.Fatal("resume must look in the clarification CLI's own config directory")
 	}
 }
