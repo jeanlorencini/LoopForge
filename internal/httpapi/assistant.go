@@ -1389,6 +1389,10 @@ type assistantCLIRequest struct {
 	ReviewOnly                                     bool
 	Native                                         bool
 	MCPConfig, Settings                            string
+	// ClaudeCode overrides the user's Claude Code credential for platform-side
+	// callers that may fall back to the platform token; Claude Code is then
+	// installed on demand when missing.
+	ClaudeCode *runtime.ProviderCredential
 	// OnUsage receives the usage of this CLI invocation once its result event
 	// reports one; the result event covers only this process, not the session.
 	OnUsage func(domain.TokenUsage)
@@ -1412,6 +1416,8 @@ func runAssistantCLI(ctx context.Context, req assistantCLIRequest, user domain.U
 	var err error
 	if req.RemoteBinary {
 		bin = assistantEngineBinary(engine)
+	} else if req.ClaudeCode != nil && engine == assistantEngineClaude {
+		bin, err = resolveClarifyBin(ctx, engine)
 	} else {
 		bin, err = resolveAssistantEngineBin(engine)
 	}
@@ -1462,6 +1468,9 @@ func runAssistantCLI(ctx context.Context, req assistantCLIRequest, user domain.U
 	switch engine {
 	case assistantEngineClaude:
 		engineOpts.User = runtime.ProviderCredential{APIKey: user.ClaudeCodeAPIKey, BaseURL: user.ClaudeCodeBaseURL}
+		if req.ClaudeCode != nil {
+			engineOpts.User = *req.ClaudeCode
+		}
 		inv, err = prepareAssistantClaudeInvocation(engineOpts)
 	case assistantEngineCodex:
 		engineOpts.User = runtime.ProviderCredential{APIKey: user.CodexAPIKey, BaseURL: user.CodexBaseURL}

@@ -141,3 +141,29 @@ func TestClarifyClaudeCredentialSkipsLoopbackProxy(t *testing.T) {
 		}
 	}
 }
+
+// A Claude Code model runs a run eval without a CodeBuddy key and keeps its id.
+func TestRunEvalStartsClaudeModelWithoutCodeBuddyKey(t *testing.T) {
+	f := cvBNewHTTPFixture(t)
+	done := domain.Run{ID: "eval-claude-run", Status: "succeeded", WorkflowID: "missing",
+		ExecutionContext: domain.TelemetryContext{ProjectID: "platform"}, Nodes: map[string]*domain.NodeRun{}}
+	if err := f.s.PutRun(done); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan string, 1)
+	setRunEvalExecForTest(func(_ context.Context, rec domain.RunEvalRecord, _ domain.Run, _ domain.User, _ func(string, any)) (domain.RunEvalResult, error) {
+		got <- rec.Model
+		return domain.RunEvalResult{Score: 90, Passed: true}, nil
+	})
+	t.Cleanup(func() { setRunEvalExecForTest(nil) })
+	if rec := cvBRequest(t, f, http.MethodPost, "/api/runs/eval-claude-run/eval", map[string]any{"model": "gpt-5.6-sol"}, true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("CodeBuddy model without a key: status = %d, want 400", rec.Code)
+	}
+	rec := cvBRequest(t, f, http.MethodPost, "/api/runs/eval-claude-run/eval", map[string]any{"model": "claude-code:claude-opus-5-5"}, true)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body = %s, want 202", rec.Code, rec.Body.String())
+	}
+	if model := <-got; model != "claude-code:claude-opus-5-5" {
+		t.Fatalf("eval model = %q", model)
+	}
+}
