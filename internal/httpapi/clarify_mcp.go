@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +14,7 @@ import (
 	"strings"
 
 	"agentflow/internal/domain"
+	"agentflow/internal/runtime"
 	"agentflow/internal/tracker"
 )
 
@@ -47,6 +50,21 @@ func clarifyModelEngineError(id string) error {
 // user has no Claude Code API key; chat never uses it.
 func claudeCodePlatformOAuthToken() string {
 	return strings.TrimSpace(os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"))
+}
+
+// clarifyClaudeCredential is the Claude credential a platform-side
+// clarification runs with. The user's own key wins, as in chat, except when
+// its Base URL is loopback: that proxy lives on the user's machine, which the
+// platform cannot reach, so the platform token is used instead.
+func clarifyClaudeCredential(user domain.User) runtime.ProviderCredential {
+	cred := runtime.ProviderCredential{APIKey: strings.TrimSpace(user.ClaudeCodeAPIKey), BaseURL: strings.TrimSpace(user.ClaudeCodeBaseURL), OAuthToken: claudeCodePlatformOAuthToken()}
+	if u, err := url.Parse(cred.BaseURL); err == nil && cred.BaseURL != "" {
+		host := u.Hostname()
+		if ip := net.ParseIP(host); strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback()) {
+			cred.APIKey, cred.BaseURL = "", ""
+		}
+	}
+	return cred
 }
 
 // clarifyPlatformClaudeModels lists the built-in Claude Code models that

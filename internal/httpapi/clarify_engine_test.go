@@ -129,3 +129,15 @@ func TestCanResumeClarifySessionClaudeHome(t *testing.T) {
 		t.Fatal("resume must look in the clarification CLI's own config directory")
 	}
 }
+
+// A user key behind a loopback Base URL (a proxy on the user's PC) cannot be
+// reached from the platform, so clarification falls back to the platform token.
+func TestClarifyClaudeCredentialSkipsLoopbackProxy(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+	for base, wantKey := range map[string]bool{"http://127.0.0.1:8317": false, "http://localhost:8317/v1": false, "http://[::1]:8317": false, "https://api.example.com": true, "": true} {
+		got := clarifyClaudeCredential(domain.User{ClaudeCodeAPIKey: "user-key", ClaudeCodeBaseURL: base})
+		if (got.APIKey == "user-key") != wantKey || got.OAuthToken != "sk-ant-oat01-test" {
+			t.Fatalf("base %q: got key=%q base=%q token set=%v", base, got.APIKey, got.BaseURL, got.OAuthToken != "")
+		}
+	}
+}

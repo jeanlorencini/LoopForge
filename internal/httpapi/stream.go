@@ -650,8 +650,7 @@ func (h *streamHandlers) executeClarify(ctx context.Context, issue domain.Issue,
 	}
 	if engine == assistantEngineClaude {
 		modelID = strings.TrimSpace(request.Model)
-		// The responsible user's own key wins, as in chat; otherwise the platform's subscription token.
-		credentials.ClaudeCode = runtime.ProviderCredential{APIKey: strings.TrimSpace(responsible.ClaudeCodeAPIKey), BaseURL: strings.TrimSpace(responsible.ClaudeCodeBaseURL), OAuthToken: claudeCodePlatformOAuthToken()}
+		credentials.ClaudeCode = clarifyClaudeCredential(responsible)
 	}
 	turnPrompt := userMsg
 	if resume {
