@@ -132,7 +132,7 @@ function Assert-ManagedBinary {
     param([string]$Path, [string]$Name)
     $absolute = Assert-InstallPath -Path $Path
     $relative = $absolute.Substring(($InstallDirectory.TrimEnd('\', '/') + '\').Length)
-    if ($relative -notmatch ('^bin[\\/][a-f0-9]{16}-[a-f0-9]{16}(?:-[a-f0-9]{16})?[\\/]' + [Regex]::Escape($Name) + '\.exe$')) { throw 'Saved binary does not belong to this managed installation.' }
+    if ($relative -notmatch ('^bin[\\/][a-f0-9]{16}-[a-f0-9]{16}(?:-[a-f0-9]{16}){0,2}[\\/]' + [Regex]::Escape($Name) + '\.exe$')) { throw 'Saved binary does not belong to this managed installation.' }
     return $absolute
 }
 
@@ -337,8 +337,8 @@ try {
         $binRoot = Assert-InstallPath -Path (Join-Path $InstallDirectory 'bin')
         if (Test-Path -LiteralPath $binRoot) {
             foreach ($directory in Get-ChildItem -LiteralPath $binRoot -Directory -Force) {
-                if ($directory.Name -notmatch '^[a-f0-9]{16}-[a-f0-9]{16}(?:-[a-f0-9]{16})?$') { continue }
-                foreach ($name in @('agentflow-runner.exe', 'agentflow-gate-mcp.exe', 'agentflow-gate-mcp-linux-amd64', 'agentflow-gate-mcp-linux-arm64')) { $managedFiles += Join-Path $directory.FullName $name }
+                if ($directory.Name -notmatch '^[a-f0-9]{16}-[a-f0-9]{16}(?:-[a-f0-9]{16}){0,2}$') { continue }
+                foreach ($name in @('agentflow-runner.exe', 'agentflow-gate-mcp.exe', 'agentflow-gate-mcp-linux-amd64', 'agentflow-gate-mcp-linux-arm64', 'agentflow-runner-linux-amd64', 'agentflow-runner-linux-arm64')) { $managedFiles += Join-Path $directory.FullName $name }
             }
         }
         $managedFiles += $configPath
@@ -385,7 +385,7 @@ try {
     if (-not $Name) { $Name = 'Windows-' + [Environment]::MachineName }
     if ($Name -match '["\r\n]') { throw 'Runner Name cannot contain a quote or newline.' }
     $architecture = Get-WindowsArchitecture
-    if ($Update -and ([IO.Path]::GetFileName([IO.Path]::GetDirectoryName($config.GateBinary)) -match '^[a-f0-9]{16}-[a-f0-9]{16}-[a-f0-9]{16}$')) {
+    if ($Update -and ([IO.Path]::GetFileName([IO.Path]::GetDirectoryName($config.GateBinary)) -match '^[a-f0-9]{16}(?:-[a-f0-9]{16}){2,3}$')) {
         $savedLinuxGate = Assert-InstallPath -Path (Join-Path ([IO.Path]::GetDirectoryName($config.GateBinary)) ('agentflow-gate-mcp-linux-' + $architecture))
         if (-not (Test-Path -LiteralPath $savedLinuxGate -PathType Leaf)) { throw 'The saved Linux Gate helper is missing; restore it before updating.' }
     }
@@ -396,7 +396,9 @@ try {
         $artifacts = @(
             @{ name = 'agentflow-runner'; os = 'windows'; fileName = 'agentflow-runner.exe' },
             @{ name = 'agentflow-gate-mcp'; os = 'windows'; fileName = 'agentflow-gate-mcp.exe' },
-            @{ name = 'agentflow-gate-mcp'; os = 'linux'; fileName = 'agentflow-gate-mcp-linux-' + $architecture }
+            @{ name = 'agentflow-gate-mcp'; os = 'linux'; fileName = 'agentflow-gate-mcp-linux-' + $architecture },
+            # Docker sandboxes run the Linux runner as the in-container Git/MCP helper (internal/runtime/mcp_call.go).
+            @{ name = 'agentflow-runner'; os = 'linux'; fileName = 'agentflow-runner-linux-' + $architecture }
         )
         foreach ($artifact in $artifacts) {
             $endpoint = $ServerUrl + '/runners/' + $artifact.name + '?os=' + $artifact.os + '&arch=' + $architecture
