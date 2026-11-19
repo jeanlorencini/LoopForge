@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -88,7 +89,7 @@ func TestConversationClaudeGeneratedInvocationSurvivesRemoteSync(t *testing.T) {
 			if _, err := pool.Handle(context.Background(), destination, "", nil, runtime.ConversationProcessRequest{Operation: "sync", SourceRoot: source, Files: files}, nil); err != nil {
 				t.Fatal(err)
 			}
-			for _, flag := range []string{"--mcp-config", "--settings"} {
+			for _, flag := range []string{"--mcp-config", "--settings", "--system-prompt-file"} {
 				found := false
 				for i, arg := range invocation.command.Argv[:len(invocation.command.Argv)-1] {
 					if arg != flag {
@@ -110,6 +111,43 @@ func TestConversationClaudeGeneratedInvocationSurvivesRemoteSync(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Windows rejects a command line over 32,767 chars (error 206), and a fresh
+// chat turn carries the whole transcript.
+func TestClaudeInvocationKeepsPromptsOffArgv(t *testing.T) {
+	root := t.TempDir()
+	config := filepath.Join(root, "mcp.json")
+	if err := os.WriteFile(config, []byte(`{"mcpServers":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	system, prompt := strings.Repeat("s", 100000), strings.Repeat("p", 100000)
+	inv, err := prepareAssistantClaudeInvocation(assistantEngineInvocationOpts{Bin: "claude", Root: root, Config: config, Prompt: prompt, SystemPrompt: system, Model: "fixture", SessionID: "long"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv := inv.command.Argv
+	if n := len(strings.Join(argv, " ")); n >= 8000 {
+		t.Fatalf("argv is %d chars", n)
+	}
+	file := ""
+	for i, arg := range argv {
+		if arg == "--system-prompt" {
+			t.Fatalf("system prompt still passed on argv: %q", argv)
+		}
+		if arg == "--system-prompt-file" && i+1 < len(argv) {
+			file = argv[i+1]
+		}
+	}
+	if file == "" {
+		t.Fatalf("missing --system-prompt-file: %q", argv)
+	}
+	if data, err := os.ReadFile(file); err != nil || string(data) != system {
+		t.Fatalf("system prompt file mismatch: %v", err)
+	}
+	if got, err := io.ReadAll(inv.command.Stdin); err != nil || string(got) != prompt {
+		t.Fatalf("stdin does not carry the prompt: %v", err)
 	}
 }
 

@@ -190,9 +190,15 @@ func prepareAssistantClaudeInvocation(o assistantEngineInvocationOpts) (assistan
 	if err := os.WriteFile(settingsPath, settings, 0o600); err != nil {
 		return assistantCLIInvocation{}, err
 	}
+	// The system prompt and the turn prompt can exceed the Windows command-line
+	// limit (32,767 chars), so neither goes on argv.
+	systemPath := filepath.Join(o.Root, "claude-system.md")
+	if err := os.WriteFile(systemPath, []byte(o.SystemPrompt), 0o600); err != nil {
+		return assistantCLIInvocation{}, err
+	}
 	sessionID := assistantClaudeSessionID(o.SessionID)
 	argv := []string{o.Bin, "-p", "--verbose", "--output-format", "stream-json", "--include-partial-messages",
-		"--max-turns", nativeAssistantUnlimitedTurns, "--system-prompt", o.SystemPrompt,
+		"--max-turns", nativeAssistantUnlimitedTurns, "--system-prompt-file", systemPath,
 		"--mcp-config", mcpPath, "--strict-mcp-config", "--settings", settingsPath, "--setting-sources", "user",
 		"--permission-mode", "bypassPermissions",
 		"--model", o.Model}
@@ -210,9 +216,8 @@ func prepareAssistantClaudeInvocation(o assistantEngineInvocationOpts) (assistan
 	} else {
 		argv = append(argv, "--session-id", sessionID)
 	}
-	// --disallowedTools is variadic: end option parsing before the prompt.
-	argv = append(argv, "--", o.Prompt)
-	command := runtime.CommandSpec{Argv: argv, Provider: "claude-code", CredentialBindings: []runtime.CredentialBinding{runtime.BindClaudeCode}}
+	// With no positional prompt, claude -p reads it from stdin.
+	command := runtime.CommandSpec{Argv: argv, Provider: "claude-code", CredentialBindings: []runtime.CredentialBinding{runtime.BindClaudeCode}, Stdin: strings.NewReader(o.Prompt)}
 	return assistantCLIInvocation{
 		command:     command.WithClaudeBypassAccepted(),
 		credentials: runtime.RunCredentials{ClaudeCode: o.User},
