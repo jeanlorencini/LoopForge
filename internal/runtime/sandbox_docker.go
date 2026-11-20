@@ -508,6 +508,19 @@ func dockerBindMatchesWorkspace(source, workspace string) bool {
 	return filepath.Clean(got) == filepath.Clean(want)
 }
 
+// DockerWorkspaceLabel records the host workspace on the container. Engines
+// that run in a VM report a guest path as the bind source, so the source alone
+// cannot prove which workspace a container belongs to.
+const DockerWorkspaceLabel = "agentflow.workspace"
+
+func dockerRecordedWorkspace(ctx context.Context, name string) string {
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "--type", "container", "--format", `{{index .Config.Labels "`+DockerWorkspaceLabel+`"}}`, name).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // dockerSandboxesUnder maps sandbox container name -> workspace directory name
 // for every container whose /workspace bind lives directly under root.
 //
@@ -767,7 +780,7 @@ func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
 		return err
 	}
 	if mounts != nil {
-		if !dockerBindMatchesWorkspace(mounts.source, workspace) {
+		if !dockerBindMatchesWorkspace(mounts.source, workspace) && !dockerBindMatchesWorkspace(dockerRecordedWorkspace(ctx, name), workspace) {
 			return fmt.Errorf("docker sandbox %s is bound to %s, not %s", name, mounts.source, workspace)
 		}
 		if !recreate && !mounts.legacyMasks {
@@ -784,7 +797,7 @@ func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
 		return err
 	}
 	image := built
-	args := []string{"create", "--name", name, "--init", "--cap-drop=ALL", "--security-opt", "no-new-privileges", "-v", workspace + ":/workspace"}
+	args := []string{"create", "--name", name, "--init", "--cap-drop=ALL", "--security-opt", "no-new-privileges", "--label", DockerWorkspaceLabel + "=" + workspace, "-v", workspace + ":/workspace"}
 	// Native installs own private (0700) workspaces as the service user.
 	// A root image without DAC capabilities cannot access another UID's bind.
 	// Run default/root images as that user; retain explicit non-root image users.

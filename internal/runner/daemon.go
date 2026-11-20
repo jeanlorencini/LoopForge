@@ -648,13 +648,14 @@ func cleanupDockerWorkspace(ctx context.Context, workspace string) error {
 	// A task container mounts runs/<run>/<node>, while this cleanup targets
 	// runs/<run>. Enumerate only runner-owned containers, then match their bind
 	// mount sources against the run directory so crash-orphaned node containers
-	// are removed as well.
+	// are removed as well. A VM-backed engine reports guest paths as sources, so
+	// the workspace label recorded at create time is matched too.
 	out, err := exec.CommandContext(ctx, "docker", "ps", "-aq", "--filter", "name=^/agentflow-rt-").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("list containers: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	for _, id := range strings.Fields(string(out)) {
-		mountOut, mountErr := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{range .Mounts}}{{println .Source}}{{end}}", id).CombinedOutput()
+		mountOut, mountErr := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{range .Mounts}}{{println .Source}}{{end}}{{index .Config.Labels \""+runtime.DockerWorkspaceLabel+"\"}}", id).CombinedOutput()
 		if mountErr != nil {
 			// The container can exit between ps and inspect: closeRunSandboxes
 			// removes it, or the daemon already reaped it. A missing container
@@ -665,8 +666,9 @@ func cleanupDockerWorkspace(ctx context.Context, workspace string) error {
 			return fmt.Errorf("inspect container %s mounts: %w: %s", id, mountErr, strings.TrimSpace(string(mountOut)))
 		}
 		belongsToRun := false
-		for _, source := range strings.Fields(string(mountOut)) {
-			if workspaceContainsPath(workspace, source) {
+		// One path per line: the label holds a host path, which may contain spaces.
+		for _, source := range strings.Split(string(mountOut), "\n") {
+			if source = strings.TrimSpace(source); source != "" && workspaceContainsPath(workspace, source) {
 				belongsToRun = true
 				break
 			}

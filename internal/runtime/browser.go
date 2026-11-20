@@ -259,7 +259,7 @@ func (s *dockerSandbox) ensureBrowser(ctx context.Context, runID string, sink Ev
 	if inspectErr != nil || strings.TrimSpace(string(out)) != "true|"+image+"|"+runID {
 		_ = exec.CommandContext(ctx, "docker", "rm", "-f", name).Run()
 		args := []string{"run", "-d", "--name", name, "--init",
-			"--label", browserRunLabel + "=" + runID, "--label", browserOwnerLabel + "=" + s.name,
+			"--label", browserRunLabel + "=" + runID, "--label", browserOwnerLabel + "=" + s.name, "--label", DockerWorkspaceLabel + "=" + s.workspace,
 			"--network", "container:" + s.name, "--cap-drop=ALL", "--security-opt", "no-new-privileges",
 			"--shm-size", "512m", "-v", s.workspace + ":/workspace", "-w", "/workspace",
 			"-e", "AGENTFLOW_BROWSER_OUTPUT=/workspace/.agentflow/browser", "-e", "AGENTFLOW_BROWSER_SCALE=" + BrowserDeviceScale(), image}

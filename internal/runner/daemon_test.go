@@ -1117,6 +1117,38 @@ esac
 	}
 }
 
+// A VM-backed engine reports guest paths as bind sources, so only the
+// workspace label ties the container to the run. The label is a host path,
+// which may contain spaces.
+func TestCleanupDockerWorkspaceMatchesWorkspaceLabel(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "my run")
+	logPath := filepath.Join(t.TempDir(), "rm.log")
+	installFakeDocker(t, `#!/bin/sh
+last=""
+for a in "$@"; do last="$a"; done
+case "$1" in
+ps) echo vm ;;
+inspect)
+  case "$3" in
+  *Config.Image*) echo ubuntu ;;
+  *agentflow.workspace*) printf '/mnt/vm/b-1\n%s\n' "$AF_TEST_WORKSPACE/node" ;;
+  *) echo /mnt/vm/b-1 ;;
+  esac
+  ;;
+rm) printf '%s\n' "$last" >> "$AF_TEST_RM_LOG" ;;
+*) echo "unexpected $1" >&2; exit 1 ;;
+esac
+`)
+	t.Setenv("AF_TEST_WORKSPACE", workspace)
+	t.Setenv("AF_TEST_RM_LOG", logPath)
+	if err := cleanupDockerWorkspace(context.Background(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := os.ReadFile(logPath); err != nil || strings.TrimSpace(string(removed)) != "vm" {
+		t.Fatalf("removed = %q (%v), want vm", removed, err)
+	}
+}
+
 func TestCleanupDockerWorkspaceReturnsRealInspectFailure(t *testing.T) {
 	installFakeDocker(t, `#!/bin/sh
 case "$1" in

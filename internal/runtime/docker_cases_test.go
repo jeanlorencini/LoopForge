@@ -357,6 +357,41 @@ exit 0
 	}
 }
 
+// A VM-backed engine reports a guest path as the bind source. The workspace
+// label decides ownership there: the sandbox restarts its own container and
+// refuses one recorded for another workspace.
+func TestDockerSandboxRestartsContainerWithTranslatedBindSource(t *testing.T) {
+	bin, workspace := t.TempDir(), t.TempDir()
+	script := `#!/bin/sh
+case "$*" in
+  "inspect --type container --format {{json .Mounts}} box")
+    echo '[{"Destination":"/workspace","Source":"/mnt/vm/b-1"}]'; exit 0 ;;
+  "inspect --type container --format {{index .Config.Labels \"agentflow.workspace\"}} box")
+    echo "$CVR_DOCKER_LABEL"; exit 0 ;;
+  "create "*) echo 'unexpected create' >&2; exit 1 ;;
+  "exec "*) echo /workspace; exit 0 ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx := context.Background()
+	t.Setenv("CVR_DOCKER_LABEL", workspace)
+	sb := &dockerSandbox{id: "box", name: "box", workspace: workspace}
+	if err := sb.ensureStarted(ctx); err != nil || !sb.started {
+		t.Fatalf("own container was not restarted: started=%v err=%v", sb.started, err)
+	}
+	for _, label := range []string{filepath.Join(workspace, "other"), ""} {
+		t.Setenv("CVR_DOCKER_LABEL", label)
+		sb = &dockerSandbox{id: "box", name: "box", workspace: workspace}
+		if err := sb.ensureStarted(ctx); err == nil || !strings.Contains(err.Error(), "is bound to") {
+			t.Fatalf("label %q: foreign container must be refused, got %v", label, err)
+		}
+	}
+}
+
 func cvRInstallFakeDocker(t *testing.T, workspace string) {
 	t.Helper()
 	bin := t.TempDir()
