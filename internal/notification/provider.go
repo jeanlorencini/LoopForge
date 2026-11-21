@@ -25,9 +25,13 @@ type Provider interface {
 type ProviderError struct {
 	Code    int
 	Message string
+	Source  string
 }
 
 func (e *ProviderError) Error() string {
+	if e.Source != "" {
+		return fmt.Sprintf("%s 错误：%s", e.Source, e.Message)
+	}
 	return fmt.Sprintf("企业微信错误 %d：%s", e.Code, e.Message)
 }
 func failure(code int) *ProviderError {

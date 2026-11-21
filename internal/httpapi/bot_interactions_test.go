@@ -7,6 +7,7 @@ import (
 	"agentflow/internal/notification"
 	"agentflow/internal/repo"
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -244,6 +245,28 @@ func TestBotRepliesOnClaudeCodeWithoutCodeBuddyKey(t *testing.T) {
 	reply, err = h.generateBotReply(context.Background(), bot, domain.BotConversation{ChatType: "single"}, nil, item)
 	if err != nil || reply != "完成 [redacted]" || calls != 1 {
 		t.Fatalf("platform token: reply=%q err=%v calls=%d", reply, err, calls)
+	}
+}
+
+func TestTelegramBotTakesItsIDFromTheToken(t *testing.T) {
+	f := cvBNewHTTPFixture(t)
+	body := map[string]any{"projectId": "platform", "name": "TG", "provider": "telegram", "botId": "ignored", "secret": "123456:AAE-token_x", "enabled": true, "interactionEnabled": true}
+	rec := cvBRequest(t, f, http.MethodPost, "/api/notification-bots", body, true)
+	var bot domain.NotificationBot
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &bot) != nil {
+		t.Fatalf("create %d %s", rec.Code, rec.Body.String())
+	}
+	if bot.Provider != domain.BotProviderTelegram || bot.BotID != "telegram-123456" || bot.InteractionEnabled {
+		t.Fatalf("bot %+v", bot)
+	}
+	// Editing without a new token keeps the provider and the derived id.
+	rec = cvBRequest(t, f, http.MethodPut, "/api/notification-bots/"+bot.ID, map[string]any{"projectId": "platform", "name": "TG 2", "provider": "", "botId": bot.BotID, "secret": "", "enabled": true}, true)
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &bot) != nil || bot.Provider != domain.BotProviderTelegram || bot.BotID != "telegram-123456" {
+		t.Fatalf("edit %d %s", rec.Code, rec.Body.String())
+	}
+	body["secret"] = "not-a-token"
+	if rec = cvBRequest(t, f, http.MethodPost, "/api/notification-bots", body, true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad token accepted: %d", rec.Code)
 	}
 }
 

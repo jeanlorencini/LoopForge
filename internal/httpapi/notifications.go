@@ -8,9 +8,13 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// telegramTokenPattern also keeps the token safe to place in the Bot API URL path.
+var telegramTokenPattern = regexp.MustCompile(`^(\d+):[A-Za-z0-9_-]+$`)
 
 type notificationHandlers struct {
 	*deps
@@ -122,6 +126,7 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 		Model              *string `json:"model"`
 		InteractionEnabled *bool   `json:"interactionEnabled"`
 		TargetID           *string `json:"targetId"`
+		Provider           string  `json:"provider"`
 	}
 	if !decode(c, &req) {
 		return
@@ -129,11 +134,32 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 	req.Name = strings.TrimSpace(req.Name)
 	req.BotID = strings.TrimSpace(req.BotID)
 	req.Secret = strings.TrimSpace(req.Secret)
+	provider := strings.TrimSpace(req.Provider)
+	if old != nil {
+		provider = old.Provider
+	}
+	if provider != "" && provider != domain.BotProviderTelegram {
+		c.JSON(400, gin.H{"error": "不支持的通知渠道"})
+		return
+	}
+	if provider == domain.BotProviderTelegram {
+		if req.Secret != "" {
+			m := telegramTokenPattern.FindStringSubmatch(req.Secret)
+			if m == nil {
+				c.JSON(400, gin.H{"error": "请填写 @BotFather 提供的 Telegram Bot Token"})
+				return
+			}
+			req.BotID = "telegram-" + m[1]
+		} else if old != nil {
+			req.BotID = old.BotID
+		}
+		req.InteractionEnabled = new(bool)
+	}
 	if req.Name == "" || len([]rune(req.Name)) > 80 || req.BotID == "" || len(req.BotID) > 191 || len(req.Secret) > 512 {
 		c.JSON(400, gin.H{"error": "请填写有效的名称、Bot ID 和 Secret"})
 		return
 	}
-	bot := domain.NotificationBot{ID: "bot-" + randomID(), ProjectID: strings.TrimSpace(req.ProjectID), Name: req.Name, BotID: req.BotID, Enabled: req.Enabled, Health: "unchecked"}
+	bot := domain.NotificationBot{ID: "bot-" + randomID(), ProjectID: strings.TrimSpace(req.ProjectID), Provider: provider, Name: req.Name, BotID: req.BotID, Enabled: req.Enabled, Health: "unchecked"}
 	if old != nil {
 		bot = *old
 		bot.Name = req.Name

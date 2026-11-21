@@ -4,6 +4,7 @@ import (
 	"agentflow/internal/domain"
 	"agentflow/internal/repo"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +50,38 @@ func serviceFixture(t *testing.T) (*Service, *fakeProvider, domain.NotificationB
 		t.Fatal(err)
 	}
 	return svc, provider, bot, run
+}
+func TestTelegramBotSendsWithoutRecentSession(t *testing.T) {
+	svc, wecom, bot, _ := serviceFixture(t)
+	bot.Provider = domain.BotProviderTelegram
+	if err := svc.Store.SaveNotificationBot(bot, ""); err != nil {
+		t.Fatal(err)
+	}
+	telegram := &fakeProvider{}
+	svc.Telegram = telegram
+	if _, err := svc.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := svc.Store.NotificationDeliveries(bot.ProjectID)
+	if telegram.sent != 1 || wecom.sent != 0 || items[0].Status != "sent" {
+		t.Fatalf("telegram %d wecom %d delivery %+v", telegram.sent, wecom.sent, items)
+	}
+}
+func TestTelegramPartialDeliveryFailsWithoutResendAndTracksHealth(t *testing.T) {
+	svc, _, bot, _ := serviceFixture(t)
+	bot.Provider = domain.BotProviderTelegram
+	if err := svc.Store.SaveNotificationBot(bot, ""); err != nil {
+		t.Fatal(err)
+	}
+	svc.Telegram = &fakeProvider{err: fmt.Errorf("%w: %w", errPartialDelivery, &ProviderError{Code: 853004, Source: "Telegram", Message: "token"})}
+	if _, err := svc.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := svc.Store.NotificationDeliveries(bot.ProjectID)
+	saved, _ := svc.Store.NotificationBot(bot.ID)
+	if items[0].Status != "failed" || saved.Health != "awaiting_authorization" {
+		t.Fatalf("delivery %s health %s", items[0].Status, saved.Health)
+	}
 }
 func TestNotificationSendAndExpire(t *testing.T) {
 	t.Run("send", func(t *testing.T) {

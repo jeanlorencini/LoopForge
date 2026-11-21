@@ -12,6 +12,7 @@ type NotificationBot struct {
 	ID                 string     `json:"id"`
 	ProjectID          string     `json:"projectId"`
 	OwnerID            int64      `json:"ownerId"`
+	Provider           string     `json:"provider,omitempty"`
 	Model              string     `json:"model,omitempty"`
 	Name               string     `json:"name"`
 	BotID              string     `json:"botId"`
@@ -36,6 +37,8 @@ type NotificationBinding struct {
 type NodeNotification = NotificationBinding
 
 const DefaultNotificationReportModel = "default"
+
+const BotProviderTelegram = "telegram"
 
 type NotificationReportRequest struct {
 	Binding NotificationBinding

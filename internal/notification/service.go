@@ -17,6 +17,7 @@ import (
 type Service struct {
 	Store          *repo.Store
 	Provider       Provider
+	Telegram       Provider
 	GenerateReport ReportGenerator
 	Interactions   *botinteraction.Service
 	PublicURL      string
@@ -24,7 +25,13 @@ type Service struct {
 
 func New(s *repo.Store) *Service {
 	base := strings.TrimRight(os.Getenv("AGENTFLOW_PUBLIC_URL"), "/")
-	return &Service{Store: s, Provider: NewCLIProvider(), PublicURL: base, Interactions: botinteraction.New(s)}
+	return &Service{Store: s, Provider: NewCLIProvider(), Telegram: NewTelegramProvider(), PublicURL: base, Interactions: botinteraction.New(s)}
+}
+func (s *Service) provider(bot domain.NotificationBot) Provider {
+	if bot.Provider == domain.BotProviderTelegram {
+		return s.Telegram
+	}
+	return s.Provider
 }
 func (s *Service) secret(bot domain.NotificationBot) (string, error) {
 	secret, err := s.Store.BotCredential(bot.ID)
@@ -38,19 +45,22 @@ func (s *Service) Sessions(ctx context.Context, bot domain.NotificationBot) ([]d
 	if err != nil {
 		return nil, err
 	}
-	chats, err := s.Provider.Sessions(ctx, bot.BotID, secret)
-	health := "ready"
-	if err != nil {
-		health = "error"
-		var pe *ProviderError
-		if errors.As(err, &pe) && (pe.Code == 850003 || pe.Code == 853004) {
-			health = "awaiting_authorization"
-		}
-	}
-	if updateErr := s.Store.SetNotificationBotHealth(bot.ID, health); updateErr != nil && err == nil {
+	chats, err := s.provider(bot).Sessions(ctx, bot.BotID, secret)
+	if updateErr := s.Store.SetNotificationBotHealth(bot.ID, botHealth(err)); updateErr != nil && err == nil {
 		return nil, updateErr
 	}
 	return chats, err
+}
+
+func botHealth(err error) string {
+	var pe *ProviderError
+	switch {
+	case err == nil:
+		return "ready"
+	case errors.As(err, &pe) && (pe.Code == 850003 || pe.Code == 853004):
+		return "awaiting_authorization"
+	}
+	return "error"
 }
 
 var errNotificationExpired = errors.New("节点已无需人工处理")
@@ -64,18 +74,22 @@ func (s *Service) send(ctx context.Context, bot domain.NotificationBot, targetID
 	if !bot.Enabled {
 		return errors.New("机器人已停用")
 	}
-	chats, err := s.Sessions(ctx, bot)
-	if err != nil {
-		return err
-	}
-	found := false
-	for _, chat := range chats {
-		if chat.ID == targetID {
-			found = true
+	// Telegram keeps updates for 24 hours only, so a quiet chat drops out of
+	// Sessions; sendMessage reports an unusable chat itself.
+	if bot.Provider != domain.BotProviderTelegram {
+		chats, err := s.Sessions(ctx, bot)
+		if err != nil {
+			return err
 		}
-	}
-	if !found {
-		return &ProviderError{Code: 404, Message: "接收会话当前不可用，请与机器人互动后刷新列表"}
+		found := false
+		for _, chat := range chats {
+			if chat.ID == targetID {
+				found = true
+			}
+		}
+		if !found {
+			return &ProviderError{Code: 404, Message: "接收会话当前不可用，请与机器人互动后刷新列表"}
+		}
 	}
 	secret, err := s.secret(bot)
 	if err != nil {
@@ -93,7 +107,13 @@ func (s *Service) send(ctx context.Context, bot domain.NotificationBot, targetID
 		}
 		return s.Interactions.QueueNotificationCard(ctx, bot, delivery[0], content, detailURL)
 	}
-	return s.Provider.Send(ctx, bot.BotID, secret, targetID, content)
+	err = s.provider(bot).Send(ctx, bot.BotID, secret, targetID, content)
+	// Telegram sends skip Sessions, so they keep the bot health current; a failed
+	// health write must not fail a delivered message and trigger a resend.
+	if bot.Provider == domain.BotProviderTelegram && botHealth(err) != bot.Health {
+		_ = s.Store.SetNotificationBotHealth(bot.ID, botHealth(err))
+	}
+	return err
 }
 func (s *Service) Start(ctx context.Context) {
 	if s.Interactions != nil {
@@ -215,6 +235,9 @@ func (s *Service) ProcessOne(ctx context.Context) (bool, error) {
 	}, *item)
 	if errors.Is(err, errNotificationExpired) || errors.Is(err, botinteraction.ErrCardExpired) {
 		return finish("expired", err.Error())
+	}
+	if errors.Is(err, errPartialDelivery) {
+		return finish("failed", err.Error())
 	}
 	if err == nil {
 		return finish("sent", "")
