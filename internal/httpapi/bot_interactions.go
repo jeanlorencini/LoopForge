@@ -4,6 +4,7 @@ import (
 	"agentflow/internal/botinteraction"
 	"agentflow/internal/domain"
 	"agentflow/internal/engine"
+	"agentflow/internal/notification"
 	"context"
 	"errors"
 	"fmt"
@@ -71,19 +72,26 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 	if err != nil {
 		return "绑定的平台账号不可用或已失去项目权限，请在平台检查配置。", nil
 	}
-	if strings.TrimSpace(user.CodeBuddyAPIKey) == "" {
-		return "你的平台账号尚未配置 CodeBuddy Key，请在平台个人配置中配置。", nil
-	}
 	model := bot.Model
 	if model == "" {
 		model = domain.DefaultNotificationReportModel
 	}
-	if assistantAllowedModel(model, loadAssistantModels(ctx, user.CodeBuddyInternetEnvironment)) != model {
+	claude, err := platformModelCredential(ctx, user, model)
+	if errors.Is(err, notification.ErrReportCredentials) {
+		engine, _ := assistantModelEngine(model)
+		return "你的平台账号尚未配置 " + assistantEngineLabel(engine) + " Key，请在平台个人配置中配置。", nil
+	}
+	if err != nil {
 		return "所选模型不可用，请在 Bot 管理中重新选择。", nil
 	}
 	if err = ensureAssistantSessionDirs(user.ID); err != nil {
 		return "", err
 	}
+	root, cleanup, err := claudeCallRoot(user.ID, claude)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
 	modelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	session, files, err := h.openAssistantToolSession(modelCtx, user, bot.ProjectID, assistantExecModeForApproval(AssistantApprovalAuto), cancel)
@@ -100,7 +108,7 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 		cliSessionID := newAssistantSessionID()
 		resume := false
 		generate = func(callCtx context.Context, prompt string, u domain.User) (string, error) {
-			raw, _, err := runAssistantCLI(callCtx, assistantCLIRequest{Prompt: prompt, Model: model, SessionID: cliSessionID, Resume: resume, UserID: u.ID, Native: true, MCPConfig: files.MCPConfig, Settings: files.Settings, SystemPrompt: assistantSystemPromptForMode(AssistantApprovalAuto)}, u, func(ev assistantStreamEvent) {
+			raw, _, err := runAssistantCLI(callCtx, assistantCLIRequest{Prompt: prompt, Model: model, SessionID: cliSessionID, Resume: resume, UserID: u.ID, Native: true, MCPConfig: files.MCPConfig, Settings: files.Settings, SystemPrompt: assistantSystemPromptForMode(AssistantApprovalAuto), ClaudeCode: claude, SessionRoot: root}, u, func(ev assistantStreamEvent) {
 				switch ev.Kind {
 				case "tool":
 					if strings.Contains(ev.Tool, "submit_assistant_reply") {
@@ -139,7 +147,7 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 					}
 				}
 			}
-			return redactAssistantSecrets(strings.ReplaceAll(reply.Message, user.CodeBuddyAPIKey, "[redacted]"), user), nil
+			return redactAssistantSecrets(reply.Message, user), nil
 		}
 		if ctx.Err() != nil {
 			return "", ctx.Err()

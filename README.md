@@ -113,7 +113,7 @@ New accounts join the **LoopForge demo project**, which includes an SOP made onl
 
 <br>
 
-- **Executors.** Pick one of ten CLIs beside the home composer, then a model. Every SOP role can choose its executor independently (built-in roles default to CodeBuddy). Requirement clarification, AI notification summaries, Bot replies and run evals currently use CodeBuddy, so their model pickers list CodeBuddy models only and the server refuses a model of another CLI instead of switching it to CodeBuddy; scheduled assistant tasks run on the CLI the task selects.
+- **Executors.** Pick one of ten CLIs beside the home composer, then a model. Every SOP role can choose its executor independently (built-in roles default to CodeBuddy). Requirement clarification, AI notification summaries, Bot replies and run evals run on CodeBuddy or Claude Code (Claude Code uses the user's key, or the platform's `CLAUDE_CODE_OAUTH_TOKEN` subscription when the user has none), so their model pickers list only those models and the server refuses a model of another CLI instead of switching it; scheduled assistant tasks run on the CLI the task selects.
 
   | Executor | Credentials | Installation |
   | --- | --- | --- |

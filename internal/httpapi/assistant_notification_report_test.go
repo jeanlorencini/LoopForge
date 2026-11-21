@@ -153,3 +153,33 @@ func TestSubmitNotificationReportValidationAndModeIsolation(t *testing.T) {
 		t.Fatalf("valid failed %v", err)
 	}
 }
+
+// A SOP report on a Claude Code model runs without a CodeBuddy key on the
+// platform subscription token, and fails as missing credentials without it.
+func TestSOPReportRunsOnClaudeCodeWithoutCodeBuddyKey(t *testing.T) {
+	store, err := repo.OpenTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	t.Setenv("AGENTFLOW_ASSISTANT_SESSION_DIR", t.TempDir())
+	store.PutUser(domain.User{ID: 42, LoginName: "executor"})
+	h := &assistantHandlers{deps: &deps{repo: store}}
+	calls := 0
+	h.generate = func(ctx context.Context, prompt string, user domain.User) (string, error) {
+		calls++
+		gateway := &agentToolGateway{deps: h.deps}
+		_, err := gateway.callTool(ctx, activeReportSession(t), json.RawMessage(`{"name":"submit_notification_report","arguments":{"body":"完成 sk-ant-oat01-report"}}`))
+		return "", err
+	}
+	run := domain.Run{ID: "run-claude-report", ExecutionContext: domain.TelemetryContext{ResponsibleUserID: 42}}
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	if _, err = h.generateSOPReport(context.Background(), run, "claude-code:sonnet", "资料"); !errors.Is(err, notification.ErrReportCredentials) || calls != 0 {
+		t.Fatalf("no Claude credential: err=%v calls=%d", err, calls)
+	}
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-report")
+	report, err := h.generateSOPReport(context.Background(), run, "claude-code:sonnet", "资料")
+	if err != nil || calls != 1 || report.Body != "完成 [redacted]" {
+		t.Fatalf("report=%+v calls=%d err=%v", report, calls, err)
+	}
+}

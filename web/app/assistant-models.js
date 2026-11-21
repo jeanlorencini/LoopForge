@@ -149,8 +149,8 @@
   function renderList(menu, selectedId, onPick) {
     renderOptions(menu, catalog.models || [], selectedId, onPick);
   }
-  // Bot replies, run evals and the SOP preview build run on CodeBuddy only
-  // (clarification uses clarifyModels), so their pickers list CodeBuddy models and
+  // The SOP preview build runs on CodeBuddy only (clarification, Bot replies
+  // and run evals use clarifyModels), so its picker lists CodeBuddy models and
   // never offer a "codex:…" id the server would have to refuse.
   function codeBuddyModels() {
     return (catalog.models || []).filter(m => (m.engine || 'codebuddy') === 'codebuddy');

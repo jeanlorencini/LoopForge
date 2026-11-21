@@ -7,6 +7,7 @@ import (
 	"agentflow/internal/notification"
 	"agentflow/internal/repo"
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -210,5 +211,51 @@ func TestUnboundCardActorCannotMutateRun(t *testing.T) {
 	after, _ := s.RunState(run.ID)
 	if after.Nodes["gate"].Status != "waiting_approval" {
 		t.Fatal("unbound click changed run")
+	}
+}
+
+// A Bot on a Claude Code model replies without a CodeBuddy key: on the
+// sender's Claude key or, without one, the platform subscription token.
+func TestBotRepliesOnClaudeCodeWithoutCodeBuddyKey(t *testing.T) {
+	s, h, bot := botFixture(t)
+	s.UpdateUserCredentials(43, repo.UserCredentialUpdate{CodeBuddyAPIKeyClear: true})
+	bot.Model = "claude-code:opus"
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	calls := 0
+	h.generate = func(ctx context.Context, prompt string, user domain.User) (string, error) {
+		calls++
+		agentToolSessions.mu.Lock()
+		var session *AgentToolSession
+		for _, candidate := range agentToolSessions.sessions {
+			if candidate.Mode == AgentToolAssistant && candidate.UserID == user.ID {
+				session = candidate
+			}
+		}
+		agentToolSessions.mu.Unlock()
+		session.commitFinal(AgentTerminalResult{Kind: AgentTerminalAssistant, Assistant: &assistantReply{Message: "完成 sk-ant-oat01-bot"}})
+		return "", context.Canceled
+	}
+	item := domain.BotInteraction{SenderID: "new-wecom-user", Content: "现在有什么进展"}
+	reply, err := h.generateBotReply(context.Background(), bot, domain.BotConversation{ChatType: "single"}, nil, item)
+	if err != nil || !strings.Contains(reply, "Claude Code Key") || calls != 0 {
+		t.Fatalf("no Claude credential: reply=%q err=%v calls=%d", reply, err, calls)
+	}
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-bot")
+	reply, err = h.generateBotReply(context.Background(), bot, domain.BotConversation{ChatType: "single"}, nil, item)
+	if err != nil || reply != "完成 [redacted]" || calls != 1 {
+		t.Fatalf("platform token: reply=%q err=%v calls=%d", reply, err, calls)
+	}
+}
+
+// The Bot editor saves Claude Code models; other CLIs stay refused.
+func TestBotSavesClaudeCodeModel(t *testing.T) {
+	f := cvBNewHTTPFixture(t)
+	for model, want := range map[string]int{"claude-code:opus": http.StatusOK, "codex:gpt-5.5": http.StatusBadRequest, "claude-code:": http.StatusBadRequest} {
+		rec := cvBRequest(t, f, http.MethodPost, "/api/notification-bots", map[string]any{
+			"projectId": "platform", "name": "Bot", "botId": "claude-" + strings.ReplaceAll(model, ":", "-"), "secret": "secret", "enabled": true, "model": model,
+		}, true)
+		if rec.Code != want {
+			t.Errorf("model %q = %d want %d: %s", model, rec.Code, want, rec.Body.String())
+		}
 	}
 }
