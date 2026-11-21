@@ -54,7 +54,7 @@ func NodeReminderBindings(bindings []NotificationBinding) []NotificationBinding 
 	out := []NotificationBinding{}
 	for _, b := range bindings {
 		events := []string{"waiting", "failed"}
-		out = append(out, NotificationBinding{BotID: b.BotID, Events: events, Scope: "node", WaitingPolicy: "actionable", Template: "### {{status}}\n需求：{{issue.title}}\nSOP：{{workflow}}\n节点：{{node}}\n{{error}}\n查看详情：{{url}}"})
+		out = append(out, NotificationBinding{BotID: b.BotID, Events: events, Scope: "node", WaitingPolicy: "actionable", Template: "### {{status}}\nRequisito: {{issue.title}}\nSOP: {{workflow}}\nNó: {{node}}\n{{error}}\nDetalhes: {{url}}"})
 	}
 	return out
 }
@@ -72,10 +72,10 @@ func BuildWorkflowNotificationResult(run Run) string {
 		}
 	}
 	for _, node := range run.WorkflowSnapshot.Nodes {
-		status, result, errorText := "未执行", "", ""
+		status, result, errorText := "Não executado", "", ""
 		if nr := run.Nodes[node.ID]; nr != nil {
 			status = nr.Status
-			if label, ok := map[string]string{"succeeded": "已完成", "failed": "失败", "skipped": "已跳过", "pending": "未执行", "running": "执行中", "waiting_approval": "待人工处理"}[status]; ok {
+			if label, ok := map[string]string{"succeeded": "Concluído", "failed": "Falhou", "skipped": "Ignorado", "pending": "Não executado", "running": "Em execução", "waiting_approval": "Aguardando ação"}[status]; ok {
 				status = label
 			}
 			result = nr.Output
@@ -90,12 +90,12 @@ func BuildWorkflowNotificationResult(run Run) string {
 				plain = ai.Summary
 			}
 		}
-		section := "### " + NotificationText(node.Name, 160) + "（" + status + "）"
+		section := "### " + NotificationText(node.Name, 160) + " (" + status + ")"
 		if text := NotificationText(plain, budget); text != "" {
 			section += "\n" + text
 		}
 		if errorText != "" {
-			section += "\n失败原因：" + NotificationText(errorText, 600)
+			section += "\nMotivo da falha: " + NotificationText(errorText, 600)
 		}
 		sections = append(sections, section)
 	}
@@ -103,7 +103,7 @@ func BuildWorkflowNotificationResult(run Run) string {
 	if !generatedAny {
 		return body
 	}
-	content := AINotificationContent{Title: run.WorkflowSnapshot.Name + " · SOP 已完成", Summary: body, Body: body, Simulated: simulated}
+	content := AINotificationContent{Title: run.WorkflowSnapshot.Name + " · SOP concluído", Summary: body, Body: body, Simulated: simulated}
 	raw, _ := json.Marshal(content)
 	return body + "\n\n```notification\n" + string(raw) + "\n```"
 }

@@ -40,6 +40,9 @@ const DefaultNotificationReportModel = "default"
 
 const BotProviderTelegram = "telegram"
 
+// NotificationNoIssue fills {{issue.title}} when the run has no linked requirement.
+const NotificationNoIssue = "Sem requisito vinculado"
+
 type NotificationReportRequest struct {
 	Binding NotificationBinding
 	Context NotificationContext

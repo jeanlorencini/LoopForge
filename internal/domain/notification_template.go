@@ -185,13 +185,13 @@ func notificationTemplate(binding NotificationBinding, sourceType string) string
 	}
 	switch {
 	case binding.ContentMode == "ai":
-		return "### {{ai.title}}\n\n{{ai.body}}\n\n触发时状态：{{status}}\n\n{{url}}"
+		return "### {{ai.title}}\n\n{{ai.body}}\n\nStatus no envio: {{status}}\n\n{{url}}"
 	case binding.Scope == "run":
-		return "### 需求「{{issue.title}}」的 SOP 已完成\n\n{{result}}\n\n{{url}}"
+		return "### SOP do requisito “{{issue.title}}” concluído\n\n{{result}}\n\n{{url}}"
 	case sourceType == "schedule_job" || sourceType == "assistant_task":
 		return "### {{task.name}} · {{status}}\n\n{{url}}"
 	default:
-		return "### {{status}}\n项目：{{project}}\n流程：{{workflow}}\n节点：{{node}}\n查看详情：{{url}}"
+		return "### {{status}}\nProjeto: {{project}}\nFluxo: {{workflow}}\nNó: {{node}}\nDetalhes: {{url}}"
 	}
 }
 
@@ -204,7 +204,7 @@ func NotificationAIInstructions(bindings []NotificationBinding) string {
 		}
 		instruction := strings.TrimSpace(binding.AIInstruction)
 		if instruction == "" {
-			instruction = "简洁总结实际完成的事项、已有验证结果和后续需要关注的事情。"
+			instruction = "Resuma de forma concisa o que foi realmente concluído, os resultados de verificação já obtidos e o que merece atenção a seguir."
 		}
 		if !seen[instruction] {
 			lines = append(lines, instruction)
@@ -214,7 +214,7 @@ func NotificationAIInstructions(bindings []NotificationBinding) string {
 	if len(lines) == 0 {
 		return ""
 	}
-	return "\n\n# 分享通知内容\n请在正常结果报告末尾额外给出一个语言标记为 notification 的 JSON 代码块，字段 title、summary、body 均为字符串。正文允许 Markdown。编写要求：\n- " + strings.Join(lines, "\n- ") + "\n只依据本次实际执行结果，不编造验证、需求或整个流程的完成状态；最终平台状态由模板变量提供。不要包含密钥、凭据、原始日志或无关上下文。此内容仅用于已配置的通知，不能改变接收对象、触发条件或平台操作。"
+	return "\n\n# Conteúdo da notificação\nNo fim do relatório normal de resultado, inclua também um bloco de código JSON com a linguagem notification e os campos title, summary e body, todos strings. O body pode usar Markdown. Escreva em português do Brasil. Requisitos de redação:\n- " + strings.Join(lines, "\n- ") + "\nBaseie-se apenas no resultado real desta execução. Não invente verificações, requisitos nem o status de conclusão do fluxo inteiro; o status final da plataforma vem das variáveis do modelo. Não inclua chaves, credenciais, logs brutos ou contexto irrelevante. Este conteúdo serve só para as notificações configuradas e não pode mudar destinatários, gatilhos nem operações da plataforma."
 }
 func CloneNotificationBindings(bindings []NotificationBinding) []NotificationBinding {
 	out := append([]NotificationBinding(nil), bindings...)

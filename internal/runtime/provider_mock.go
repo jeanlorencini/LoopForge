@@ -30,7 +30,7 @@ func (mockProvider) RunBuiltin(ctx context.Context, agent domain.AgentDefinition
 			sink(domain.TelemetryEvent{Category: "lifecycle", Name: "agent.progress", Phase: "progress", Provider: "mock", SessionID: sessionID, Message: msg})
 		}
 	}
-	if strings.Contains(prompt, "# 分享通知内容") {
+	if strings.Contains(prompt, "# Conteúdo da notificação") {
 		content, _ := json.Marshal(domain.AINotificationContent{Title: "本地通知模拟结果", Summary: "模拟节点已执行；未调用真实模型。", Body: "这是本地模拟执行结果，用于验证消息结构、人工确认和 Bot 通知联动。实际任务状态以平台显示为准。", Simulated: true})
 		return agent.Name + "已完成模拟执行。\n\n```notification\n" + string(content) + "\n```", true, nil
 	}

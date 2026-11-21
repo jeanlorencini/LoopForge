@@ -193,7 +193,7 @@ func (s *Service) ProcessOne(ctx context.Context) (bool, error) {
 	if item.EventType == "waiting" && item.WaitingPolicy == "event" {
 		run, _ := s.Store.RunState(item.RunID)
 		if waitingNodeStale(run, *item) {
-			item.Content += "\n\n此消息记录进入等待的状态；当前该次等待已结束，无需按旧提醒操作。"
+			item.Content += "\n\nEsta mensagem registra uma espera que já terminou. Não é preciso agir sobre este aviso."
 		}
 	}
 	if item.ReportState == "pending" {
@@ -206,7 +206,7 @@ func (s *Service) ProcessOne(ctx context.Context) (bool, error) {
 		}
 	}
 	content := item.Content
-	link := "请在平台运行记录中查看"
+	link := "Veja no histórico de execuções da plataforma."
 	if base, parseErr := url.Parse(s.PublicURL); parseErr == nil && (base.Scheme == "https" || base.Scheme == "http") && base.Host != "" {
 		if item.SourceType == "schedule_job" {
 			link = s.PublicURL + "/#/issues"

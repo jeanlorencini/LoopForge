@@ -39,7 +39,7 @@ func TestScheduledAssistantNotificationUsesModelOutputWithoutExtraCalls(t *testi
 	h := &assistantHandlers{deps: &deps{repo: s}}
 	h.generate = func(ctx context.Context, prompt string, user domain.User) (string, error) {
 		calls++
-		if !strings.Contains(prompt, "两句话总结") || !strings.Contains(prompt, "分享通知内容") {
+		if !strings.Contains(prompt, "两句话总结") || !strings.Contains(prompt, "Conteúdo da notificação") {
 			t.Error("AI instructions missing")
 		}
 		return "日报报告\n```notification\n{\"title\":\"日报\",\"summary\":\"今日完成登录优化\",\"body\":\"详细进展\"}\n```", nil

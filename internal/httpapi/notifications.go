@@ -302,7 +302,7 @@ func (h *notificationHandlers) test(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "请先选择并保存接收会话"})
 		return
 	}
-	content := "### 平台通知测试\n机器人：" + bot.Name + "\n这是一条测试通知，不代表实际任务状态。"
+	content := "### Teste de notificação\nBot: " + bot.Name + "\nEsta é uma notificação de teste e não representa o status de nenhuma tarefa."
 	now := time.Now().UTC()
 	item := domain.NotificationDelivery{ID: "test-" + randomID(), ProjectID: bot.ProjectID, BotID: bot.ID, EventType: "test", TargetID: bot.Target.ID, TargetName: bot.Target.Name, Content: content, Status: "sending", Attempts: 1, LeaseToken: randomID(), CreatedAt: now, NextAttemptAt: now}
 	until := now.Add(2 * time.Minute)
@@ -398,13 +398,13 @@ func (h *notificationHandlers) preview(c *gin.Context) {
 		return
 	}
 	project, _ := h.repo.Project(req.ProjectID)
-	values := map[string]string{"project": project.Name, "workflow": "需求交付流程", "node": "实现功能", "status": "节点已完成", "issue.title": "登录校验优化", "issue.id": "示例需求", "task.name": "每日进度汇总", "input": "优化登录校验并完成验证", "error": "示例错误（仅失败时可用）"}
+	values := map[string]string{"project": project.Name, "workflow": "需求交付流程", "node": "实现功能", "status": "Nó concluído", "issue.title": "登录校验优化", "issue.id": "示例需求", "task.name": "每日进度汇总", "input": "优化登录校验并完成验证", "error": "示例错误（仅失败时可用）"}
 	if req.Binding.Scope == "run" {
-		values["status"] = "SOP 已完成"
-		values["node"] = "全部节点"
+		values["status"] = "SOP concluído"
+		values["node"] = "Todos os nós"
 	}
 	if req.SourceType == "schedule_job" || req.SourceType == "assistant_task" {
-		values["status"] = "任务已完成"
+		values["status"] = "Tarefa concluída"
 	}
 	result := "已完成登录校验优化，并通过相关测试。\n\n```notification\n{\"title\":\"登录校验优化进展\",\"summary\":\"已完成校验优化，相关测试通过。\",\"body\":\"已完成校验优化，相关测试通过。后续可进行人工验收。\"}\n```"
 	if req.Binding.Scope == "run" {

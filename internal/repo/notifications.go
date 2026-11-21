@@ -192,7 +192,7 @@ func (r *NotificationsRepo) enqueueRunNotifications(tx *gorm.DB, run domain.Run,
 		for _, binding := range runNotificationBindings(run, node, runTrigger) {
 			trigger := nodeTrigger
 			nodeID := node.ID
-			labelPrefix := "节点"
+			labelPrefix := "Nó"
 			if binding.Scope == "run" {
 				trigger = runTrigger
 				nodeID = ""
@@ -203,7 +203,7 @@ func (r *NotificationsRepo) enqueueRunNotifications(tx *gorm.DB, run domain.Run,
 			if trigger == "" || !notificationEventSelected(binding, trigger) {
 				continue
 			}
-			values := map[string]string{"project": r.notificationProjectName(tx, projectID), "workflow": run.WorkflowSnapshot.Name, "node": node.Name, "input": run.Input, "status": notificationStatus(trigger, labelPrefix), "issue.title": "未关联需求"}
+			values := map[string]string{"project": r.notificationProjectName(tx, projectID), "workflow": run.WorkflowSnapshot.Name, "node": node.Name, "input": run.Input, "status": notificationStatus(trigger, labelPrefix), "issue.title": domain.NotificationNoIssue}
 			if run.ExecutionContext.IssueID != "" {
 				if issue, ok := r.issues.issueInTx(tx, run.ExecutionContext.IssueID); ok && issue.ProjectID == projectID {
 					values["issue.title"] = issue.Title
@@ -225,11 +225,11 @@ func (r *NotificationsRepo) enqueueRunNotifications(tx *gorm.DB, run domain.Run,
 			if binding.Scope == "run" {
 				sourceName = run.WorkflowSnapshot.Name
 				result = domain.BuildWorkflowNotificationResult(run)
-				values["node"] = "全部节点"
+				values["node"] = "Todos os nós"
 			}
 			item := domain.NotificationDelivery{ProjectID: projectID, BotID: binding.BotID, RunID: run.ID, NodeID: nodeID, EventType: trigger, Attempt: attempt, ReworkCount: rework, SourceType: "run", SourceID: run.ID, SourceName: sourceName}
 			key := fmt.Sprintf("run:%s:%d:%s", run.ID, seq, binding.BotID)
-			context := domain.NotificationContext{Values: values, Result: result, Fallback: sourceName + "：" + values["status"] + "。请在平台查看详情。", SourceType: "run"}
+			context := domain.NotificationContext{Values: values, Result: result, Fallback: sourceName + ": " + values["status"] + ". Veja os detalhes na plataforma.", SourceType: "run"}
 			if err := r.enqueueNotification(tx, key, binding, context, item); err != nil {
 				return err
 			}
@@ -272,10 +272,10 @@ func (r *NotificationsRepo) enqueueTaskNotifications(tx *gorm.DB, sourceType, id
 		if !notificationEventSelected(binding, trigger) {
 			continue
 		}
-		values := map[string]string{"project": r.notificationProjectName(tx, projectID), "task.name": name, "status": notificationStatus(trigger, "任务"), "error": errorText, "issue.title": "未关联需求"}
+		values := map[string]string{"project": r.notificationProjectName(tx, projectID), "task.name": name, "status": notificationStatus(trigger, "Tarefa"), "error": errorText, "issue.title": domain.NotificationNoIssue}
 		item := domain.NotificationDelivery{ProjectID: projectID, BotID: binding.BotID, EventType: trigger, SourceType: sourceType, SourceID: id, SourceName: name}
 		key := fmt.Sprintf("%s:%s:%d:%s:%s", sourceType, id, at.UTC().UnixMilli(), trigger, binding.BotID)
-		context := domain.NotificationContext{Values: values, Result: result, Fallback: name + "：" + values["status"] + "。请在平台查看详情。", SourceType: sourceType}
+		context := domain.NotificationContext{Values: values, Result: result, Fallback: name + ": " + values["status"] + ". Veja os detalhes na plataforma.", SourceType: sourceType}
 		if err := r.enqueueNotification(tx, key, binding, context, item); err != nil {
 			return err
 		}
@@ -294,11 +294,14 @@ func notificationEventSelected(binding domain.NotificationBinding, event string)
 func notificationStatus(trigger, scope string) string {
 	switch trigger {
 	case "succeeded":
-		return scope + "已完成"
+		if scope == "Tarefa" {
+			return "Tarefa concluída"
+		}
+		return scope + " concluído"
 	case "failed":
-		return scope + "失败"
+		return scope + " falhou"
 	default:
-		return "需要人工处理"
+		return "Aguardando sua ação"
 	}
 }
 func (r *NotificationsRepo) enqueueNotification(tx *gorm.DB, key string, binding domain.NotificationBinding, context domain.NotificationContext, item domain.NotificationDelivery) error {

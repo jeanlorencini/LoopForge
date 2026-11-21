@@ -47,7 +47,7 @@ func TestWaitingNodeStale(t *testing.T) {
 // carry WaitingPolicy "event". Those record the transition itself, so they are
 // delivered even after the wait ends, but must tell the reader it is over.
 func TestLegacyEventPolicyWaitingReminderMarksEndedWait(t *testing.T) {
-	const endedNote = "当前该次等待已结束"
+	const endedNote = "uma espera que já terminou"
 	for _, tc := range []struct {
 		name    string
 		resolve bool

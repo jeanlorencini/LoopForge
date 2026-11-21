@@ -25,17 +25,17 @@ func TestNotificationCardRendering(t *testing.T) {
 	}
 	item := domain.NotificationDelivery{ID: "d", NodeID: "review", SourceName: "Review", EventType: "waiting"}
 	actions := []map[string]any{{"text": "通过", "key": "approve", "style": 1}, {"text": "重试", "key": "retry", "style": 4}, {"text": "退回", "key": "reject", "style": 4}}
-	card := notificationCard(run, item, actions, "需求：Issue\nSOP：Workflow")
+	card := notificationCard(run, item, actions, "Requisito: Issue\nSOP: Workflow")
 	if card["action_menu"] != nil {
 		t.Fatal("unexpected action menu")
 	}
-	if got := notificationCardIssue("x\n需求： Issue "); got != "Issue" {
+	if got := notificationCardIssue("x\nRequisito:  Issue "); got != "Issue" {
 		t.Fatalf("issue = %q", got)
 	}
 	if got := cardReworkTarget(run, "review"); got != "修复" {
 		t.Fatalf("target = %q", got)
 	}
-	details := notificationCardDetails(run, item, "需求：Issue", "https://example.test/run")
+	details := notificationCardDetails(run, item, "Requisito: Issue", "https://example.test/run")
 	if !strings.Contains(details, "finding") || !strings.Contains(details, "查看运行详情") {
 		t.Fatalf("details = %q", details)
 	}
@@ -350,7 +350,7 @@ func TestQueueNotificationCardCancellationAndValidation(t *testing.T) {
 	svc := New(st)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err = svc.QueueNotificationCard(ctx, bot, item, "需求：Issue\n"+strings.Repeat("detail ", 30), "https://example.test/run")
+	err = svc.QueueNotificationCard(ctx, bot, item, "Requisito: Issue\n"+strings.Repeat("detail ", 30), "https://example.test/run")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("queue cancellation = %v", err)
 	}
@@ -360,7 +360,7 @@ func TestQueueNotificationCardCancellationAndValidation(t *testing.T) {
 	if err := st.DB.Create(&domain.BotInteraction{ID: cardID, BotID: bot.ID, Action: "notification", DeliveryID: valid.ID, Status: "replied"}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.QueueNotificationCard(context.Background(), bot, valid, "需求：Issue\nDetails", "https://example.test/run"); err != nil {
+	if err := svc.QueueNotificationCard(context.Background(), bot, valid, "Requisito: Issue\nDetails", "https://example.test/run"); err != nil {
 		t.Fatalf("valid card queue = %v", err)
 	}
 	expired := item

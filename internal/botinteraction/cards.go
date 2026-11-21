@@ -162,7 +162,7 @@ func notificationCard(run domain.Run, item domain.NotificationDelivery, actions 
 	if strings.TrimSpace(reason) == "" {
 		for _, line := range strings.Split(content, "\n") {
 			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "需求：") || strings.HasPrefix(line, "SOP：") || strings.HasPrefix(line, "节点：") || strings.HasPrefix(line, "查看详情：") {
+			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "Requisito:") || strings.HasPrefix(line, "SOP:") || strings.HasPrefix(line, "Nó:") || strings.HasPrefix(line, "Detalhes:") {
 				continue
 			}
 			reason = line
@@ -182,7 +182,7 @@ func notificationCard(run domain.Run, item domain.NotificationDelivery, actions 
 	}
 	issue := notificationCardIssue(content)
 	title := issue
-	if title == "未关联需求" {
+	if title == domain.NotificationNoIssue {
 		title = run.WorkflowSnapshot.Name
 	}
 	rows := []map[string]string{
@@ -210,11 +210,11 @@ func notificationCard(run domain.Run, item domain.NotificationDelivery, actions 
 }
 func notificationCardIssue(content string) string {
 	for _, line := range strings.Split(content, "\n") {
-		if issue, ok := strings.CutPrefix(strings.TrimSpace(line), "需求："); ok && strings.TrimSpace(issue) != "" {
+		if issue, ok := strings.CutPrefix(strings.TrimSpace(line), "Requisito: "); ok && strings.TrimSpace(issue) != "" {
 			return strings.TrimSpace(issue)
 		}
 	}
-	return "未关联需求"
+	return domain.NotificationNoIssue
 }
 
 // Keep long evidence intact in a companion Markdown message; the enterprise

@@ -257,6 +257,13 @@ func TestRunNotificationBindings(t *testing.T) {
 	}
 }
 
+func TestNotificationStatusIsPortuguese(t *testing.T) {
+	for _, c := range [][3]string{{"succeeded", "Nó", "Nó concluído"}, {"succeeded", "Tarefa", "Tarefa concluída"}, {"failed", "SOP", "SOP falhou"}, {"waiting", "Nó", "Aguardando sua ação"}} {
+		if got := notificationStatus(c[0], c[1]); got != c[2] {
+			t.Errorf("%v: got %q", c, got)
+		}
+	}
+}
 func TestRunHasNodeFailureEvent(t *testing.T) {
 	cases := []struct {
 		name   string

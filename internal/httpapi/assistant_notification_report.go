@@ -11,7 +11,7 @@ import (
 )
 
 func (h *assistantHandlers) generateSOPReport(ctx context.Context, run domain.Run, model, prompt string) (domain.AINotificationContent, error) {
-	return h.generateReport(ctx, run, model, prompt, "你是整体交付报告编写者。只能根据提供的资料总结结果。仅允许调用 submit_notification_report，必须通过该工具提交报告，不能用普通文本代替。")
+	return h.generateReport(ctx, run, model, prompt, "Você escreve o relatório geral de entrega. Resuma o resultado apenas com base no material fornecido. Só é permitido chamar submit_notification_report; envie o relatório por essa ferramenta, nunca como texto comum.")
 }
 func (h *assistantHandlers) generateReport(ctx context.Context, run domain.Run, model, prompt, system string) (domain.AINotificationContent, error) {
 	user, ok := h.repo.User(run.ExecutionContext.ResponsibleUserID)
@@ -53,7 +53,7 @@ func (h *assistantHandlers) generateReport(ctx context.Context, run domain.Run, 
 	for attempt := 0; attempt <= nativeTerminalMaxRetries; attempt++ {
 		input := prompt
 		if attempt > 0 {
-			input = "上一轮没有有效提交报告。请修正参数并调用 submit_notification_report；普通文本不会被接收。\n" + prompt
+			input = "A rodada anterior não enviou um relatório válido. Corrija os argumentos e chame submit_notification_report; texto comum não é aceito.\n" + prompt
 		}
 		_, cliErr := generate(modelCtx, input, user)
 		if result, ok := session.takeFinal(); ok && result.Report != nil {

@@ -12,7 +12,7 @@ import (
 func TestNotificationCardShowsStructuredReasonAndRequiredAction(t *testing.T) {
 	run := domain.Run{WorkflowSnapshot: domain.WorkflowDefinition{Name: "验收 SOP"}, Nodes: map[string]*domain.NodeRun{"review": {Error: "generic runner failed", GateResult: &domain.GateResult{Reason: "缺少回滚方案，无法自动批准", ActionRequired: "请负责人补充回滚方案"}}}}
 	item := domain.NotificationDelivery{ID: "delivery", NodeID: "review", SourceName: "方案审查", EventType: "waiting"}
-	card := notificationCard(run, item, nil, "### 需要人工处理\n需求：未关联需求\nSOP：验收 SOP\n节点：方案审查\ngeneric runner failed")
+	card := notificationCard(run, item, nil, "### Aguardando sua ação\nRequisito: "+domain.NotificationNoIssue+"\nSOP: 验收 SOP\nNó: 方案审查\ngeneric runner failed")
 	body := card["sub_title_text"].(string)
 	if !strings.Contains(body, "缺少回滚方案") || !strings.Contains(body, "请负责人补充回滚方案") || strings.Contains(body, "generic") {
 		t.Fatal(body)
@@ -22,6 +22,26 @@ func TestNotificationCardShowsStructuredReasonAndRequiredAction(t *testing.T) {
 	}
 	if len(card["horizontal_content_list"].([]map[string]string)) != 3 {
 		t.Fatal(card)
+	}
+}
+func TestNotificationCardReadsPortugueseReminderLines(t *testing.T) {
+	run := domain.Run{WorkflowSnapshot: domain.WorkflowDefinition{Name: "SOP X"}}
+	item := domain.NotificationDelivery{NodeID: "gone", SourceName: "Revisão", EventType: "failed"}
+	// Real reminder template with an unnamed node: its empty label lines must not become the reason.
+	content, _, err := domain.RenderNotification(domain.NodeReminderBindings([]domain.NotificationBinding{{BotID: "b"}})[0], domain.NotificationContext{Values: map[string]string{"status": "Nó falhou", "issue.title": "Login", "workflow": "SOP X", "error": "boom"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	card := notificationCard(run, item, nil, content)
+	if body := card["sub_title_text"].(string); body != "原因：boom" {
+		t.Fatal(body)
+	}
+	if issue := card["horizontal_content_list"].([]map[string]string)[0]["value"]; issue != "Login" {
+		t.Fatal(issue)
+	}
+	card = notificationCard(run, item, nil, "### Nó falhou\nRequisito: "+domain.NotificationNoIssue)
+	if title := card["main_title"].(map[string]string)["title"]; title != "SOP X" {
+		t.Fatal(title)
 	}
 }
 func TestNotificationCardFailureAndLengthLimits(t *testing.T) {
@@ -42,7 +62,7 @@ func TestLongCardKeepsContextAndEvidenceInCompanionMessage(t *testing.T) {
 	reason := strings.Repeat("回滚验证未完成，当前不能自动批准。\n", 35)
 	run := domain.Run{WorkflowSnapshot: domain.WorkflowDefinition{Name: "后端交付 SOP"}, Nodes: map[string]*domain.NodeRun{"review": {GateResult: &domain.GateResult{Summary: "缺少回滚验证，需要负责人确认", Reason: reason, ActionRequired: "补充回滚演练结果", Findings: []domain.GateFinding{{Title: "回滚测试缺失", Evidence: "未找到 rollback-test.log"}}}}}}
 	item := domain.NotificationDelivery{NodeID: "review", SourceName: "上线风险审查", EventType: "waiting"}
-	content := "需求：DNS 消息去重与可靠投递优化"
+	content := "Requisito: DNS 消息去重与可靠投递优化"
 	card := notificationCard(run, item, nil, content)
 	if !strings.Contains(card["main_title"].(map[string]string)["title"], "DNS") || !strings.Contains(card["sub_title_text"].(string), "负责人确认") {
 		t.Fatal(card)
@@ -56,7 +76,7 @@ func TestLongCardKeepsContextAndEvidenceInCompanionMessage(t *testing.T) {
 func TestLongDetailsPreserveRunLinkEvenAtMessageLimit(t *testing.T) {
 	run := domain.Run{Nodes: map[string]*domain.NodeRun{"fail": {Error: strings.Repeat("完整失败原因。", 4000)}}}
 	link := "https://loopforge-test.example.com/#/runs/run-test"
-	text := notificationCardDetails(run, domain.NotificationDelivery{NodeID: "fail"}, "需求：模拟验收", link)
+	text := notificationCardDetails(run, domain.NotificationDelivery{NodeID: "fail"}, "Requisito: 模拟验收", link)
 	if !strings.HasSuffix(text, "[查看运行详情]("+link+")") || len(text) > 16000 {
 		t.Fatalf("missing or oversized link footer: %d", len(text))
 	}
