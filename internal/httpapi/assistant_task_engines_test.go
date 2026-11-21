@@ -91,6 +91,21 @@ func TestScheduledTaskRunsOnTaskCLI(t *testing.T) {
 	if err := h.executeAssistantTask(context.Background(), user, &task); err == nil || !strings.Contains(task.LastError, "CodeBuddy API Key") {
 		t.Fatalf("missing codebuddy key = %v %q", err, task.LastError)
 	}
+
+	// With the platform's Claude subscription the keyless Claude Code run
+	// starts, and its turn carries the token.
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+	task.Model = "claude-code:opus"
+	var oauth string
+	h.generate = func(ctx context.Context, _ string, _ domain.User) (string, error) {
+		if cred := scheduledClaudeCredentialFrom(ctx); cred != nil && cred.APIKey == "" {
+			oauth = cred.OAuthToken
+		}
+		return "完成", nil
+	}
+	if err := h.executeAssistantTask(context.Background(), user, &task); err != nil || task.Model != "claude-code:opus" || oauth != "sk-ant-oat01-test" {
+		t.Fatalf("claude task on the platform token = %v model %q token %q error %q", err, task.Model, oauth, task.LastError)
+	}
 }
 
 func TestScheduleJobAssistantUserNeedsModelCLIKey(t *testing.T) {

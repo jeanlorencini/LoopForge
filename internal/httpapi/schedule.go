@@ -263,10 +263,15 @@ func (h *scheduleHandlers) bindScheduleRunAs(c *gin.Context, job *domain.Schedul
 		return true
 	}
 	_, shared, ok := scheduleCredentialUser(h.repo, self, engine)
+	if !ok && stopOnly() {
+		return false
+	}
+	// A job saved without a model by someone CodeBuddy cannot serve runs on
+	// the Claude Code default instead of being refused.
+	if !ok && engine == assistantEngineCodeBuddy && scheduleSharedRequestedModel(requestedModel) == "" && scheduleClaudeCanRun(h.repo, self) {
+		job.AssistantModel, ok = assistantEngineClaude+":"+assistantDefaultModel, true
+	}
 	if !ok {
-		if stopOnly() {
-			return false
-		}
 		c.JSON(400, gin.H{"error": scheduleMissingKeyError(engine)})
 		return false
 	}
@@ -322,7 +327,11 @@ func scheduleMissingKeyError(engine string) string {
 	if engine != assistantEngineCodeBuddy {
 		return fmt.Sprintf("你还没有配置 %s API Key，平台共享 Key 只支持 CodeBuddy 模型：请先在个人配置中填写，或改选 CodeBuddy 模型", assistantEngineLabel(engine))
 	}
-	return "你还没有配置 CodeBuddy API Key，平台也没有配置共享 Key，定时任务无法执行：请先在个人配置中填写自己的 Key，或联系平台管理员配置共享 Key"
+	msg := "你还没有配置 CodeBuddy API Key，平台也没有配置共享 Key，定时任务无法执行：请先在个人配置中填写自己的 Key，或联系平台管理员配置共享 Key"
+	if claudeCodePlatformOAuthToken() != "" {
+		msg += "；也可以改选 Claude Code 模型，使用平台的 Claude 订阅执行"
+	}
+	return msg
 }
 
 func scheduleUserName(user domain.User) string {

@@ -8,6 +8,7 @@ import (
 
 	"agentflow/internal/domain"
 	"agentflow/internal/repo"
+	"agentflow/internal/runtime"
 )
 
 // scheduledSessionPolicy carries how a schedule job's AI run uses Studio
@@ -33,6 +34,29 @@ func withScheduledSessionPolicy(ctx context.Context, p scheduledSessionPolicy) c
 func scheduledSessionPolicyFrom(ctx context.Context) scheduledSessionPolicy {
 	p, _ := ctx.Value(scheduledSessionPolicyKey{}).(scheduledSessionPolicy)
 	return p
+}
+
+// scheduledClaudeKey carries the Claude credential one scheduler-started
+// generation runs with on the platform (see clarifyClaudeCredential). Only
+// that generation uses it: interactive turns and steer follow-ups, which run
+// as later generations, never use the platform token.
+type scheduledClaudeKey struct{}
+
+type scheduledClaude struct {
+	generationID string
+	cred         runtime.ProviderCredential
+}
+
+func withScheduledClaudeCredential(ctx context.Context, generationID string, cred runtime.ProviderCredential) context.Context {
+	return context.WithValue(ctx, scheduledClaudeKey{}, scheduledClaude{generationID, cred})
+}
+
+func scheduledClaudeCredentialFrom(ctx context.Context) *runtime.ProviderCredential {
+	v, ok := ctx.Value(scheduledClaudeKey{}).(scheduledClaude)
+	if !ok || v.generationID == "" || v.generationID != assistantControlScopeFrom(ctx).GenerationID {
+		return nil
+	}
+	return &v.cred
 }
 
 func (h *assistantHandlers) prepareScheduleJob(job domain.ScheduleJob) (string, error) {
@@ -194,8 +218,12 @@ func scheduleHasPersonalCredential(r *repo.Store, user domain.User, engine strin
 
 // scheduleCredentialUser keeps the actor's identity, substituting only the
 // CodeBuddy key and its environment when the platform sponsors the run.
+// Claude Code falls back to the platform subscription token, as clarification does.
 func scheduleCredentialUser(r *repo.Store, user domain.User, engine string) (domain.User, []string, bool) {
 	if scheduleHasPersonalCredential(r, user, engine) {
+		return user, nil, true
+	}
+	if engine == assistantEngineClaude && claudeCodePlatformOAuthToken() != "" {
 		return user, nil, true
 	}
 	if engine != assistantEngineCodeBuddy || r == nil {
@@ -208,6 +236,13 @@ func scheduleCredentialUser(r *repo.Store, user domain.User, engine string) (dom
 	user.CodeBuddyAPIKey = key.APIKey
 	user.CodeBuddyInternetEnvironment = key.InternetEnvironment
 	return user, key.Models, true
+}
+
+// scheduleClaudeCanRun reports whether a Claude Code job of user can run: on
+// their login machine, or on the platform with a usable key or the token.
+func scheduleClaudeCanRun(r *repo.Store, user domain.User) bool {
+	cred := clarifyClaudeCredential(user)
+	return cred.APIKey != "" || cred.OAuthToken != "" || scheduleLoginRunner(r, user.ID, assistantEngineClaude).ID != ""
 }
 
 // scheduleProjectWriter mirrors scheduleProjectAllowed for a stored user.

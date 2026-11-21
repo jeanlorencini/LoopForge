@@ -1,8 +1,12 @@
 package httpapi
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -139,6 +143,94 @@ func TestScheduleJobRunsWithTheSaversKey(t *testing.T) {
 	}
 }
 
+// Without any CodeBuddy key, the platform's Claude subscription token runs AI
+// jobs: a job saved without a model gets the Claude Code default, an explicit
+// Claude Code model is kept, and a CodeBuddy model is still refused.
+func TestScheduleJobFallsBackToClaudePlatformToken(t *testing.T) {
+	t.Setenv("AGENTFLOW_AUTH_REQUIRED", "true")
+	t.Setenv("AGENTFLOW_SESSION_SECRET", "schedule-claude-token-test-secret")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+	h, _ := workbenchFixture(t)
+	st := h.repo
+	if err := st.PutUser(domain.User{LoginName: "claude-saver"}); err != nil {
+		t.Fatal(err)
+	}
+	saver, _ := st.UserByLoginName("claude-saver")
+	if err := st.PutProject(domain.Project{ID: "claude-proj", Name: "Claude", OwnerID: saver.ID}); err != nil {
+		t.Fatal(err)
+	}
+	server := New(st, engine.New(st, runtime.NewManager(filepath.Join(t.TempDir(), "workspaces"))), tracker.NewService(), "", "")
+	job := func(model string) map[string]any {
+		body := map[string]any{"id": "claude-job", "projectId": "claude-proj", "name": "巡检", "skipDispatch": true, "assistantPrompt": "p", "intervalSec": 3600}
+		if model != "" {
+			body["assistantModel"] = model
+		}
+		return body
+	}
+	for _, model := range []string{"", "default"} {
+		saved := requestJSONAuthed[domain.ScheduleJob](t, server, saver, http.MethodPut, "/api/schedule-jobs", job(model), http.StatusOK)
+		if saved.AssistantModel != "claude-code:default" || saved.RunAsUserID != saver.ID {
+			t.Fatalf("model %q: saved model %q run as %d", model, saved.AssistantModel, saved.RunAsUserID)
+		}
+	}
+	saved := requestJSONAuthed[domain.ScheduleJob](t, server, saver, http.MethodPut, "/api/schedule-jobs", job("claude-code:claude-opus-5-5"), http.StatusOK)
+	if saved.AssistantModel != "claude-code:claude-opus-5-5" {
+		t.Fatalf("explicit Claude Code model = %q", saved.AssistantModel)
+	}
+	if code := scheduleAuthzStatus(t, server, saver, http.MethodPut, "/api/schedule-jobs", job("glm-5.1")); code != http.StatusBadRequest {
+		t.Fatalf("CodeBuddy model without a CodeBuddy key = %d", code)
+	}
+	a := &assistantHandlers{deps: &deps{repo: st}}
+	if user, shared, err := a.scheduleJobAssistantUser(saved, saved.AssistantModel); err != nil || user.ID != saver.ID || shared != nil {
+		t.Fatalf("run as = %d %v %v", user.ID, shared, err)
+	}
+	// The token belongs to the scheduler's own generation only, never to a
+	// steer follow-up or any other turn.
+	ctx := withScheduledClaudeCredential(context.Background(), "gen-1", clarifyClaudeCredential(saver))
+	scoped := func(id string) context.Context {
+		return context.WithValue(ctx, assistantControlScopeKey{}, assistantControlScope{GenerationID: id})
+	}
+	if cred := scheduledClaudeCredentialFrom(scoped("gen-1")); cred == nil || cred.OAuthToken != "sk-ant-oat01-test" {
+		t.Fatalf("scheduled generation credential = %+v", cred)
+	}
+	if scheduledClaudeCredentialFrom(scoped("gen-2")) != nil || scheduledClaudeCredentialFrom(ctx) != nil {
+		t.Fatal("another generation got the platform token")
+	}
+	// The schedule form lists Claude Code as usable only while the token exists.
+	scheduleClaude := func() (configured, listed bool) {
+		t.Helper()
+		c, rec := workbenchContext(saver, http.MethodGet, "/api/assistant/models?schedule=1", &bytes.Buffer{})
+		h.models(c)
+		var catalog assistantModelCatalog
+		if err := json.Unmarshal(rec.Body.Bytes(), &catalog); err != nil || rec.Code != http.StatusOK {
+			t.Fatalf("catalog status %d: %v", rec.Code, err)
+		}
+		configured = slices.ContainsFunc(catalog.Engines, func(e assistantEngineOption) bool { return e.ID == assistantEngineClaude && e.Configured })
+		listed = slices.ContainsFunc(catalog.Models, func(m assistantModel) bool { return m.Engine == assistantEngineClaude })
+		return
+	}
+	if configured, listed := scheduleClaude(); !configured || !listed {
+		t.Fatalf("schedule catalog with the token: configured=%v listed=%v", configured, listed)
+	}
+
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	if code := scheduleAuthzStatus(t, server, saver, http.MethodPut, "/api/schedule-jobs", job("")); code != http.StatusBadRequest {
+		t.Fatalf("no CodeBuddy key and no platform token = %d", code)
+	}
+	if configured, listed := scheduleClaude(); configured || listed {
+		t.Fatalf("schedule catalog without the token: configured=%v listed=%v", configured, listed)
+	}
+	// A loopback proxy key without the token cannot run on the platform, so
+	// a keyless CodeBuddy save is refused instead of moved to Claude Code.
+	if err := st.PutUser(domain.User{LoginName: "claude-saver", ClaudeCodeAPIKey: "proxy-key", ClaudeCodeBaseURL: "http://127.0.0.1:8317"}); err != nil {
+		t.Fatal(err)
+	}
+	saver, _ = st.UserByLoginName("claude-saver")
+	if code := scheduleAuthzStatus(t, server, saver, http.MethodPut, "/api/schedule-jobs", job("")); code != http.StatusBadRequest {
+		t.Fatalf("loopback Claude key without the token = %d", code)
+	}
+}
+
 // A job saved before the binding tries every candidate's own key before the
 // shared key, so a job whose recorded owner still has a key keeps running on
 // it after the project changes owner.
@@ -224,6 +316,13 @@ func TestScheduleJobMemberWithoutKeyCanStopIt(t *testing.T) {
 	}
 	if code := scheduleAuthzStatus(t, server, nokey, http.MethodPut, "/api/schedule-jobs", body(map[string]any{"enabled": true})); code != http.StatusBadRequest {
 		t.Fatalf("enabling without a key = %d", code)
+	}
+	// With the platform's Claude subscription a keyless stop still only
+	// stops: it neither moves the job to Claude Code nor takes it over.
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+	stopped = requestJSONAuthed[domain.ScheduleJob](t, server, nokey, http.MethodPut, "/api/schedule-jobs", body(map[string]any{"enabled": false}), http.StatusOK)
+	if stopped.AssistantModel != saved.AssistantModel || stopped.RunAsUserID != owner.ID {
+		t.Fatalf("keyless stop with the platform token = model %q run as %d", stopped.AssistantModel, stopped.RunAsUserID)
 	}
 }
 

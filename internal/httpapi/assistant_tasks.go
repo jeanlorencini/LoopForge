@@ -236,10 +236,15 @@ func (h *assistantHandlers) executeAssistantTask(ctx context.Context, user domai
 	// Select the credential and machine before creating the conversation.
 	model := strings.TrimSpace(task.Model)
 	var target *domain.AssistantExecutionTarget
+	// On the platform Claude Code runs on the user's key unless it is a
+	// loopback proxy, else on the subscription token.
+	claudeCred := clarifyClaudeCredential(user)
+	platformClaude := engine == assistantEngineClaude && (claudeCred.APIKey != "" || claudeCred.OAuthToken != "")
 	if machine.ID != "" && !machineOffline {
 		target = &domain.AssistantExecutionTarget{Pool: domain.ExecutionModeRunner, RunnerID: machine.ID}
+		platformClaude = false
 	} else {
-		if key, _ := assistantEngineCredential(user, engine); key == "" {
+		if key, _ := assistantEngineCredential(user, engine); key == "" && !platformClaude {
 			if machineOffline {
 				return fail(fmt.Sprintf("未配置 %s API Key。请启动 Runner，或在个人配置中填写 Key 后重试", assistantEngineLabel(engine)))
 			}
@@ -249,8 +254,11 @@ func (h *assistantHandlers) executeAssistantTask(ctx context.Context, user domai
 			return fail("未配置 CodeBuddy API Key")
 		}
 		var err error
-		if model, err = scheduledRunModel(ctx, model, user); err != nil {
-			return fail(err.Error())
+		// A Claude Code model was checked on save; the chat turn checks the id again.
+		if !platformClaude {
+			if model, err = scheduledRunModel(ctx, model, user); err != nil {
+				return fail(err.Error())
+			}
 		}
 	}
 	cliEngine, _ := assistantModelEngine(model)
@@ -293,6 +301,9 @@ func (h *assistantHandlers) executeAssistantTask(ctx context.Context, user domai
 	task.Model = model
 	if policy.Opened != nil {
 		policy.Opened(sessionID)
+	}
+	if platformClaude {
+		ctx = withScheduledClaudeCredential(ctx, g.ID, claudeCred)
 	}
 	// Like a chat turn, a scheduled run has no time limit: it ends when the
 	// CLI finishes or someone stops it from the conversation page.

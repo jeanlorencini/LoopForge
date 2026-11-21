@@ -267,12 +267,15 @@ func (h *assistantHandlers) models(c *gin.Context) {
 	if signedIn {
 		c.Header("Cache-Control", "private, no-store")
 		catalog.Engines = assistantEngineOptions(user, usingSharedKey)
+		catalog.ClarifyModels = clarifyPlatformClaudeModels(user)
 		var runnerLogin map[string]bool
 		if c.Query("schedule") == "1" {
 			runnerLogin = make(map[string]bool)
 			for i := range catalog.Engines {
 				engine := catalog.Engines[i].ID
-				if scheduleLoginRunner(h.repo, user.ID, engine).ID != "" {
+				// Without a Claude key, AI jobs run Claude Code on the platform token
+				// (scheduleCredentialUser), listed from the built-in catalog.
+				if scheduleLoginRunner(h.repo, user.ID, engine).ID != "" || (engine == assistantEngineClaude && len(catalog.ClarifyModels) > 0) {
 					runnerLogin[engine] = true
 					catalog.Engines[i].Configured = true
 				}
@@ -282,7 +285,6 @@ func (h *assistantHandlers) models(c *gin.Context) {
 		catalog.Models = append(catalog.Models, models...)
 		catalog.CursorModelsPending = pending
 		h.saveCursorCatalog(user)
-		catalog.ClarifyModels = clarifyPlatformClaudeModels(user)
 	}
 	c.JSON(200, catalog)
 }

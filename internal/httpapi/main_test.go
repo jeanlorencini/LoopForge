@@ -11,5 +11,7 @@ import (
 // them to a real directory shared by every test.
 func TestMain(m *testing.M) {
 	os.Unsetenv("AGENTFLOW_CONVERSATION_DIR")
+	// Claude Code falls back to this platform token; tests that need it set it.
+	os.Unsetenv("CLAUDE_CODE_OAUTH_TOKEN")
 	os.Exit(m.Run())
 }

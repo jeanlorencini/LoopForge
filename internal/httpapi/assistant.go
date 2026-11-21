@@ -174,7 +174,12 @@ func (h *assistantHandlers) chat(c *gin.Context) {
 	cliEngine, _ := assistantModelEngine(req.Model)
 	loginRunner := h.assistantLoginRunner(stored.ID, req.ExecutionTarget, cliEngine)
 	runnerLogin := loginRunner.ID != ""
-	user, model, refusal := h.assistantTurnUser(stored, req.Model, runnerLogin)
+	// Only a scheduler-started Claude Code turn may run on the platform token.
+	platformClaude := scheduledClaudeCredentialFrom(c.Request.Context())
+	if cliEngine != assistantEngineClaude || runnerLogin || (req.ExecutionTarget != nil && req.ExecutionTarget.RunnerID != "") {
+		platformClaude = nil
+	}
+	user, model, refusal := h.assistantTurnUser(stored, req.Model, runnerLogin || platformClaude != nil)
 	if refusal != "" {
 		c.JSON(400, gin.H{"error": refusal})
 		return
@@ -222,7 +227,7 @@ func (h *assistantHandlers) chat(c *gin.Context) {
 	if catalogEngine == assistantEngineCodeBuddy {
 		catalog = h.turnCatalog(c.Request.Context(), user, req.Model)
 	}
-	if !runnerLogin {
+	if !runnerLogin && platformClaude == nil {
 		req.Model = assistantAllowedUserModel(req.Model, catalog, user)
 	}
 	cliEngine, _ = assistantModelEngine(req.Model)
@@ -552,6 +557,10 @@ func (h *assistantHandlers) chat(c *gin.Context) {
 					prompt = assistantPlatformExecutionReminder + "\n" + prompt
 				}
 				cliReq := assistantCLIRequest{Executor: req.Executor, Prompt: prompt, Model: cliModel, Effort: req.Effort, SessionID: cliSessionID, Resume: resume, UserID: u.ID, Native: true, MCPConfig: mcp, Settings: settings, SystemPrompt: system, SessionRoot: cliRoot, RunnerLogin: runnerLogin, OnUsage: turnUsage.add, Workspace: req.workspaceMode, RemoteBinary: req.workspaceMode || toolSession.ExecutionRunnerID != "", Execute: h.conversationExecutor(toolSession, cliRoot)}
+				if !cliReq.RemoteBinary {
+					// The platform token never leaves the platform process.
+					cliReq.ClaudeCode = platformClaude
+				}
 				persistAttempt := func(unstarted bool) error {
 					if nativeSession != nil {
 						nativeSession.checkpoint.Unstarted = unstarted
@@ -648,6 +657,9 @@ func (h *assistantHandlers) chat(c *gin.Context) {
 				}
 				if ctx.Err() != nil {
 					return "", ctx.Err()
+				}
+				if mode == domain.AssistantModeWorkspace && platformClaude != nil && platformClaude.APIKey == "" {
+					return "", fmt.Errorf("平台 Claude 订阅只能在平台模式执行，定时任务不能进入工作区；请在个人配置填写 Claude Code API Key，或在默认执行机器启用账号登录")
 				}
 				next, err := h.switchConversationProcessMode(toolSession, cliRoot, mode)
 				if err != nil {
