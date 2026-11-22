@@ -95,7 +95,9 @@ type AgentToolSession struct {
 	mu           sync.Mutex
 	catalog      []agentToolDescriptor
 	terminalOnly bool
-	runIDs       []string
+	// codeRoot is the clarification analysis directory the code_* tools read.
+	codeRoot string
+	runIDs   []string
 	assets       []domain.AssistantAssetRef
 	// replyFiles are what Main Bot handed the user this turn: browser
 	// screenshots and workspace files it attached. Tool results never reach
@@ -266,6 +268,27 @@ func (s *AgentToolSession) SetTerminalOnly() {
 	s.catalog = nil
 	s.MCPServers = nil
 	s.mu.Unlock()
+}
+
+// SetCodeRoot offers the read-only code_* tools over dir to a CLI without
+// usable native file tools (Codex's sandbox cannot run in the platform container).
+func (s *AgentToolSession) SetCodeRoot(dir string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.codeRoot = dir
+	s.catalog = nil
+	s.mu.Unlock()
+}
+
+func (s *AgentToolSession) clarifyCodeRoot() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.codeRoot
 }
 
 type agentToolSessionRegistry struct {

@@ -34,13 +34,17 @@ func clarifyCLIHome(userID int64) string {
 
 // Older assessments have no owner metadata. Only resume those when the
 // conversation actually exists inside the current responsible user's HOME.
-// configDir is the CLI's config directory there (.codebuddy or .claude).
+// configDir is the CLI's config directory there (.codebuddy, .claude or .codex).
 func canResumeClarifySession(homeDir, configDir, sessionID string, sessionUserID, userID int64) bool {
 	if sessionUserID != 0 && sessionUserID != userID {
 		return false
 	}
 	if sessionID == "" || strings.ContainsAny(sessionID, `/\\*?[]`) || sessionID == "." || sessionID == ".." {
 		return false
+	}
+	if configDir == ".codex" {
+		// Codex resumes its own thread; the map beside HOME links the session to it.
+		return readCodexThread(filepath.Dir(homeDir), sessionID) != ""
 	}
 	files, err := filepath.Glob(filepath.Join(homeDir, configDir, "projects", "*", sessionID+".jsonl"))
 	if err != nil {
@@ -314,6 +318,9 @@ func prepareClarifyClaudeCommand(opts clarifyCommandOpts) (runtime.CommandSpec, 
 // resolveClarifyBin finds the CLI for a clarification model. Published images
 // do not bundle Claude Code, so a missing claude is installed on first use.
 func resolveClarifyBin(ctx context.Context, engine string) (string, error) {
+	if engine == assistantEngineCodex {
+		return resolveAssistantEngineBin(engine)
+	}
 	if engine != assistantEngineClaude {
 		return resolveCodeBuddyBin()
 	}
@@ -322,6 +329,72 @@ func resolveClarifyBin(ctx context.Context, engine string) (string, error) {
 		return runtime.EnsureClaudeCode(ctx)
 	}
 	return bin, err
+}
+
+// runClarifyCodexTurn runs one clarification turn on `codex app-server` with
+// the platform's own Codex login. Native tools stay off (the guard admits only
+// session MCP tools), so Codex reads code through the code_* tools. The thread
+// map lives beside HOME, keyed by the platform session ID.
+func runClarifyCodexTurn(ctx context.Context, workDir, bin, model, prompt, sessionID, homeDir string, resume bool, mcpConfig string, emit func(string, any)) (string, error) {
+	_, engineModel := assistantModelEngine(model)
+	root := filepath.Dir(homeDir)
+	// thread/start uses <root>/ws as the thread's working directory.
+	if err := os.MkdirAll(filepath.Join(root, "ws"), 0o700); err != nil {
+		return "", err
+	}
+	inv, err := prepareAssistantCodexInvocation(assistantEngineInvocationOpts{Bin: bin, Root: root, Config: mcpConfig, Prompt: prompt, Model: engineModel, SessionID: sessionID, Resume: resume})
+	if err != nil {
+		return "", err
+	}
+	if inv.resumeMissing {
+		return "", fmt.Errorf("澄清会话不存在，无法续接")
+	}
+	ok := false
+	defer func() { inv.finish(ok) }()
+	// shortcut: two concurrent clarifications of one user share HOME/.codex/auth.json and the
+	// first cleanup removes it; give each turn its own CODEX_HOME if that shows up in practice.
+	loginEnv, cleanup, err := runtime.PrepareHostCodexLogin(homeDir)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	command := inv.command.WithPrivateHomeDir(homeDir)
+	// The platform login replaces the responsible user's Codex key.
+	command.CredentialBindings = nil
+	command = runtime.WithCommandEnvironment(command, loginEnv)
+	var lines []string
+	turnErr := ""
+	sink := func(ev domain.TelemetryEvent) {
+		if ev.Name != "process.stdout" {
+			return
+		}
+		for _, line := range inv.translate(ev.Message) {
+			lines = append(lines, line)
+			var event struct {
+				Type  string `json:"type"`
+				Error string `json:"error"`
+			}
+			if json.Unmarshal([]byte(line), &event) == nil && event.Type == "error" {
+				turnErr = strings.TrimSpace(event.Error)
+			}
+			for _, ui := range clarifyStreamEvents(line) {
+				emit("thought", ui)
+			}
+		}
+	}
+	_, err = runtime.ExecuteLocalCommand(ctx, workDir, command, runtime.RunCredentials{}, sink)
+	if err == nil && turnErr != "" {
+		switch {
+		case strings.Contains(strings.ToLower(turnErr), "no conversation found with session id"):
+			err = fmt.Errorf("澄清会话不存在，无法续接")
+		case assistantAuthFailureText(turnErr):
+			err = fmt.Errorf("平台的 Codex 登录无效或已过期，请在服务器上重新执行 codex login")
+		default:
+			err = fmt.Errorf("Codex：%s", turnErr)
+		}
+	}
+	ok = err == nil
+	return strings.Join(lines, "\n"), err
 }
 
 func captureClarifySessionID(line string) string {

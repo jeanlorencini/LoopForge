@@ -101,7 +101,7 @@ function scheduleModelAPI(){return window.AgentFlowAssistantModels}
 function selectedClarifyModel(){
   const api=window.AgentFlowAssistantModels;
   const stored=localStorage.getItem('agentflow.clarifyModel')||'';
-  // Clarification runs on CodeBuddy and Claude Code; a saved "codex:…" id falls back.
+  // Clarification runs on CodeBuddy, Claude Code and GPT-6.2 Sol; another saved "codex:…" id falls back.
   if(api?.clarifyModel)return api.clarifyModel(stored);
   return stored||(api&&api.DEFAULT)||'default';
 }
@@ -145,7 +145,7 @@ function bindClarifyModelPicker(host){
         api.paint(toggle, id);
         menu.hidden=true;
         toggle.setAttribute('aria-expanded','false');
-      });
+      }, true);
     }
   };
 }

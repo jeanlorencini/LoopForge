@@ -20,12 +20,12 @@ import (
 // CodeBuddy only. A model of another CLI ("codex:…") must be refused up front,
 // not silently swapped for the CodeBuddy default.
 func TestClarifyModelEngineError(t *testing.T) {
-	for _, id := range []string{"", "default", "glm-5.1", "public-model", "claude-code:sonnet", "claude-code:claude-opus-5-5"} {
+	for _, id := range []string{"", "default", "glm-5.1", "public-model", "claude-code:sonnet", "claude-code:claude-opus-5-5", "codex:gpt-6.2-sol"} {
 		if err := clarifyModelEngineError(id); err != nil {
 			t.Fatalf("model %q refused: %v", id, err)
 		}
 	}
-	for _, id := range []string{"codex:gpt-5.5"} {
+	for _, id := range []string{"codex:gpt-5.5", "codex:gpt-6.2-astra"} {
 		if err := clarifyModelEngineError(id); err != errClarifyNeedsCodeBuddy {
 			t.Fatalf("model %q = %v, want errClarifyNeedsCodeBuddy", id, err)
 		}

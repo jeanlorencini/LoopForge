@@ -641,6 +641,11 @@ func (h *streamHandlers) executeClarify(ctx context.Context, issue domain.Issue,
 	if mcpHint := h.clarifyMCPInstructionsFor(issue, responsible, len(request.History) > 0, extras...); mcpHint != "" {
 		prompt.WriteString(mcpHint)
 	}
+	if engine == assistantEngineCodex && len(analyzedRepos) > 0 {
+		// Codex's sandboxed shell cannot run in the platform container.
+		toolSession.SetCodeRoot(workDir)
+		prompt.WriteString("\n\n## 读取代码\n本轮没有 Read/Grep/Glob：用 code_list_files、code_read_file、code_search 工具读取分析目录的代码，路径相对于分析目录。")
+	}
 	userMsg := prompt.String()
 	clarifyID := fmt.Sprintf("clarify-%d", time.Now().UnixNano())
 	modelID := clarifyAllowedModel(request.Model)
@@ -651,6 +656,9 @@ func (h *streamHandlers) executeClarify(ctx context.Context, issue domain.Issue,
 	if engine == assistantEngineClaude {
 		modelID = strings.TrimSpace(request.Model)
 		credentials.ClaudeCode = clarifyClaudeCredential(responsible)
+	}
+	if engine == assistantEngineCodex {
+		modelID = strings.TrimSpace(request.Model)
 	}
 	turnPrompt := userMsg
 	if resume {
@@ -752,6 +760,11 @@ func (h *streamHandlers) rememberClarifySession(issueID, sessionID string, userI
 }
 
 func (h *streamHandlers) runClarifyTurn(ctx context.Context, workDir, cbPath, model, prompt, runID, sessionID, homeDir string, resume bool, credentials runtime.RunCredentials, emit func(event string, payload any), opts clarifyTurnOpts) (any, string, string, error) {
+	if engine, _ := assistantModelEngine(model); engine == assistantEngineCodex {
+		// The platform session ID stays the reference; its Codex thread is in the thread map.
+		output, err := runClarifyCodexTurn(ctx, workDir, cbPath, model, prompt, sessionID, homeDir, resume, opts.MCPConfig, emit)
+		return nil, strings.TrimSpace(output), sessionID, err
+	}
 	command, err := prepareClarifyCommandWith(clarifyCommandOpts{
 		Bin: cbPath, Model: model, Prompt: prompt, RunID: runID, SessionID: sessionID, Resume: resume,
 		Native: opts.Native, MCPConfig: opts.MCPConfig, Settings: opts.Settings, SubmitOnly: opts.SubmitOnly,

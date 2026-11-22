@@ -367,6 +367,10 @@ func (h *agentToolGateway) dispatch(ctx context.Context, session *AgentToolSessi
 	if tool.Kind == "workspace" {
 		return h.callMainBotWorkspace(ctx, session, tool.Name, args)
 	}
+	if tool.Kind == "code" {
+		text, err := callClarifyCodeTool(session.clarifyCodeRoot(), tool.Name, args)
+		return redactAgentToolResult(text, session.User), err
+	}
 	if tool.Kind == "agentflow" {
 		if session.Mode == AgentToolClarify && !agentToolNameAllowed(AgentToolClarify, "agentflow", tool.UpstreamName) {
 			return "", errAgentToolForbidden

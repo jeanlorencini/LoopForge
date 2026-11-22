@@ -102,6 +102,38 @@ func PrepareRunnerAgentCLILogin(sandbox Sandbox, command CommandSpec) (map[strin
 	return env, cleanup, nil
 }
 
+// PrepareHostCodexLogin stages this process's own Codex login in homeDir/.codex
+// through the refresh lease, so a token refresh in the child never rotates the
+// source login. The control plane uses it for platform-side clarification.
+func PrepareHostCodexLogin(homeDir string) (map[string]string, func() error, error) {
+	login, _ := runnerLoginSpec("codex")
+	cleanup, env, err := prepareRunnerLogin(HostAgentCLIHome(homeDir), login, true)
+	if err != nil {
+		if cleanup != nil {
+			err = errors.Join(err, cleanup())
+		}
+		return nil, nil, err
+	}
+	if cleanup == nil {
+		cleanup = func() error { return nil }
+	}
+	return env, cleanup, nil
+}
+
+// HostCodexLoginAvailable reports whether this process has a Codex login file.
+func HostCodexLoginAvailable() bool {
+	dir := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		if home == "" {
+			return false
+		}
+		dir = filepath.Join(home, ".codex")
+	}
+	_, err := readRunnerLoginFile(dir, "auth.json")
+	return err == nil
+}
+
 func prepareRunnerLogin(home AgentCLIHome, login conversationLoginSpec, enabled bool, docker ...bool) (func() error, map[string]string, error) {
 	home.Rel = filepath.Join(home.Rel, login.dir)
 	target, err := openAgentCLIHome(home)

@@ -416,6 +416,7 @@ func (h *agentToolGateway) buildCatalog(ctx context.Context, session *AgentToolS
 		out = append(out, h.workspaceOpenDescriptorFor(session))
 	}
 	out = append(out, mainBotBrowserTools(session)...)
+	out = append(out, clarifyCodeToolDescriptors(session)...)
 	out = append(out, terminalToolDescriptors(session.Mode, session.ExecMode)...)
 	session.mu.Lock()
 	session.catalog = append([]agentToolDescriptor{}, out...)

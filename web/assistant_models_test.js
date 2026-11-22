@@ -80,6 +80,7 @@ const ctx = {
       clarifyModels: [
         { id: 'claude-code:claude-opus-5-5', name: 'Claude Opus 5.5', family: 'claude', engine: 'claude-code' },
         { id: 'claude-code:claude-sonnet-5-5', name: 'Claude Sonnet 5.5', family: 'claude', engine: 'claude-code' },
+        { id: 'codex:gpt-6.2-sol', name: 'GPT-6.2 Sol', family: 'gpt', engine: 'codex' },
       ],
     }),
   }),
@@ -145,6 +146,9 @@ vm.runInContext(moduleSource, ctx);
   assert.deepEqual(api.clarifyModels().map(m => m.id), ['model-a', 'model-b', 'claude-code:claude-opus-5-5', 'claude-code:claude-sonnet-5-5']);
   assert.equal(api.clarifyModel('claude-code:claude-sonnet-5-5'), 'claude-code:claude-sonnet-5-5');
   assert.equal(api.clarifyModel('codex:gpt-5.5'), 'default');
+  // Only requirement clarification runs the platform's Codex model; Bot replies and run evals do not.
+  assert.deepEqual(api.clarifyModels(true).map(m => m.id).slice(-1), ['codex:gpt-6.2-sol']);
+  assert.equal(api.clarifyModel('codex:gpt-6.2-sol'), 'codex:gpt-6.2-sol');
   assert.equal(api.codeBuddyModel('codex:gpt-5.5'), 'default');
   assert.equal(api.codeBuddyModel(''), 'default');
   assert.equal(api.codeBuddyModel('model-a'), 'model-a');
@@ -162,8 +166,8 @@ vm.runInContext(moduleSource, ctx);
 
   toggle.onclick({ stopPropagation() {} });
   assert.equal(menu.hidden, false, 'clicking 选择模型 must open the menu');
-  assert.equal(menu.children.length, 4, 'menu lists CodeBuddy and Claude Code models');
-  assert.ok(!menu.children.some(opt => opt.dataset.id.startsWith('codex:')), 'clarify menu hides Codex models');
+  assert.equal(menu.children.length, 5, 'menu lists CodeBuddy, Claude Code and the platform Codex model');
+  assert.deepEqual(menu.children.filter(opt => opt.dataset.id.startsWith('codex:')).map(opt => opt.dataset.id), ['codex:gpt-6.2-sol'], 'clarify menu hides other Codex models');
   assert.ok(menu.children[0].className.includes('is-active'), 'stored model is marked active');
 
   menu.children[1].onclick();
@@ -177,5 +181,7 @@ vm.runInContext(moduleSource, ctx);
   assert.equal(ctx.selectedClarifyModel(), 'default');
   store.set('agentflow.clarifyModel', 'claude-code:claude-sonnet-5-5');
   assert.equal(ctx.selectedClarifyModel(), 'claude-code:claude-sonnet-5-5');
+  store.set('agentflow.clarifyModel', 'codex:gpt-6.2-sol');
+  assert.equal(ctx.selectedClarifyModel(), 'codex:gpt-6.2-sol');
   console.log('assistant models ok');
 })().catch(err => { console.error(err); process.exit(1); });

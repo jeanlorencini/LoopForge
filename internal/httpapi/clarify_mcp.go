@@ -32,15 +32,35 @@ func clarifyAllowedModel(id string) string {
 }
 
 // errClarifyNeedsCodeBuddy is returned when a clarification asks for a model of
-// another CLI: clarification runs on CodeBuddy and Claude Code only, so a
-// "codex:…" id must be refused instead of being swapped for the CodeBuddy default.
-var errClarifyNeedsCodeBuddy = errors.New("需求澄清目前只支持 CodeBuddy 和 Claude Code 模型，请在模型列表中改选 CodeBuddy 或 Claude Code 模型")
+// another CLI: clarification runs on CodeBuddy, Claude Code and one Codex
+// model, so any other id must be refused instead of being swapped for the
+// CodeBuddy default.
+var errClarifyNeedsCodeBuddy = errors.New("需求澄清目前只支持 CodeBuddy、Claude Code 和 Codex GPT-6.2 Sol 模型，请在模型列表中改选")
+
+// clarifyCodexModel is the Codex model clarification runs on the platform's
+// own Codex login.
+const clarifyCodexModel = "gpt-6.2-sol"
 
 // clarifyModelEngineError reports whether id names a model of a CLI that
 // requirement clarification cannot run.
 func clarifyModelEngineError(id string) error {
-	if engine, _ := assistantModelEngine(id); engine != assistantEngineCodeBuddy && engine != assistantEngineClaude {
-		return errClarifyNeedsCodeBuddy
+	engine, model := assistantModelEngine(id)
+	if engine == assistantEngineCodeBuddy || engine == assistantEngineClaude || (engine == assistantEngineCodex && model == clarifyCodexModel) {
+		return nil
+	}
+	return errClarifyNeedsCodeBuddy
+}
+
+// clarifyPlatformCodexModels lists the Codex model clarification offers when
+// the platform has its own Codex login (codex login in the platform HOME).
+func clarifyPlatformCodexModels() []assistantModel {
+	if !runtime.HostCodexLoginAvailable() {
+		return nil
+	}
+	for _, model := range assistantEngineBuiltinModels(assistantEngineCodex) {
+		if model.ID == clarifyCodexModel {
+			return []assistantModel{{ID: assistantEngineCodex + ":" + model.ID, Name: model.Name, Family: assistantModelFamily(model.ID, assistantEngineCodex), Engine: assistantEngineCodex}}
+		}
 	}
 	return nil
 }

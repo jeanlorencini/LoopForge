@@ -167,18 +167,21 @@
     return value;
   }
   // Requirement clarification also runs on Claude Code: the user's own models
-  // plus clarifyModels, which the platform's Claude subscription serves.
-  function clarifyModels() {
+  // plus clarifyModels, which the platform's Claude subscription serves. Only
+  // requirement clarification runs the platform's Codex model; Bot replies and
+  // run evals pass withCodex=false.
+  const CLARIFY_CODEX_MODEL = 'codex:gpt-6.2-sol';
+  function clarifyModels(withCodex) {
     const listed = (catalog.models || []).filter(m => ['codebuddy', 'claude-code'].includes(m.engine || 'codebuddy'));
-    const extra = (catalog.clarifyModels || []).filter(m => !listed.some(l => l.id === m.id));
+    const extra = (catalog.clarifyModels || []).filter(m => !listed.some(l => l.id === m.id) && (withCodex || m.engine !== 'codex'));
     return listed.concat(extra);
   }
-  function renderClarifyList(menu, selectedId, onPick) {
-    renderOptions(menu, clarifyModels(), selectedId, onPick);
+  function renderClarifyList(menu, selectedId, onPick, withCodex) {
+    renderOptions(menu, clarifyModels(withCodex), selectedId, onPick);
   }
   function clarifyModel(id) {
     const value = String(id || '').trim();
-    if (/^claude-code:/.test(value)) return value;
+    if (/^claude-code:/.test(value) || value === CLARIFY_CODEX_MODEL) return value;
     return codeBuddyModel(value);
   }
   async function fetchCatalog() {
