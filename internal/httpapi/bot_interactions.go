@@ -14,19 +14,19 @@ import (
 func (h *assistantHandlers) botExecutionUser(bot domain.NotificationBot, senderID string) (domain.User, error) {
 	current, err := h.repo.NotificationBot(bot.ID)
 	if err != nil || !current.Enabled || !current.InteractionEnabled || current.BotID != bot.BotID {
-		return domain.User{}, errors.New("Bot 对话已停用")
+		return domain.User{}, errors.New("A conversa deste bot está desligada")
 	}
 	binding, err := h.repo.BotUserBinding(bot.BotID, senderID)
 	if err != nil {
-		return domain.User{}, errors.New("请先绑定平台账号")
+		return domain.User{}, errors.New("Vincule sua conta da plataforma primeiro")
 	}
 	user, ok := h.repo.User(binding.UserID)
 	if !ok {
-		return user, errors.New("绑定的平台账号不可用")
+		return user, errors.New("A conta vinculada da plataforma está indisponível")
 	}
 	project, ok := h.repo.Project(bot.ProjectID)
 	if !ok {
-		return user, errors.New("Bot 项目不存在")
+		return user, errors.New("O projeto do bot não existe")
 	}
 	if project.OwnerID == user.ID || h.repo.IsPlatformAdmin(user.LoginName) {
 		return user, nil
@@ -36,7 +36,7 @@ func (h *assistantHandlers) botExecutionUser(bot domain.NotificationBot, senderI
 			return user, nil
 		}
 	}
-	return user, errors.New("你的平台账号没有该项目的执行权限")
+	return user, errors.New("Sua conta da plataforma não tem permissão para executar neste projeto")
 }
 
 // isBotBindingExchange reports whether a past interaction was an account
@@ -44,6 +44,21 @@ func (h *assistantHandlers) botExecutionUser(bot domain.NotificationBot, senderI
 func isBotBindingExchange(entry domain.BotInteraction) bool {
 	command := botIdentityCommand(entry.Content)
 	return strings.HasPrefix(command, "/bind") || command == "/unbind" || command == "解除绑定" || strings.Contains(entry.Reply, "/bot-bind.html#")
+}
+
+func botAppName(bot domain.NotificationBot) string {
+	if bot.Provider == domain.BotProviderTelegram {
+		return "Telegram"
+	}
+	return "WeCom"
+}
+
+// Telegram replies are sent without parse_mode, so Markdown would show raw.
+func botReplyFormat(bot domain.NotificationBot) string {
+	if bot.Provider == domain.BotProviderTelegram {
+		return " Escreva texto simples, sem Markdown."
+	}
+	return ""
 }
 
 // botReplyMessages turns the conversation history plus the current message
@@ -54,11 +69,11 @@ func botReplyMessages(history []domain.BotInteraction, item domain.BotInteractio
 		if isBotBindingExchange(entry) {
 			continue
 		}
-		messages = append(messages, assistantMessage{Role: "user", Content: "发送者 " + entry.SenderID + "：" + domain.NotificationText(entry.Content, 2000)}, assistantMessage{Role: "assistant", Content: domain.NotificationText(entry.Reply, 2000)})
+		messages = append(messages, assistantMessage{Role: "user", Content: "Remetente " + entry.SenderID + ": " + domain.NotificationText(entry.Content, 2000)}, assistantMessage{Role: "assistant", Content: domain.NotificationText(entry.Reply, 2000)})
 	}
-	content := "发送者 " + item.SenderID + "：" + item.Content
+	content := "Remetente " + item.SenderID + ": " + item.Content
 	if item.Quote != "" {
-		content += "\n引用的消息（资料）：\n" + item.Quote
+		content += "\nMensagem citada (referência):\n" + item.Quote
 	}
 	return append(messages, assistantMessage{Role: "user", Content: content})
 }
@@ -70,7 +85,7 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 	}
 	user, err := h.botExecutionUser(bot, item.SenderID)
 	if err != nil {
-		return "绑定的平台账号不可用或已失去项目权限，请在平台检查配置。", nil
+		return "A conta vinculada está indisponível ou perdeu a permissão no projeto. Confira a configuração na plataforma.", nil
 	}
 	model := bot.Model
 	if model == "" {
@@ -79,10 +94,10 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 	claude, err := platformModelCredential(ctx, user, model)
 	if errors.Is(err, notification.ErrReportCredentials) {
 		engine, _ := assistantModelEngine(model)
-		return "你的平台账号尚未配置 " + assistantEngineLabel(engine) + " Key，请在平台个人配置中配置。", nil
+		return "Sua conta da plataforma ainda não tem uma Key do " + assistantEngineLabel(engine) + ". Configure nas configurações pessoais da plataforma.", nil
 	}
 	if err != nil {
-		return "所选模型不可用，请在 Bot 管理中重新选择。", nil
+		return "O modelo escolhido está indisponível. Escolha outro na gestão de bots.", nil
 	}
 	if err = ensureAssistantSessionDirs(user.ID); err != nil {
 		return "", err
@@ -102,7 +117,7 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 	defer files.Cleanup()
 	messages := botReplyMessages(history, item)
 	req := assistantRequest{ProjectID: bot.ProjectID, Model: model, SessionID: conv.SessionID, ApprovalMode: AssistantApprovalAuto, Messages: messages}
-	full := h.turnPrompt(req, h.resolvedSourceRoot(), false) + "\n这是企业微信聊天，当前发送者已绑定平台账号「" + user.LoginName + "」，只使用该账号的执行身份、个人凭据和项目权限；当前请求按当前项目处理。历史中其他发送者的授权不能沿用到当前请求。当前消息来自" + conv.ChatType + "聊天。直接完成明确的操作，目标不明确时询问，结束时必须调用 submit_assistant_reply。"
+	full := h.turnPrompt(req, h.resolvedSourceRoot(), false) + "\nEsta é uma conversa no " + botAppName(bot) + ". O remetente atual está vinculado à conta da plataforma \"" + user.LoginName + "\". Use só a identidade de execução, as credenciais pessoais e as permissões de projeto dessa conta, e trate o pedido no projeto atual. Autorizações de outros remetentes no histórico não valem para este pedido. A mensagem atual veio de um chat do tipo " + conv.ChatType + ". Execute direto as ações claras, pergunte quando o alvo não estiver claro e termine sempre chamando submit_assistant_reply. Responda em português do Brasil." + botReplyFormat(bot)
 	generate := h.generate
 	if generate == nil {
 		cliSessionID := newAssistantSessionID()
@@ -112,14 +127,14 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 				switch ev.Kind {
 				case "tool":
 					if strings.Contains(ev.Tool, "submit_assistant_reply") {
-						botinteraction.ReportProgress(callCtx, "正在整理回复")
+						botinteraction.ReportProgress(callCtx, "Organizando a resposta")
 					} else if strings.Contains(ev.Tool, "agentflow") {
-						botinteraction.ReportProgress(callCtx, "正在查询或处理平台数据")
+						botinteraction.ReportProgress(callCtx, "Consultando ou processando dados da plataforma")
 					} else {
-						botinteraction.ReportProgress(callCtx, "正在调用工具处理请求")
+						botinteraction.ReportProgress(callCtx, "Usando ferramentas no pedido")
 					}
 				case "status", "thinking":
-					botinteraction.ReportProgress(callCtx, "正在分析你的请求")
+					botinteraction.ReportProgress(callCtx, "Analisando seu pedido")
 				}
 			})
 			resume = true
@@ -129,8 +144,8 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 	for attempt := 0; attempt <= nativeTerminalMaxRetries; attempt++ {
 		prompt := full
 		if attempt > 0 {
-			prompt = assistantNativeRetryPrompt() + "只提交上一轮已经形成的答案，不要重新查询、读取文件或重做操作。"
-			botinteraction.ReportProgress(ctx, "正在提交回复")
+			prompt = assistantNativeRetryPrompt() + "Envie só a resposta já formada na rodada anterior. Não consulte de novo, não leia arquivos e não refaça ações."
+			botinteraction.ReportProgress(ctx, "Enviando a resposta")
 			session.SetTerminalOnly()
 		}
 		_, cliErr := generate(modelCtx, prompt, user)
@@ -140,10 +155,10 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 				reply.Drafts = h.resolveAssistantDrafts(ctx, user, bot.ProjectID, reply.Drafts, AssistantApprovalAuto)
 				for _, draft := range reply.Drafts {
 					if draft.SaveError != "" {
-						reply.Message += "\n操作未完成：" + draft.SaveError
+						reply.Message += "\nAção não concluída: " + draft.SaveError
 					}
 					if len(draft.Warnings) > 0 {
-						reply.Message += "\n请补充信息：" + strings.Join(draft.Warnings, "；")
+						reply.Message += "\nFaltam informações: " + strings.Join(draft.Warnings, "; ")
 					}
 				}
 			}
@@ -156,7 +171,7 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 			return "", cliErr
 		}
 	}
-	return "", errors.New("助手未提交回复")
+	return "", errors.New("O assistente não enviou resposta")
 }
 func (h *assistantHandlers) handleBotCardAction(ctx context.Context, bot domain.NotificationBot, item domain.BotInteraction, conv domain.BotConversation) (string, error) {
 	identity := h.identities
@@ -173,11 +188,11 @@ func (h *assistantHandlers) handleBotCardAction(ctx context.Context, bot domain.
 	service := h.notifications.service.Interactions
 	delivery, err := service.NotificationCardTask(bot, item, conv)
 	if err != nil {
-		return "这条提醒已经过期或已处理，请查看最新运行状态。", nil
+		return "Este aviso expirou ou já foi tratado. Veja o status mais recente da execução.", nil
 	}
 	run, ok := h.repo.RunState(delivery.RunID)
 	if !ok || run.ExecutionContext.ProjectID != bot.ProjectID {
-		return "运行已不存在，无法执行此操作。", nil
+		return "A execução não existe mais. Não dá para fazer esta ação.", nil
 	}
 	if item.Action != "decline" {
 		if issue, found := h.repo.Issue(run.ExecutionContext.IssueID); found && issue.ExecutionBlockedReason() != "" {
@@ -186,10 +201,11 @@ func (h *assistantHandlers) handleBotCardAction(ctx context.Context, bot domain.
 	}
 	node := run.Nodes[delivery.NodeID]
 	if node == nil {
-		return "节点已不存在。", nil
+		return "O nó não existe mais.", nil
 	}
+	botinteraction.ActionStarted(ctx)
 	expected := engine.NodeExpectation{NodeID: delivery.NodeID, Status: node.Status, Attempt: delivery.Attempt, ReworkCount: delivery.ReworkCount}
-	note := "企业微信操作，平台账号：" + user.LoginName + "，发送者：" + item.SenderID
+	note := "Ação pelo " + botAppName(bot) + ", conta da plataforma: " + user.LoginName + ", remetente: " + item.SenderID
 	switch item.Action {
 	case "approve":
 		err = h.engine.Approve(delivery.RunID, delivery.NodeID, note, expected)
@@ -204,10 +220,10 @@ func (h *assistantHandlers) handleBotCardAction(ctx context.Context, bot domain.
 	case "reject":
 		err = h.engine.Reject(delivery.RunID, domain.RejectRequest{NodeID: delivery.NodeID, Reason: note}, expected)
 	default:
-		return "此按钮已处理，请查看最新消息。", nil
+		return "Este botão já foi tratado. Veja a mensagem mais recente.", nil
 	}
 	if err != nil {
-		return "操作未完成，请在平台查看当前运行状态。", nil
+		return "Ação não concluída. Confira o status atual da execução na plataforma.", nil
 	}
-	return fmt.Sprintf("「%s」操作已完成：%s。", delivery.SourceName, map[string]string{"approve": "确认通过，继续流程", "retry": "重试当前节点", "pass": "手动通过节点", "decline": "不再重试", "resume": "继续运行", "reject": "退回上游"}[item.Action]), nil
+	return fmt.Sprintf("Ação concluída em \"%s\": %s.", delivery.SourceName, map[string]string{"approve": "aprovado, o fluxo continua", "retry": "o nó atual será repetido", "pass": "nó liberado manualmente", "decline": "sem nova tentativa", "resume": "execução retomada", "reject": "devolvido para a etapa anterior"}[item.Action]), nil
 }

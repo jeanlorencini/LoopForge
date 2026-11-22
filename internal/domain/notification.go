@@ -40,6 +40,9 @@ const DefaultNotificationReportModel = "default"
 
 const BotProviderTelegram = "telegram"
 
+// TelegramBotIDPrefix precedes the bot's numeric id in a Telegram BotID.
+const TelegramBotIDPrefix = "telegram-"
+
 // NotificationNoIssue fills {{issue.title}} when the run has no linked requirement.
 const NotificationNoIssue = "Sem requisito vinculado"
 

@@ -20,6 +20,16 @@ func ReportProgress(ctx context.Context, status string) {
 	}
 }
 
+type actionStartedKey struct{}
+
+// ActionStarted tells the transport that a tapped action passed the binding,
+// permission and card checks and is about to run.
+func ActionStarted(ctx context.Context) {
+	if started, ok := ctx.Value(actionStartedKey{}).(func()); ok {
+		started()
+	}
+}
+
 type responseStream struct {
 	mu       sync.Mutex
 	started  bool
@@ -48,7 +58,7 @@ func (s *socket) streamWithState(ctx context.Context, item domain.BotInteraction
 		}
 		return nil
 	}
-	if state.started && content == "已收到，正在处理…" {
+	if state.started && content == "Recebido, processando…" {
 		return nil
 	}
 	err := s.request(ctx, "aibot_respond_msg", item.RequestID, map[string]any{
@@ -64,7 +74,7 @@ func (s *socket) streamWithState(ctx context.Context, item domain.BotInteraction
 	return nil
 }
 
-var errorsStreamUnavailable = errors.New("流式回复不可用")
+var errorsStreamUnavailable = errors.New("Resposta em streaming indisponível")
 
 // progressTurn keeps slow-model and queued work visible in one reply bubble.
 // Status publication is non-blocking so network delays cannot stall model tools.
@@ -81,11 +91,11 @@ func (s *socket) progressTurn(ctx context.Context, item domain.BotInteraction) (
 	started := time.Now()
 	go func() {
 		defer close(stopped)
-		phase := "正在理解你的请求"
+		phase := "Entendendo seu pedido"
 		ticker := time.NewTicker(8 * time.Second)
 		defer ticker.Stop()
 		// Initial receipt may already have been sent by the callback reader.
-		_ = s.stream(ctx, item, "已收到，正在处理…", false)
+		_ = s.stream(ctx, item, "Recebido, processando…", false)
 		for {
 			select {
 			case <-done:
@@ -95,7 +105,7 @@ func (s *socket) progressTurn(ctx context.Context, item domain.BotInteraction) (
 			case phase = <-updates:
 				// The next tick coalesces rapid tool events and bounds update frequency.
 			case <-ticker.C:
-				_ = s.stream(ctx, item, fmt.Sprintf("%s…（已等待 %d 秒）", phase, int(time.Since(started).Seconds())), false)
+				_ = s.stream(ctx, item, fmt.Sprintf("%s… (%d s de espera)", phase, int(time.Since(started).Seconds())), false)
 			}
 		}
 	}()

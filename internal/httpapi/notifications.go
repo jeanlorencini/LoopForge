@@ -149,11 +149,10 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 				c.JSON(400, gin.H{"error": "请填写 @BotFather 提供的 Telegram Bot Token"})
 				return
 			}
-			req.BotID = "telegram-" + m[1]
+			req.BotID = domain.TelegramBotIDPrefix + m[1]
 		} else if old != nil {
 			req.BotID = old.BotID
 		}
-		req.InteractionEnabled = new(bool)
 	}
 	if req.Name == "" || len([]rune(req.Name)) > 80 || req.BotID == "" || len(req.BotID) > 191 || len(req.Secret) > 512 {
 		c.JSON(400, gin.H{"error": "请填写有效的名称、Bot ID 和 Secret"})
@@ -223,7 +222,22 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 		}
 		for _, existing := range bots {
 			if existing.BotID == bot.BotID && existing.ID != bot.ID && bot.Enabled {
-				c.JSON(409, gin.H{"error": "这只企业微信 Bot 已在另一个配置中启用对话，请复用原配置"})
+				c.JSON(409, gin.H{"error": "Este bot já tem a conversa ligada em outra configuração. Reutilize a configuração existente."})
+				return
+			}
+		}
+		// The conversation lease is per BotID, so a fake token must not claim it.
+		if bot.Provider == domain.BotProviderTelegram && bot.Enabled {
+			token := req.Secret
+			if token == "" {
+				var err error
+				if token, err = h.repo.BotCredential(bot.ID); err != nil {
+					respond(c, err)
+					return
+				}
+			}
+			if err := h.service.CheckTelegramToken(c.Request.Context(), bot.BotID, token); err != nil {
+				c.JSON(400, gin.H{"error": "Não foi possível confirmar o token no Telegram: " + err.Error()})
 				return
 			}
 		}

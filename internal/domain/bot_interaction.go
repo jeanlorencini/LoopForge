@@ -15,6 +15,7 @@ type BotConversation struct {
 	BotID     string    `json:"botId" gorm:"index;size:191"`
 	ChatID    string    `json:"chatId" gorm:"size:191"`
 	ChatType  string    `json:"chatType" gorm:"size:16"`
+	ChatName  string    `json:"chatName,omitempty" gorm:"size:191;not null;default:''"`
 	SessionID string    `json:"sessionId" gorm:"size:64"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }

@@ -3,6 +3,7 @@ package botinteraction
 import (
 	"agentflow/internal/domain"
 	"agentflow/internal/repo"
+	"agentflow/internal/telegram"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -18,20 +19,21 @@ import (
 type Generate func(context.Context, domain.NotificationBot, domain.BotConversation, []domain.BotInteraction, domain.BotInteraction) (string, error)
 type Action func(context.Context, domain.NotificationBot, domain.BotInteraction, domain.BotConversation) (string, error)
 type Service struct {
-	Store    *repo.Store
-	Generate Generate
-	Action   Action
-	URL      string
-	mu       sync.Mutex
-	running  map[string]*connection
-	Done     chan struct{}
-	start    sync.Once
+	Store       *repo.Store
+	Generate    Generate
+	Action      Action
+	URL         string
+	TelegramURL string
+	mu          sync.Mutex
+	running     map[string]*connection
+	Done        chan struct{}
+	start       sync.Once
 }
 type connection struct {
 	bot    domain.NotificationBot
 	cancel context.CancelFunc
 	done   chan struct{}
-	socket *socket
+	conn   transport
 }
 
 func randomID() string {
@@ -46,7 +48,7 @@ func New(store *repo.Store) *Service {
 	if endpoint == "" {
 		endpoint = "wss://openws.work.weixin.qq.com"
 	}
-	return &Service{Store: store, URL: endpoint, running: map[string]*connection{}, Done: make(chan struct{})}
+	return &Service{Store: store, URL: endpoint, TelegramURL: telegram.BaseURL, running: map[string]*connection{}, Done: make(chan struct{})}
 }
 func (s *Service) Start(ctx context.Context) {
 	s.start.Do(func() {
@@ -156,29 +158,44 @@ func (s *Service) run(ctx context.Context, c *connection) {
 	for runCtx.Err() == nil {
 		secret, err := s.Store.BotCredential(c.bot.ID)
 		if err != nil {
-			s.state(c.bot, owner, "error", "机器人凭据不可用")
+			s.state(c.bot, owner, "error", "Credenciais do bot indisponíveis")
 			return
 		}
-		var ws *socket
-		ws, err = dial(runCtx, s.URL, c.bot.BotID, secret, func(received *socket, f Frame) {
-			s.receive(runCtx, c.bot, f, received)
-		})
+		var t transport
+		if c.bot.Provider == domain.BotProviderTelegram {
+			t, err = s.pollTelegram(runCtx, c.bot, secret)
+		} else {
+			var ws *socket
+			ws, err = dial(runCtx, s.URL, c.bot.BotID, secret, func(received *socket, f Frame) {
+				s.receive(runCtx, c.bot, f, received)
+			})
+			if err == nil {
+				t = ws
+			}
+		}
 		if err == nil {
 			s.mu.Lock()
-			c.socket = ws
+			c.conn = t
 			s.mu.Unlock()
 			s.state(c.bot, owner, "connected", "")
-			err = s.process(runCtx, c.bot, owner, ws)
-			ws.close()
+			err = s.process(runCtx, c.bot, owner, t)
+			t.close()
 			s.mu.Lock()
-			c.socket = nil
+			c.conn = nil
 			s.mu.Unlock()
 			backoff = time.Second
 		}
 		if runCtx.Err() != nil {
 			return
 		}
-		s.state(c.bot, owner, "reconnecting", "连接中断，正在重连")
+		// A refused getUpdates (bad token, active webhook) is shown as is;
+		// the platform never deletes another program's webhook.
+		var refused *telegram.Error
+		if errors.As(err, &refused) {
+			s.state(c.bot, owner, "error", refused.Error())
+		} else {
+			s.state(c.bot, owner, "reconnecting", "Conexão perdida, reconectando")
+		}
 		timer := time.NewTimer(backoff)
 		select {
 		case <-runCtx.Done():
@@ -238,7 +255,7 @@ func normalizeIncoming(bot domain.NotificationBot, f Frame) (domain.BotInteracti
 			return domain.BotInteraction{}, "", "", false
 		}
 	} else if incoming.Type != "text" && incoming.Type != "voice" {
-		text = "[不支持的消息类型，请发送文字]"
+		text = unsupportedMessageText
 	}
 	text = domain.NotificationText(text, 16000)
 	if strings.TrimSpace(text) == "" && action == "" {
@@ -266,23 +283,26 @@ func (s *Service) receive(ctx context.Context, bot domain.NotificationBot, f Fra
 			chat = delivery.TargetID
 		}
 	}
+	_ = s.accept(ctx, item, kind, chat, ws)
+}
+
+func (s *Service) accept(ctx context.Context, item domain.BotInteraction, kind, chat string, t transport) error {
 	inserted, err := s.Store.EnqueueBotInteraction(item, kind, chat)
-	if err != nil || !inserted {
-		if err != nil {
-			log.Printf("wecom event enqueue failed action=%s", item.Action)
-		}
-		return
+	if err != nil {
+		log.Printf("bot event enqueue failed action=%s", item.Action)
+		return err
 	}
 	// Card operations are direct engine controls. Reply with the actual result
 	// within the callback window rather than consuming it with a receipt-only update.
-
-	if item.Action == "" {
-		state := ws.streamState(item.ID)
-		go func() { _ = ws.streamWithState(ctx, item, "已收到，正在处理…", false, state) }()
+	if inserted {
+		t.acknowledge(ctx, item)
 	}
+	return nil
 }
 
-var ErrCardActionDeferred = errors.New("等待账号确认或项目授权")
+const unsupportedMessageText = "[Tipo de mensagem não suportado. Envie texto.]"
+
+var ErrCardActionDeferred = errors.New("Aguardando a confirmação da conta ou a permissão no projeto")
 
 func newConversationCommand(content string) bool {
 	text := strings.TrimSpace(content)
@@ -296,15 +316,15 @@ func newConversationCommand(content string) bool {
 	}
 	return text == "/new" || text == "开启新会话" || text == "新会话"
 }
-func (s *Service) process(ctx context.Context, bot domain.NotificationBot, owner string, ws *socket) error {
+func (s *Service) process(ctx context.Context, bot domain.NotificationBot, owner string, t transport) error {
 	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ws.done:
-			return errors.New("连接中断")
+		case <-t.closed():
+			return errors.New("Conexão perdida")
 		case <-ticker.C:
 		}
 		item, err := s.Store.ClaimBotInteraction(bot.ID, bot.BotID, owner)
@@ -320,16 +340,15 @@ func (s *Service) process(ctx context.Context, bot domain.NotificationBot, owner
 		}
 		if item.Action == "notification" {
 			delivery, lookupErr := s.Store.NotificationDelivery(item.DeliveryID)
-			valid := lookupErr == nil && len(ActionsForDelivery(s.Store, delivery)) > 0
-			if !valid {
+			var actions []map[string]any
+			if lookupErr == nil {
+				actions = ActionsForDelivery(s.Store, delivery)
+			}
+			if len(actions) == 0 {
 				if err = s.Store.ExpireBotCard(item.ID); err != nil {
 					return err
 				}
 				continue
-			}
-			var card map[string]any
-			if json.Unmarshal([]byte(item.Quote), &card) != nil {
-				return errors.New("通知卡片无效")
 			}
 			if item.Status != "ready" {
 				if err = s.Store.SaveBotReply(*item, "", ""); err != nil {
@@ -338,12 +357,15 @@ func (s *Service) process(ctx context.Context, bot domain.NotificationBot, owner
 			}
 			// A task_id may not be reused by the same Bot across sent cards.
 			// Keep the delivery prefix for callback routing; suffix each send attempt.
-			taskID := item.DeliveryID + "_" + randomID()[:12]
-			card["task_id"] = taskID
+			// Telegram callback_data holds at most 64 bytes, so it carries only the suffix.
+			taskID := randomID()[:12]
+			if bot.Provider != domain.BotProviderTelegram {
+				taskID = item.DeliveryID + "_" + taskID
+			}
 			if err = s.Store.SetBotCardTaskID(item.ID, taskID); err != nil {
 				return err
 			}
-			if err = ws.request(ctx, "aibot_send_msg", "", map[string]any{"chatid": conv.ChatID, "msgtype": "template_card", "template_card": card}); err != nil {
+			if err = t.sendCard(ctx, *item, conv.ChatID, taskID, actions); err != nil {
 				var business *ReplyError
 				if errors.As(err, &business) {
 					if err = s.Store.FailBotReply(item.ID, business.Error()); err != nil {
@@ -372,30 +394,32 @@ func (s *Service) process(ctx context.Context, bot domain.NotificationBot, owner
 			if item.Action == "notification_details" {
 				reply = item.Content
 			} else if time.Since(item.CreatedAt) > 10*time.Minute {
-				reply = "这条消息等待处理的时间较长，已停止自动执行。请重新发送当前请求。"
+				reply = "Esta mensagem esperou demais na fila e não foi executada. Envie o pedido de novo."
 			} else if newConversationCommand(item.Content) {
 				err = s.Store.NewBotConversation(*item)
-				reply = "已开启新会话。当前聊天将从新的上下文开始，历史记录保留。"
-			} else if item.Content == "[不支持的消息类型，请发送文字]" {
+				reply = "Nova conversa iniciada. As próximas mensagens partem de um contexto novo, e o histórico continua salvo."
+			} else if item.Content == unsupportedMessageText {
 				reply = item.Content
 			} else {
 				turnCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 				var stopProgress func()
 				if item.Action == "" {
-					turnCtx, stopProgress = ws.progressTurn(turnCtx, *item)
+					turnCtx, stopProgress = t.progressTurn(turnCtx, *item)
 				}
 				if item.Action != "" {
 					if s.Action == nil {
-						err = errors.New("操作服务未就绪")
+						err = errors.New("Serviço de ações indisponível")
 					} else {
-						reply, err = s.Action(turnCtx, bot, *item, conv)
+						tapped := *item
+						actionCtx := context.WithValue(turnCtx, actionStartedKey{}, func() { t.actionStarted(turnCtx, tapped) })
+						reply, err = s.Action(actionCtx, bot, *item, conv)
 					}
 				} else {
 					history, historyErr := s.Store.BotHistory(conv.SessionID)
 					err = historyErr
 					if err == nil {
 						if s.Generate == nil {
-							err = errors.New("助手服务未就绪")
+							err = errors.New("Serviço do assistente indisponível")
 						} else {
 							reply, err = s.Generate(turnCtx, bot, conv, history, *item)
 						}
@@ -409,16 +433,16 @@ func (s *Service) process(ctx context.Context, bot domain.NotificationBot, owner
 			if errors.Is(err, ErrCardActionDeferred) {
 				detail = ErrCardActionDeferred.Error()
 			} else if err != nil {
-				detail = "本次处理失败"
-				reply = "本次处理未完成，请稍后重试或到平台查看状态。"
+				detail = "Falha no processamento"
+				reply = "O pedido não foi concluído. Tente de novo mais tarde ou confira o status na plataforma."
 				if errors.Is(err, context.DeadlineExceeded) {
-					detail = "模型回复提交超时"
-					reply = "本次处理已超时，未能提交最终回复。请重新发送请求；若涉及修改操作，请先在平台核对状态，避免重复执行。"
+					detail = "Tempo esgotado ao enviar a resposta do modelo"
+					reply = "O pedido excedeu o tempo e a resposta final não foi enviada. Envie o pedido de novo. Se ele altera algo, confira antes o status na plataforma para não repetir a ação."
 				}
 			}
 			if strings.TrimSpace(reply) == "" {
-				detail = "助手未提交回复"
-				reply = "本次没有得到有效回复，请稍后重试。"
+				detail = "O assistente não enviou resposta"
+				reply = "Não houve resposta válida desta vez. Tente de novo mais tarde."
 			}
 			reply = domain.NotificationText(reply, 16000)
 			if reply, detail, err = s.saveReply(*item, reply, detail); err != nil {
@@ -428,25 +452,16 @@ func (s *Service) process(ctx context.Context, bot domain.NotificationBot, owner
 			item.LastError = detail
 		}
 		if item.Action != "" && item.Action != "notification_details" && item.CardTaskID != "" && item.LastError != ErrCardActionDeferred.Error() {
-			if updateErr := ws.updateActionCard(ctx, *item, item.Reply, true); updateErr != nil {
+			if updateErr := t.updateActionCard(ctx, *item, item.Reply, true); updateErr != nil {
 				code := 0
 				var business *ReplyError
 				if errors.As(updateErr, &business) {
 					code = business.Code
 				}
-				log.Printf("wecom action card update failed action=%s code=%d", item.Action, code)
+				log.Printf("bot action card update failed action=%s code=%d", item.Action, code)
 			}
 		}
-		if item.Action == "" {
-			err = ws.stream(ctx, *item, item.Reply, true)
-			if err != nil {
-				err = ws.send(ctx, conv.ChatID, item.Reply)
-			}
-		} else {
-			err = ws.send(ctx, conv.ChatID, item.Reply)
-		}
-		ws.streams.Delete(item.ID)
-		if err != nil {
+		if err = t.reply(ctx, *item, conv.ChatID, item.Reply); err != nil {
 			var business *ReplyError
 			if errors.As(err, &business) {
 				if err = s.Store.FailBotReply(item.ID, business.Error()); err != nil {

@@ -433,4 +433,4 @@ func (r *NotificationsRepo) NotificationDelivery(id string) (domain.Notification
 	return item, err
 }
 
-var ErrInteractiveBotAlreadyExists = fmt.Errorf("同一企业微信 Bot 只能有一个启用的对话配置")
+var ErrInteractiveBotAlreadyExists = fmt.Errorf("Este bot já tem a conversa ligada em outra configuração")

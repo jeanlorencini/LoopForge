@@ -360,3 +360,87 @@ func TestUnifiedSOPSetupFailureUsesStandardReminder(t *testing.T) {
 		t.Fatalf("%+v %s", items, f.content)
 	}
 }
+
+func TestTelegramSessionsListBoundChatsOfTheInteractiveConfig(t *testing.T) {
+	svc, _, _, _ := serviceFixture(t)
+	telegram := &fakeProvider{chats: []domain.BotChat{{ID: "from-getUpdates", Type: "group"}}}
+	svc.Telegram = telegram
+	interactive := domain.NotificationBot{ID: "tg", ProjectID: "p", Name: "TG", Provider: domain.BotProviderTelegram, BotID: "telegram-123", Enabled: true, InteractionEnabled: true, OwnerID: 1}
+	notifyOnly := interactive
+	notifyOnly.ID, notifyOnly.InteractionEnabled = "tg-notify", false
+	otherToken := notifyOnly
+	otherToken.ID = "tg-fake"
+	for bot, secret := range map[*domain.NotificationBot]string{&interactive: "123:t", &notifyOnly: "123:t", &otherToken: "123:fake"} {
+		if err := svc.Store.SaveNotificationBot(*bot, secret); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	for _, chat := range []string{"55", "66"} {
+		if _, err := svc.Store.EnqueueBotInteraction(domain.BotInteraction{ID: "m" + chat, BotID: "tg", SenderID: chat, Content: "oi"}, "single", chat); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := svc.Store.NameBotConversation(repo.BotConversationID("tg", "single", "55"), "Ana"); err != nil {
+		t.Fatal(err)
+	}
+	token, err := svc.Store.NewBotBindingChallenge("telegram-123", "55", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := svc.Store.ClaimBotBindingChallenge(token, 42, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = svc.Store.ConfirmBotUserBinding("telegram-123", "55", code, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, bot := range []domain.NotificationBot{interactive, notifyOnly} {
+		chats, err := svc.Sessions(context.Background(), bot)
+		if err != nil || len(chats) != 1 || chats[0].ID != "55" || chats[0].Name != "Ana" || chats[0].Type != "single" {
+			t.Fatalf("%s sessions %+v %v", bot.ID, chats, err)
+		}
+	}
+	chats, err := svc.Sessions(context.Background(), otherToken)
+	if err != nil || len(chats) != 1 || chats[0].ID != "from-getUpdates" {
+		t.Fatalf("a token that does not match the interactive config must use getUpdates: %+v %v", chats, err)
+	}
+}
+
+func TestTelegramCardOnlyForPrivateChatWithConversationOn(t *testing.T) {
+	for _, tc := range []struct {
+		target   string
+		chatting bool
+		card     bool
+	}{{"single", false, false}, {"group", true, false}, {"single", true, true}} {
+		store, err := repo.OpenTest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { store.Close() })
+		svc := New(store)
+		telegram := &fakeProvider{}
+		svc.Telegram = telegram
+		bot := domain.NotificationBot{ID: "tg", ProjectID: "p", Name: "TG", Provider: domain.BotProviderTelegram, BotID: "telegram-1", Enabled: true, InteractionEnabled: tc.chatting, OwnerID: 1, Target: &domain.BotChat{ID: "55", Name: "Ana", Type: tc.target}}
+		if err = store.SaveNotificationBot(bot, "1:t"); err != nil {
+			t.Fatal(err)
+		}
+		node := domain.WorkflowNode{ID: "n", Name: "Dev", Type: "agent", Notifications: []domain.NodeNotification{{BotID: bot.ID, Events: []string{"waiting"}}}}
+		run := domain.Run{ID: "r", WorkflowSnapshot: domain.WorkflowDefinition{Name: "SOP", Nodes: []domain.WorkflowNode{node}}, ExecutionContext: domain.TelemetryContext{ProjectID: "p"}, Status: "waiting", Nodes: map[string]*domain.NodeRun{"n": {NodeID: "n", Status: "waiting_approval", Attempt: 1}}, Events: []domain.RunEvent{{ID: "e", NodeID: "n", Type: "gate.waiting", Timestamp: time.Now().UTC()}}}
+		if err = store.PutRun(run); err != nil {
+			t.Fatal(err)
+		}
+		// No bot worker runs here, so a queued card waits for the deadline.
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		_, err = svc.ProcessOne(ctx)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		items, _ := store.NotificationDeliveries("p")
+		_, cardErr := store.BotInteraction(repo.BotMessageID("tg", "notification:"+items[0].ID))
+		if tc.card != (cardErr == nil) || tc.card == (telegram.sent == 1) {
+			t.Fatalf("%s chatting=%v: plain sends %d, card queued %v, want card %v", tc.target, tc.chatting, telegram.sent, cardErr == nil, tc.card)
+		}
+	}
+}

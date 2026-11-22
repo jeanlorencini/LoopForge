@@ -94,3 +94,27 @@ test('bot pure helpers enforce permissions, filtering, and status labels', async
   assert.match(values.target, /Alice/);
   assert.equal(values.allowed, true);
 });
+
+test('telegram bot editor offers the conversation switch and sends it', async (t) => {
+  const app = await loadApp();
+  t.after(app.close);
+  app.router.post('/api/notification-bots', (call) => ({ id: 'bot-tg', projectId: 'project-1', ownerId: 'user-1', secretConfigured: true, health: 'ready', target: null, ...call.body }));
+  app.router.get('/api/notification-deliveries', []);
+  app.evaluate(`botUI.projectId=state.projectFilter;botUI.items=[];botUI.loading=false;renderBots();botOpenEditor(null)`);
+  const host = () => app.document.querySelector('#botsContent');
+  const provider = host().querySelector('#botForm').elements.provider;
+  provider.value = 'telegram';
+  provider.dispatchEvent(new app.window.Event('change', { bubbles: true }));
+  const form = host().querySelector('#botForm');
+  assert.ok(form.elements.interactionEnabled, 'conversation switch shown for Telegram');
+  assert.match(host().textContent, /\/bind/);
+  form.elements.name.value = 'TG';
+  form.elements.secret.value = '123:token';
+  form.elements.interactionEnabled.checked = true;
+  form.dispatchEvent(new app.window.Event('input', { bubbles: true }));
+  form.dispatchEvent(new app.window.Event('submit', { bubbles: true, cancelable: true }));
+  await settle(8);
+  const body = app.router.calls.find(c => c.method === 'POST' && c.path === '/api/notification-bots').body;
+  assert.equal(body.provider, 'telegram');
+  assert.equal(body.interactionEnabled, true);
+});

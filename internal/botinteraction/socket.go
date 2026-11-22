@@ -14,9 +14,16 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type ReplyError struct{ Code int }
+// ReplyError is a reply the bot app refused; it fails that item only.
+type ReplyError struct {
+	Code    int
+	Message string
+}
 
 func (e *ReplyError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
 	return "企业微信拒绝了这次回复，请检查接收会话和 Bot 授权"
 }
 

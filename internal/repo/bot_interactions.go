@@ -61,17 +61,22 @@ func (r *BotInteractionsRepo) EnqueueBotInteraction(item domain.BotInteraction, 
 		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&conversation).Error; err != nil {
 			return err
 		}
+		now := time.Now().UTC()
 		item.ConversationID = conversation.ID
 		item.Status = "queued"
-		item.CreatedAt = time.Now().UTC()
-		item.UpdatedAt = item.CreatedAt
+		// A transport that knows when the message was sent (Telegram) sets
+		// CreatedAt, so process can refuse a backlog kept during an outage.
+		if item.CreatedAt.IsZero() {
+			item.CreatedAt = now
+		}
+		item.UpdatedAt = now
 		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&item)
 		inserted = result.RowsAffected == 1
 		if result.Error != nil {
 			return result.Error
 		}
 		if inserted {
-			return tx.Model(&conversation).Update("updated_at", item.CreatedAt).Error
+			return tx.Model(&conversation).Update("updated_at", now).Error
 		}
 		return nil
 	})
@@ -110,7 +115,7 @@ func (r *BotInteractionsRepo) ClaimBotInteraction(botID, leaseBotID, owner strin
 // A model turn interrupted by process loss must never be replayed automatically:
 // its platform tools may already have committed. Its reply can still be retried.
 func (r *BotInteractionsRepo) RecoverBotInteractions(botID string) error {
-	return r.DB.Model(&domain.BotInteraction{}).Where("bot_id = ? AND status = ?", botID, "running").Updates(map[string]any{"status": "ready", "reply": "上一轮处理已中断，执行结果可能已保存。请先查询状态，再决定是否继续操作。", "last_error": "执行中断", "updated_at": time.Now().UTC()}).Error
+	return r.DB.Model(&domain.BotInteraction{}).Where("bot_id = ? AND status = ?", botID, "running").Updates(map[string]any{"status": "ready", "reply": "A rodada anterior foi interrompida, e o resultado pode já ter sido salvo. Consulte o status antes de decidir se continua.", "last_error": "Execução interrompida", "updated_at": time.Now().UTC()}).Error
 }
 func (r *BotInteractionsRepo) SaveBotReply(item domain.BotInteraction, reply, detail string) error {
 	return r.DB.Model(&domain.BotInteraction{}).Where("id = ? AND status = ?", item.ID, "running").Updates(map[string]any{"status": "ready", "reply": reply, "last_error": detail, "updated_at": time.Now().UTC()}).Error
@@ -151,6 +156,28 @@ func (r *BotInteractionsRepo) BotConversations(botID string) ([]domain.BotConver
 	return rows, err
 }
 
+func (r *BotInteractionsRepo) NameBotConversation(id, name string) error {
+	return r.DB.Model(&domain.BotConversation{}).Where("id = ? AND chat_name <> ?", id, name).Update("chat_name", name).Error
+}
+
+// BoundBotChats lists the private chats of senders bound to platform accounts,
+// newest first. The binding filter runs before the limit, so chats of unbound
+// strangers cannot push bound chats off the list.
+func (r *BotInteractionsRepo) BoundBotChats(botID, externalBotID string) ([]domain.BotConversation, error) {
+	var rows []domain.BotConversation
+	err := r.DB.Where("bot_id = ? AND chat_type = ?", botID, "single").
+		Where("chat_id IN (?)", r.DB.Model(&domain.BotUserBinding{}).Select("sender_id").Where("bot_id = ? AND user_id > 0", externalBotID)).
+		Order("updated_at desc").Limit(50).Find(&rows).Error
+	return rows, err
+}
+
+// BotCardByTaskID finds the notification card a Telegram button belongs to.
+func (r *BotInteractionsRepo) BotCardByTaskID(botID, taskID string) (domain.BotInteraction, error) {
+	var item domain.BotInteraction
+	err := r.DB.First(&item, "bot_id = ? AND action = ? AND card_task_id = ?", botID, "notification", taskID).Error
+	return item, err
+}
+
 func (r *BotInteractionsRepo) BotInteraction(id string) (domain.BotInteraction, error) {
 	var item domain.BotInteraction
 	err := r.DB.First(&item, "id = ?", id).Error
@@ -158,7 +185,7 @@ func (r *BotInteractionsRepo) BotInteraction(id string) (domain.BotInteraction, 
 }
 
 func (r *BotInteractionsRepo) ExpireBotCard(id string) error {
-	return r.DB.Model(&domain.BotInteraction{}).Where("id = ? AND action = ? AND status <> ?", id, "notification", "replied").Updates(map[string]any{"status": "replied", "last_error": "该节点已不再等待本次操作", "updated_at": time.Now().UTC()}).Error
+	return r.DB.Model(&domain.BotInteraction{}).Where("id = ? AND action = ? AND status <> ?", id, "notification", "replied").Updates(map[string]any{"status": "replied", "last_error": "Este nó não espera mais por esta ação", "updated_at": time.Now().UTC()}).Error
 }
 
 func (r *BotInteractionsRepo) FailBotReply(id, detail string) error {

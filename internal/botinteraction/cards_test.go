@@ -17,7 +17,7 @@ func TestNotificationCardShowsStructuredReasonAndRequiredAction(t *testing.T) {
 	if !strings.Contains(body, "缺少回滚方案") || !strings.Contains(body, "请负责人补充回滚方案") || strings.Contains(body, "generic") {
 		t.Fatal(body)
 	}
-	if card["main_title"].(map[string]string)["desc"] != "节点：方案审查" {
+	if card["main_title"].(map[string]string)["desc"] != "Nó: 方案审查" {
 		t.Fatal(card)
 	}
 	if len(card["horizontal_content_list"].([]map[string]string)) != 3 {
@@ -33,7 +33,7 @@ func TestNotificationCardReadsPortugueseReminderLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	card := notificationCard(run, item, nil, content)
-	if body := card["sub_title_text"].(string); body != "原因：boom" {
+	if body := card["sub_title_text"].(string); body != "Motivo: boom" {
 		t.Fatal(body)
 	}
 	if issue := card["horizontal_content_list"].([]map[string]string)[0]["value"]; issue != "Login" {
@@ -53,7 +53,7 @@ func TestNotificationCardFailureAndLengthLimits(t *testing.T) {
 	}
 	run.Nodes["fail"].GateResult = &domain.GateResult{Reason: strings.Repeat("原因", 100), ActionRequired: strings.Repeat("补充", 100)}
 	body := notificationCard(run, item, nil, "")["sub_title_text"].(string)
-	if len([]rune(body)) > 112 || !strings.Contains(body, "待处理：") {
+	if len([]rune(body)) > 112 || !strings.Contains(body, "Pendente: ") {
 		t.Fatal(body)
 	}
 }
@@ -77,7 +77,7 @@ func TestLongDetailsPreserveRunLinkEvenAtMessageLimit(t *testing.T) {
 	run := domain.Run{Nodes: map[string]*domain.NodeRun{"fail": {Error: strings.Repeat("完整失败原因。", 4000)}}}
 	link := "https://loopforge-test.example.com/#/runs/run-test"
 	text := notificationCardDetails(run, domain.NotificationDelivery{NodeID: "fail"}, "Requisito: 模拟验收", link)
-	if !strings.HasSuffix(text, "[查看运行详情]("+link+")") || len(text) > 16000 {
+	if !strings.HasSuffix(text, "[Ver detalhes da execução]("+link+")") || len(text) > 16000 {
 		t.Fatalf("missing or oversized link footer: %d", len(text))
 	}
 	if strings.Contains(notificationCardDetails(run, domain.NotificationDelivery{NodeID: "fail"}, "", "javascript:bad"), "javascript:") {
@@ -143,14 +143,14 @@ func TestCardActionLayoutAdaptsToOperationCount(t *testing.T) {
 		}
 		if count == 3 {
 			for _, button := range buttons {
-				if button["key"] != "reject" && len([]rune(button["text"].(string))) > 2 {
+				if button["key"] != "reject" && len([]rune(button["text"].(string))) > 7 {
 					t.Fatal(button)
 				}
 			}
-			if buttons[2]["text"] != "返工" || buttons[2]["key"] != "reject" {
+			if buttons[2]["text"] != "Retrabalho" || buttons[2]["key"] != "reject" {
 				t.Fatal(buttons)
 			}
-		} else if buttons[0]["text"] != "通过并继续" {
+		} else if buttons[0]["text"] != "Aprovar e continuar" {
 			t.Fatal(buttons)
 		}
 		if all[0]["text"] != "通过" {
@@ -162,7 +162,7 @@ func TestCardIdentifiesReworkDestination(t *testing.T) {
 	run := domain.Run{WorkflowSnapshot: domain.WorkflowDefinition{Nodes: []domain.WorkflowNode{{ID: "prepare", Name: "方案准备"}, {ID: "review", RejectTo: "prepare"}}}}
 	card := notificationCard(run, domain.NotificationDelivery{NodeID: "review"}, []map[string]any{{"key": "reject"}}, "")
 	rows := card["horizontal_content_list"].([]map[string]string)
-	if rows[len(rows)-1]["keyname"] != "返工到" || rows[len(rows)-1]["value"] != "方案准备" {
+	if rows[len(rows)-1]["keyname"] != "Retrabalho para" || rows[len(rows)-1]["value"] != "方案准备" {
 		t.Fatal(rows)
 	}
 }

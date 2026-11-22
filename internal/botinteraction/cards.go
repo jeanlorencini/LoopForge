@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-var ErrCardExpired = errors.New("该节点已不再等待本次操作")
+var ErrCardExpired = errors.New("Este nó não espera mais por esta ação")
 
 func ActionsForDelivery(store *repo.Store, item domain.NotificationDelivery) []map[string]any {
 	run, ok := store.RunState(item.RunID)
@@ -36,23 +36,23 @@ func ActionsForDelivery(store *repo.Store, item domain.NotificationDelivery) []m
 			return nil
 		}
 		if strings.Contains(node.Activity, "用户暂停") {
-			button("继续", "resume")
+			button("Continuar", "resume")
 		} else if strings.Contains(node.Activity, "轮次用尽") || strings.Contains(node.Activity, "是否重试") || strings.Contains(strings.ToLower(node.Error), "max turns") {
-			button("重试", "retry")
-			button("不重试", "decline")
+			button("Repetir", "retry")
+			button("Não repetir", "decline")
 		} else {
-			button("通过", "approve")
+			button("Aprovar", "approve")
 			if run.Status != "running" {
-				button("重试", "retry")
+				button("Repetir", "retry")
 			}
 			if n, ok := snapshotNode(run, item.NodeID); ok && n.RejectTo != "" {
-				button("退回", "reject")
+				button("Retrabalho", "reject")
 			}
 		}
 	case "failed":
-		button("重试", "retry")
+		button("Repetir", "retry")
 		if n, ok := snapshotNode(run, item.NodeID); ok && n.Type == "script" {
-			button("手动通过", "pass")
+			button("Liberar manualmente", "pass")
 		}
 	default:
 		return nil
@@ -60,7 +60,7 @@ func ActionsForDelivery(store *repo.Store, item domain.NotificationDelivery) []m
 	return actions
 }
 func handledCard(id, text string) map[string]any {
-	return map[string]any{"card_type": "button_interaction", "task_id": id, "main_title": map[string]string{"title": text}, "button_list": []map[string]any{{"text": "已收到", "key": "handled", "style": 3}}}
+	return map[string]any{"card_type": "button_interaction", "task_id": id, "main_title": map[string]string{"title": text}, "button_list": []map[string]any{{"text": "Recebido", "key": "handled", "style": 3}}}
 }
 func (s *Service) QueueNotificationCard(ctx context.Context, bot domain.NotificationBot, item domain.NotificationDelivery, content string, detailsURL ...string) error {
 	actions := ActionsForDelivery(s.Store, item)
@@ -71,19 +71,27 @@ func (s *Service) QueueNotificationCard(ctx context.Context, bot domain.Notifica
 	if !ok {
 		return ErrCardExpired
 	}
-	card := notificationCard(run, item, actions, content)
-	if detail := notificationCardDetails(run, item, content, detailsURL...); detail != "" {
-		_, err := s.Store.EnqueueBotInteraction(domain.BotInteraction{ID: repo.BotMessageID(bot.ID, "notification-details:"+item.ID), BotID: bot.ID, Action: "notification_details", DeliveryID: item.ID, Content: detail}, item.TargetType, item.TargetID)
-		if err != nil {
-			return err
+	quote := ""
+	if bot.Provider == domain.BotProviderTelegram {
+		// The Telegram notification is the whole text plus buttons, so it needs
+		// neither the WeCom card nor its companion details message.
+		content = telegramCardText(run, item, actions, content, detailsURL...)
+	} else {
+		card := notificationCard(run, item, actions, content)
+		if detail := notificationCardDetails(run, item, content, detailsURL...); detail != "" {
+			_, err := s.Store.EnqueueBotInteraction(domain.BotInteraction{ID: repo.BotMessageID(bot.ID, "notification-details:"+item.ID), BotID: bot.ID, Action: "notification_details", DeliveryID: item.ID, Content: detail}, item.TargetType, item.TargetID)
+			if err != nil {
+				return err
+			}
 		}
+		if len(detailsURL) > 0 && detailsURL[0] != "" {
+			card["jump_list"] = []map[string]any{{"type": 1, "title": "Ver detalhes", "url": detailsURL[0]}}
+		}
+		data, _ := json.Marshal(card)
+		quote = string(data)
 	}
-	if len(detailsURL) > 0 && detailsURL[0] != "" {
-		card["jump_list"] = []map[string]any{{"type": 1, "title": "查看详情", "url": detailsURL[0]}}
-	}
-	data, _ := json.Marshal(card)
 	id := repo.BotMessageID(bot.ID, "notification:"+item.ID)
-	_, err := s.Store.EnqueueBotInteraction(domain.BotInteraction{ID: id, BotID: bot.ID, Action: "notification", DeliveryID: item.ID, Content: content, Quote: string(data)}, item.TargetType, item.TargetID)
+	_, err := s.Store.EnqueueBotInteraction(domain.BotInteraction{ID: id, BotID: bot.ID, Action: "notification", DeliveryID: item.ID, Content: content, Quote: quote}, item.TargetType, item.TargetID)
 	if err != nil {
 		return err
 	}
@@ -98,7 +106,7 @@ func (s *Service) QueueNotificationCard(ctx context.Context, bot domain.Notifica
 			return err
 		}
 		if record.Status == "reply_failed" {
-			return errors.New("企业微信卡片发送失败，请检查会话和 Bot 授权")
+			return errors.New("Falha ao enviar o aviso com botões. Confira o chat e a autorização do bot.")
 		}
 		if record.Status == "replied" {
 			if record.LastError != "" {
@@ -139,7 +147,7 @@ func (s *Service) NotificationCardTask(bot domain.NotificationBot, item domain.B
 	return delivery, ErrCardExpired
 }
 func actionLabel(action string) string {
-	return map[string]string{"approve": "通过并继续", "retry": "重试节点", "pass": "手动通过"}[strings.TrimSpace(action)]
+	return map[string]string{"approve": "Aprovar e continuar", "retry": "Repetir o nó", "pass": "Liberar manualmente"}[strings.TrimSpace(action)]
 }
 
 // Card text fields are plain text. Keep the reason visible above context rows,
@@ -171,14 +179,15 @@ func notificationCard(run domain.Run, item domain.NotificationDelivery, actions 
 	}
 	if strings.TrimSpace(reason) == "" {
 		if item.EventType == "waiting" {
-			reason = "流程在此设置了人工确认，请确认后继续。"
+			reason = "O fluxo pede confirmação manual aqui. Confirme para continuar."
 		} else {
-			reason = "节点执行失败，请查看运行详情。"
+			reason = "A execução do nó falhou. Veja os detalhes da execução."
 		}
 	}
-	body := "原因：" + cardText(reason, 76)
+	// 8 + 70 + 11 + 23 runes fit the 112-rune subtitle.
+	body := "Motivo: " + cardText(reason, 70)
 	if required != "" {
-		body += "\n待处理：" + cardText(required, 27)
+		body += "\nPendente: " + cardText(required, 23)
 	}
 	issue := notificationCardIssue(content)
 	title := issue
@@ -186,27 +195,44 @@ func notificationCard(run domain.Run, item domain.NotificationDelivery, actions 
 		title = run.WorkflowSnapshot.Name
 	}
 	rows := []map[string]string{
-		{"keyname": "需求", "value": cardText(issue, 26)},
-		{"keyname": "节点", "value": cardText(item.SourceName, 26)},
+		{"keyname": "Requisito", "value": cardText(issue, 26)},
+		{"keyname": "Nó", "value": cardText(item.SourceName, 26)},
 		{"keyname": "SOP", "value": cardText(run.WorkflowSnapshot.Name, 26)},
 	}
 	for _, action := range actions {
 		if action["key"] == "reject" {
 			if target := cardReworkTarget(run, item.NodeID); target != "" {
-				rows = append(rows, map[string]string{"keyname": "返工到", "value": cardText(target, 26)})
+				rows = append(rows, map[string]string{"keyname": "Retrabalho para", "value": cardText(target, 26)})
 			}
 			break
 		}
 	}
 	buttons, menu := notificationCardActions(actions)
 	card := map[string]any{"card_type": "button_interaction", "task_id": item.ID,
-		"source":         map[string]any{"desc": map[string]string{"waiting": "待人工确认", "failed": "执行失败"}[item.EventType], "desc_color": 2},
-		"main_title":     map[string]string{"title": cardText(title, 26), "desc": "节点：" + cardText(item.SourceName, 26)},
+		"source":         map[string]any{"desc": map[string]string{"waiting": "Aguardando confirmação", "failed": "Falhou"}[item.EventType], "desc_color": 2},
+		"main_title":     map[string]string{"title": cardText(title, 26), "desc": "Nó: " + cardText(item.SourceName, 26)},
 		"sub_title_text": body, "horizontal_content_list": rows, "button_list": buttons}
 	if menu != nil {
 		card["action_menu"] = menu
 	}
 	return card
+}
+
+// telegramCardText adds to the notification what the WeCom card shows in its
+// own fields: the rework target and the details link.
+func telegramCardText(run domain.Run, item domain.NotificationDelivery, actions []map[string]any, content string, detailsURL ...string) string {
+	for _, action := range actions {
+		if action["key"] == "reject" {
+			if target := cardReworkTarget(run, item.NodeID); target != "" {
+				content += "\nRetrabalho volta para: " + target
+			}
+			break
+		}
+	}
+	if len(detailsURL) > 0 && detailsURL[0] != "" && !strings.Contains(content, detailsURL[0]) {
+		content += "\nDetalhes: " + detailsURL[0]
+	}
+	return content
 }
 func notificationCardIssue(content string) string {
 	for _, line := range strings.Split(content, "\n") {
@@ -233,21 +259,21 @@ func notificationCardDetails(run domain.Run, item domain.NotificationDelivery, c
 		required = node.GateResult.ActionRequired
 		findings = node.GateResult.Findings
 	}
-	if len([]rune(reason)) <= 76 && len([]rune(required)) <= 28 && len(findings) == 0 {
+	if len([]rune(reason)) <= 70 && len([]rune(required)) <= 23 && len(findings) == 0 {
 		return ""
 	}
-	text := "### " + notificationCardIssue(content) + "\n节点：" + item.SourceName + "\nSOP：" + run.WorkflowSnapshot.Name + "\n\n**原因**\n" + reason
+	text := "### " + notificationCardIssue(content) + "\nNó: " + item.SourceName + "\nSOP: " + run.WorkflowSnapshot.Name + "\n\n**Motivo**\n" + reason
 	if required != "" {
-		text += "\n\n**需要处理**\n" + required
+		text += "\n\n**O que fazer**\n" + required
 	}
 	for _, finding := range findings {
 		text += "\n\n- " + finding.Title + "\n" + finding.Evidence
 	}
-	text += "\n\n请使用随后发送的操作卡片处理。"
+	text += "\n\nUse o card de ações enviado a seguir."
 	footer := ""
 	if len(detailsURL) > 0 {
 		if link, err := url.Parse(detailsURL[0]); err == nil && (link.Scheme == "http" || link.Scheme == "https") && link.Host != "" {
-			footer = "\n\n[查看运行详情](" + link.String() + ")"
+			footer = "\n\n[Ver detalhes da execução](" + link.String() + ")"
 		}
 	}
 	return domain.NotificationText(text, 16000-len(footer)) + footer
@@ -270,13 +296,13 @@ func (s *socket) updateActionCard(ctx context.Context, item domain.BotInteractio
 	if state.finished {
 		return nil
 	}
-	card := handledCard(item.CardTaskID, "正在处理，请稍候")
+	card := handledCard(item.CardTaskID, "Processando, aguarde")
 	if finish {
-		title := "操作未完成"
-		if strings.Contains(result, "操作已完成") {
-			title = "操作已完成"
-		} else if strings.Contains(result, "过期") {
-			title = "提醒已失效"
+		title := "Ação não concluída"
+		if strings.Contains(result, "Ação concluída") {
+			title = "Ação concluída"
+		} else if strings.Contains(result, "expirou") {
+			title = "Aviso expirado"
 		}
 		card["main_title"] = map[string]string{"title": title, "desc": cardText(result, 30)}
 		card["sub_title_text"] = cardText(result, 112)
@@ -292,9 +318,9 @@ func (s *socket) updateActionCard(ctx context.Context, item domain.BotInteractio
 // Keep every available operation visible. Three-column cards need short
 // labels; the card's context row explicitly identifies the rework target.
 func notificationCardActions(actions []map[string]any) ([]map[string]any, map[string]any) {
-	labels := map[string]string{"approve": "通过并继续", "retry": "重新执行", "reject": "返工", "pass": "手动通过", "resume": "继续运行", "decline": "不再重试"}
+	labels := map[string]string{"approve": "Aprovar e continuar", "retry": "Repetir o nó", "reject": "Retrabalho", "pass": "Liberar manualmente", "resume": "Continuar", "decline": "Não repetir"}
 	if len(actions) > 2 {
-		labels = map[string]string{"approve": "通过", "retry": "重试", "reject": "返工", "pass": "放行", "resume": "继续", "decline": "不重试"}
+		labels = map[string]string{"approve": "Aprovar", "retry": "Repetir", "reject": "Retrabalho", "pass": "Liberar", "resume": "Continuar", "decline": "Não repetir"}
 	}
 	buttons := []map[string]any{}
 	for _, action := range actions {

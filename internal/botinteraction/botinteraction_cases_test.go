@@ -36,7 +36,7 @@ func TestNotificationCardRendering(t *testing.T) {
 		t.Fatalf("target = %q", got)
 	}
 	details := notificationCardDetails(run, item, "Requisito: Issue", "https://example.test/run")
-	if !strings.Contains(details, "finding") || !strings.Contains(details, "查看运行详情") {
+	if !strings.Contains(details, "finding") || !strings.Contains(details, "Ver detalhes da execução") {
 		t.Fatalf("details = %q", details)
 	}
 	if got := notificationCardDetails(run, item, "x", "javascript:bad"); strings.Contains(got, "javascript") {
@@ -307,7 +307,7 @@ func TestNormalizeIncomingMessageVariants(t *testing.T) {
 	}{
 		{"voice", "aibot_msg_callback", map[string]any{"msgid": "1", "aibotid": "external", "chattype": "single", "from": map[string]string{"userid": "user"}, "msgtype": "voice", "voice": map[string]string{"content": "spoken"}}, true, "spoken", "single", "user"},
 		{"group inferred", "aibot_event_callback", map[string]any{"msgid": "2", "aibotid": "external", "chatid": "group", "from": map[string]string{"userid": "user"}, "msgtype": "event", "event": map[string]string{"eventtype": "template_card_event", "event_key": "retry", "task_id": "delivery_nonce"}}, true, "", "group", "group"},
-		{"unsupported", "aibot_msg_callback", map[string]any{"msgid": "3", "aibotid": "external", "chattype": "single", "from": map[string]string{"userid": "user"}, "msgtype": "image"}, true, "[不支持的消息类型", "single", "user"},
+		{"unsupported", "aibot_msg_callback", map[string]any{"msgid": "3", "aibotid": "external", "chattype": "single", "from": map[string]string{"userid": "user"}, "msgtype": "image"}, true, "[Tipo de mensagem não suportado", "single", "user"},
 		{"handled action", "aibot_event_callback", map[string]any{"msgid": "4", "aibotid": "external", "chattype": "single", "from": map[string]string{"userid": "user"}, "msgtype": "event", "event": map[string]string{"eventtype": "template_card_event", "event_key": "handled", "task_id": "delivery_nonce"}}, false, "", "", ""},
 		{"wrong event", "aibot_event_callback", map[string]any{"msgid": "5", "aibotid": "external", "chattype": "single", "from": map[string]string{"userid": "user"}, "msgtype": "event", "event": map[string]string{"eventtype": "other"}}, false, "", "", ""},
 		{"bad chat", "aibot_msg_callback", map[string]any{"msgid": "6", "aibotid": "external", "chattype": "channel", "chatid": "x", "from": map[string]string{"userid": "user"}, "msgtype": "text", "text": map[string]string{"content": "x"}}, false, "", "", ""},
@@ -546,14 +546,14 @@ func TestActionsForDeliveryBranches(t *testing.T) {
 }
 
 func TestCardTextActionsAndLabels(t *testing.T) {
-	if actionLabel(" approve ") != "通过并继续" || actionLabel("unknown") != "" {
+	if actionLabel(" approve ") != "Aprovar e continuar" || actionLabel("unknown") != "" {
 		t.Fatal("labels")
 	}
 	if got := cardText(" **hello**  `world` ", 8); !strings.HasSuffix(got, "…") || strings.Contains(got, "*") {
 		t.Fatalf("text = %q", got)
 	}
 	buttons, menu := notificationCardActions([]map[string]any{{"key": "approve", "style": 1}, {"key": "custom", "text": "Custom"}})
-	if len(buttons) != 2 || menu != nil || buttons[0]["text"] != "通过并继续" {
+	if len(buttons) != 2 || menu != nil || buttons[0]["text"] != "Aprovar e continuar" {
 		t.Fatalf("actions = %#v, %#v", buttons, menu)
 	}
 	if handledCard("id", "done")["task_id"] != "id" {

@@ -81,7 +81,7 @@ func TestReceiptBeforeModelAndFinalReplacesSameStream(t *testing.T) {
 	if err = json.Unmarshal(first.Body, &initial); err != nil {
 		t.Fatal(err)
 	}
-	if first.Cmd != "aibot_respond_msg" || first.Headers.RequestID != "original-request" || initial.Stream.Finish || initial.Stream.Content != "已收到，正在处理…" {
+	if first.Cmd != "aibot_respond_msg" || first.Headers.RequestID != "original-request" || initial.Stream.Finish || initial.Stream.Content != "Recebido, processando…" {
 		t.Fatalf("receipt: %+v %s", first, first.Body)
 	}
 	intermediate := read()

@@ -20,8 +20,8 @@ func (s *Service) saveReply(item domain.BotInteraction, reply, detail string) (s
 	if errors.As(err, &sqlErr) {
 		log.Printf("wecom reply persistence failed id=%s mysql_code=%d", item.ID, sqlErr.Number)
 		if sqlErr.Number == 1366 || sqlErr.Number == 3988 {
-			reply = "AI 回复已生成，但数据库无法保存部分字符。请联系管理员将 Bot 消息表升级为 utf8mb4，然后重新发送请求。"
-			detail = fmt.Sprintf("消息保存失败：MySQL %d，请升级 bot_interactions 字符集为 utf8mb4", sqlErr.Number)
+			reply = "A resposta da IA foi gerada, mas o banco de dados não salvou alguns caracteres. Peça ao administrador para converter a tabela de mensagens do bot para utf8mb4 e envie o pedido de novo."
+			detail = fmt.Sprintf("Falha ao salvar a mensagem: MySQL %d. Converta o charset de bot_interactions para utf8mb4", sqlErr.Number)
 			err = s.Store.SaveBotReply(item, reply, detail)
 			return reply, detail, err
 		}

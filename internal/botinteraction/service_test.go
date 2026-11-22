@@ -139,6 +139,22 @@ func TestSocketChatDiscoveryDedupeResetAndCardCallbacks(t *testing.T) {
 		t.Fatalf("contexts: %+v", calls)
 	}
 	callsMu.Unlock()
+	records, err := store.BotInteractionRecords(bot.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newReplies := 0
+	for _, m := range records {
+		if m.Content == "/new" {
+			if !strings.HasPrefix(m.Reply, "Nova conversa iniciada.") {
+				t.Fatalf("/new reply %q", m.Reply)
+			}
+			newReplies++
+		}
+	}
+	if newReplies == 0 {
+		t.Fatal("no /new record")
+	}
 	// Card callbacks use the same new group, and duplicates do not repeat actions.
 	event := map[string]any{"msgid": "click", "aibotid": "external", "chatid": "group-new", "chattype": "group", "from": map[string]string{"userid": "other-member"}, "msgtype": "event", "event": map[string]any{"eventtype": "template_card_event", "template_card_event": map[string]string{"event_key": "approve", "task_id": "delivery"}}}
 	for i := 0; i < 2; i++ {

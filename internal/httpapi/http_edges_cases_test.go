@@ -146,11 +146,11 @@ func TestMCPMarketFileAndBotIdentityErrors(t *testing.T) {
 	if rec.Code != 403 {
 		t.Fatalf("cross origin remove=%d", rec.Code)
 	}
-	if ok, msg, err := ident.message(domain.NotificationBot{BotID: "b"}, domain.BotInteraction{SenderID: "s", Content: "hello"}); !ok || err != nil || !strings.Contains(msg, "关联") {
+	if ok, msg, err := ident.message(domain.NotificationBot{BotID: "b"}, domain.BotInteraction{SenderID: "s", Content: "hello"}); !ok || err != nil || !strings.Contains(msg, "vincule") {
 		t.Fatalf("unbound message=%v %q %v", ok, msg, err)
 	}
 	ident.publicURL = "bad"
-	if ok, msg, _ := ident.message(domain.NotificationBot{BotID: "b"}, domain.BotInteraction{SenderID: "s2", Content: "hello"}); !ok || !strings.Contains(msg, "尚未配置") {
+	if ok, msg, _ := ident.message(domain.NotificationBot{BotID: "b"}, domain.BotInteraction{SenderID: "s2", Content: "hello"}); !ok || !strings.Contains(msg, "não está configurado") {
 		t.Fatalf("bad public URL=%v %q", ok, msg)
 	}
 }

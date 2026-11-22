@@ -2,18 +2,16 @@ package notification
 
 import (
 	"agentflow/internal/domain"
-	"bytes"
+	"agentflow/internal/telegram"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf16"
 )
 
 type TelegramProvider struct {
@@ -22,50 +20,32 @@ type TelegramProvider struct {
 }
 
 func NewTelegramProvider() *TelegramProvider {
-	return &TelegramProvider{HTTP: &http.Client{Timeout: 15 * time.Second}, BaseURL: "https://api.telegram.org"}
+	return &TelegramProvider{HTTP: &http.Client{Timeout: 15 * time.Second}, BaseURL: telegram.BaseURL}
 }
 
-// telegramMaxText is the sendMessage limit: "1-4096 characters after entities parsing".
-const telegramMaxText = 4096
-
 func (p *TelegramProvider) call(ctx context.Context, token, method string, params, result any) error {
-	body, _ := json.Marshal(params)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/bot"+token+"/"+method, bytes.NewReader(body))
-	if err != nil {
-		return errors.New("Telegram 请求创建失败")
+	err := (&telegram.Client{HTTP: p.HTTP, BaseURL: p.BaseURL}).Call(ctx, token, method, params, result)
+	var refused *telegram.Error
+	if !errors.As(err, &refused) {
+		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	rsp, err := p.HTTP.Do(req)
-	if err != nil {
-		// The error text holds the request URL, which contains the token.
-		return errors.New("Telegram 网络请求失败")
+	switch {
+	case refused.Code == http.StatusUnauthorized:
+		return &ProviderError{Code: 853004, Source: "Telegram", Message: "Token do bot inválido. Preencha de novo."}
+	case refused.Code == http.StatusForbidden || refused.MigrateToChatID != 0 || strings.Contains(refused.Description, "chat not found"):
+		return &ProviderError{Code: 404, Source: "Telegram", Message: "O bot saiu deste chat ou o grupo foi migrado. Escolha o chat de destino de novo."}
 	}
-	defer rsp.Body.Close()
-	var out struct {
-		OK          bool            `json:"ok"`
-		Result      json.RawMessage `json:"result"`
-		Description string          `json:"description"`
-		ErrorCode   int             `json:"error_code"`
-		Parameters  struct {
-			MigrateToChatID int64 `json:"migrate_to_chat_id"`
-		} `json:"parameters"`
+	return &ProviderError{Code: refused.Code, Source: "Telegram", Message: refused.Description}
+}
+
+func (p *TelegramProvider) BotID(ctx context.Context, token string) (string, error) {
+	var me struct {
+		ID int64 `json:"id"`
 	}
-	if json.NewDecoder(io.LimitReader(rsp.Body, 2<<20)).Decode(&out) != nil {
-		return errors.New("Telegram 响应格式异常")
+	if err := p.call(ctx, token, "getMe", map[string]any{}, &me); err != nil {
+		return "", err
 	}
-	if !out.OK {
-		switch {
-		case out.ErrorCode == http.StatusUnauthorized:
-			return &ProviderError{Code: 853004, Source: "Telegram", Message: "Bot Token 无效，请重新填写"}
-		case out.ErrorCode == http.StatusForbidden || out.Parameters.MigrateToChatID != 0 || strings.Contains(out.Description, "chat not found"):
-			return &ProviderError{Code: 404, Source: "Telegram", Message: "Bot 已不在该会话中或群已升级，请重新选择接收会话"}
-		}
-		return &ProviderError{Code: out.ErrorCode, Source: "Telegram", Message: out.Description}
-	}
-	if result != nil && json.Unmarshal(out.Result, result) != nil {
-		return errors.New("Telegram 响应格式异常")
-	}
-	return nil
+	return domain.TelegramBotIDPrefix + strconv.FormatInt(me.ID, 10), nil
 }
 
 // Sessions lists the chats seen in the last 100 updates. The Bot API has no
@@ -132,7 +112,7 @@ func (p *TelegramProvider) Send(ctx context.Context, _, token, target, content s
 		return errors.New("通知正文不能为空")
 	}
 	sent := 0
-	for _, part := range splitTelegramText(content) {
+	for _, part := range telegram.Split(content) {
 		if strings.TrimSpace(part) == "" {
 			continue // sendMessage rejects blank text
 		}
@@ -145,27 +125,4 @@ func (p *TelegramProvider) Send(ctx context.Context, _, token, target, content s
 		sent++
 	}
 	return nil
-}
-
-func splitTelegramText(text string) []string {
-	var parts []string
-	for text != "" {
-		units, end, lastBreak := 0, len(text), -1
-		for i, r := range text {
-			units += utf16.RuneLen(r)
-			if units > telegramMaxText {
-				end = i
-				break
-			}
-			if r == '\n' {
-				lastBreak = i + 1
-			}
-		}
-		if end < len(text) && lastBreak > 0 {
-			end = lastBreak
-		}
-		parts = append(parts, text[:end])
-		text = text[end:]
-	}
-	return parts
 }

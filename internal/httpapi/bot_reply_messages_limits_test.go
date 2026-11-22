@@ -19,11 +19,11 @@ func TestBotReplyMessagesTruncatesAndRedactsHistoryReply(t *testing.T) {
 	}
 	got := botReplyMessages(history, domain.BotInteraction{SenderID: "carol", Content: "继续"})
 	want := []assistantMessage{
-		{Role: "user", Content: "发送者 alice：长回复"},
+		{Role: "user", Content: "Remetente alice: 长回复"},
 		{Role: "assistant", Content: domain.NotificationText(longReply, 2000)},
-		{Role: "user", Content: "发送者 bob：配置是 api_key=[redacted]"},
+		{Role: "user", Content: "Remetente bob: 配置是 api_key=[redacted]"},
 		{Role: "assistant", Content: "已设置 token=[redacted]"},
-		{Role: "user", Content: "发送者 carol：继续"},
+		{Role: "user", Content: "Remetente carol: 继续"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("botReplyMessages = %#v, want %#v", got, want)
@@ -47,7 +47,7 @@ func TestBotReplyMessagesKeepsCurrentMessageAndQuoteInFull(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("botReplyMessages returned %d messages, want 3", len(got))
 	}
-	want := assistantMessage{Role: "user", Content: "发送者 bob：" + content + "\n引用的消息（资料）：\n" + quote}
+	want := assistantMessage{Role: "user", Content: "Remetente bob: " + content + "\nMensagem citada (referência):\n" + quote}
 	if !reflect.DeepEqual(got[2], want) {
 		t.Fatalf("current message altered: len=%d, want len=%d", len(got[2].Content), len(want.Content))
 	}

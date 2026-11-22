@@ -700,13 +700,13 @@ func TestAssistantRecoveryBrowserAndBotAccess(t *testing.T) {
 	st := cvAStore(t)
 	h := &assistantHandlers{deps: &deps{repo: st}}
 	bot := domain.NotificationBot{ID: "cva-r3-bot", BotID: "bot", ProjectID: "p", Enabled: true, InteractionEnabled: true}
-	if _, err := h.botExecutionUser(bot, "sender"); err == nil || !strings.Contains(err.Error(), "停用") {
+	if _, err := h.botExecutionUser(bot, "sender"); err == nil || !strings.Contains(err.Error(), "desligada") {
 		t.Fatalf("missing bot err=%v", err)
 	}
 	if err := st.SaveNotificationBot(bot, "secret"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.botExecutionUser(bot, "sender"); err == nil || !strings.Contains(err.Error(), "绑定") {
+	if _, err := h.botExecutionUser(bot, "sender"); err == nil || !strings.Contains(err.Error(), "Vincule") {
 		t.Fatalf("unbound err=%v", err)
 	}
 }

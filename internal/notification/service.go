@@ -40,16 +40,72 @@ func (s *Service) secret(bot domain.NotificationBot) (string, error) {
 	}
 	return secret, nil
 }
+
+// CheckTelegramToken refuses a token that Telegram did not issue to botID. The
+// BotID is the public part of a token, so anyone could pair it with a fake one.
+func (s *Service) CheckTelegramToken(ctx context.Context, botID, token string) error {
+	p, ok := s.Telegram.(*TelegramProvider)
+	if !ok {
+		return errors.New("Telegram indisponível")
+	}
+	id, err := p.BotID(ctx, token)
+	if err != nil {
+		return err
+	}
+	if id != botID {
+		return &ProviderError{Code: 400, Source: "Telegram", Message: "o token não pertence a este bot"}
+	}
+	return nil
+}
+
 func (s *Service) Sessions(ctx context.Context, bot domain.NotificationBot) ([]domain.BotChat, error) {
 	secret, err := s.secret(bot)
 	if err != nil {
 		return nil, err
+	}
+	if bot.Provider == domain.BotProviderTelegram {
+		if chats, ok, err := s.boundTelegramChats(bot, secret); ok || err != nil {
+			return chats, err
+		}
 	}
 	chats, err := s.provider(bot).Sessions(ctx, bot.BotID, secret)
 	if updateErr := s.Store.SetNotificationBotHealth(bot.ID, botHealth(err)); updateErr != nil && err == nil {
 		return nil, updateErr
 	}
 	return chats, err
+}
+
+// boundTelegramChats lists the private chats of an interactive config with the
+// same token. Its poller owns getUpdates, and a getUpdates with offset -100
+// would cut that poll and drop pending updates. The token must match, not only
+// the BotID, which is the public part of the token.
+func (s *Service) boundTelegramChats(bot domain.NotificationBot, secret string) ([]domain.BotChat, bool, error) {
+	bots, err := s.Store.InteractiveNotificationBots()
+	if err != nil {
+		return nil, false, err
+	}
+	for _, owner := range bots {
+		if owner.Provider != domain.BotProviderTelegram || owner.BotID != bot.BotID {
+			continue
+		}
+		if ownerSecret, err := s.Store.BotCredential(owner.ID); err != nil || ownerSecret != secret {
+			continue
+		}
+		convs, err := s.Store.BoundBotChats(owner.ID, owner.BotID)
+		if err != nil {
+			return nil, false, err
+		}
+		chats := []domain.BotChat{}
+		for _, conv := range convs {
+			name := conv.ChatName
+			if name == "" {
+				name = conv.ChatID
+			}
+			chats = append(chats, domain.BotChat{ID: conv.ChatID, Name: name, Type: "single", LastMessageTime: conv.UpdatedAt.UTC().Format("2006-01-02 15:04 UTC")})
+		}
+		return chats, true, nil
+	}
+	return nil, false, nil
 }
 
 func botHealth(err error) string {
@@ -100,7 +156,8 @@ func (s *Service) send(ctx context.Context, bot domain.NotificationBot, targetID
 			return err
 		}
 	}
-	if len(delivery) > 0 && bot.InteractionEnabled && s.Interactions != nil && delivery[0].NodeID != "" && delivery[0].TargetType != "" && (delivery[0].EventType == "waiting" || delivery[0].EventType == "failed") {
+	// Telegram buttons work only in private chats; groups get the plain message.
+	if len(delivery) > 0 && bot.InteractionEnabled && s.Interactions != nil && delivery[0].NodeID != "" && delivery[0].TargetType != "" && (delivery[0].EventType == "waiting" || delivery[0].EventType == "failed") && (bot.Provider != domain.BotProviderTelegram || delivery[0].TargetType == "single") {
 		detailURL := ""
 		if base, err := url.Parse(s.PublicURL); err == nil && (base.Scheme == "https" || base.Scheme == "http") && base.Host != "" {
 			detailURL = s.PublicURL + "/#/runs/" + url.PathEscape(delivery[0].RunID)

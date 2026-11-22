@@ -38,11 +38,11 @@ func TestBotReplyMessagesSkipsBindingAndPairsHistory(t *testing.T) {
 	item := domain.BotInteraction{SenderID: "carol", Content: "继续"}
 	got := botReplyMessages(history, item)
 	want := []assistantMessage{
-		{Role: "user", Content: "发送者 alice：最近的需求"},
+		{Role: "user", Content: "Remetente alice: 最近的需求"},
 		{Role: "assistant", Content: "有 3 个"},
-		{Role: "user", Content: "发送者 bob：" + domain.NotificationText(strings.Repeat("长", 1000), 2000)},
+		{Role: "user", Content: "Remetente bob: " + domain.NotificationText(strings.Repeat("长", 1000), 2000)},
 		{Role: "assistant", Content: "收到"},
-		{Role: "user", Content: "发送者 carol：继续"},
+		{Role: "user", Content: "Remetente carol: 继续"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("botReplyMessages = %#v, want %#v", got, want)
@@ -54,7 +54,7 @@ func TestBotReplyMessagesSkipsBindingAndPairsHistory(t *testing.T) {
 
 func TestBotReplyMessagesAppendsQuote(t *testing.T) {
 	got := botReplyMessages(nil, domain.BotInteraction{SenderID: "alice", Content: "解释一下", Quote: "原消息"})
-	want := []assistantMessage{{Role: "user", Content: "发送者 alice：解释一下\n引用的消息（资料）：\n原消息"}}
+	want := []assistantMessage{{Role: "user", Content: "Remetente alice: 解释一下\nMensagem citada (referência):\n原消息"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("botReplyMessages = %#v, want %#v", got, want)
 	}

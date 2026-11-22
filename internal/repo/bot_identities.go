@@ -14,8 +14,8 @@ import (
 	"time"
 )
 
-var ErrBotBindingChallenge = errors.New("绑定请求已失效，请回到企业微信重新发送消息获取链接")
-var ErrBotBindingCode = errors.New("确认码无效、已过期或不属于当前发送者，请重新确认")
+var ErrBotBindingChallenge = errors.New("O pedido de vínculo expirou. Volte ao chat com o bot e envie uma mensagem para receber um link novo.")
+var ErrBotBindingCode = errors.New("Código de confirmação inválido, expirado ou de outro remetente. Confirme de novo.")
 
 func botIdentityID(bot, sender string) string { return BotMessageID(bot, sender) }
 func botBindingNonce(n int) (string, error) {
@@ -57,7 +57,7 @@ func (r *UsersRepo) NewBotBindingChallenge(bot, sender string, now time.Time) (s
 			return err
 		}
 		if existing.UserID > 0 {
-			return errors.New("当前企业微信账号已绑定，请在个人配置解除后重新绑定")
+			return errors.New("Esta conta do chat já está vinculada. Desvincule nas configurações pessoais antes de vincular de novo.")
 		}
 		if err := tx.Model(&domain.BotBindingChallenge{}).Where("binding_id = ? AND status IN ?", id, []string{"pending", "claimed"}).Update("status", "expired").Error; err != nil {
 			return err
@@ -75,7 +75,7 @@ func (r *UsersRepo) BotBindingChallengeStatus(token string, userID int64, now ti
 		return "", ErrBotBindingChallenge
 	}
 	if out.UserID != 0 && out.UserID != userID {
-		return "", errors.New("链接已由其他平台账号确认，请回企业微信重新获取绑定链接")
+		return "", errors.New("O link já foi confirmado por outra conta da plataforma. Volte ao chat com o bot e peça um link novo.")
 	}
 	return out.Status, nil
 }
@@ -102,7 +102,7 @@ func (r *UsersRepo) ClaimBotBindingChallenge(token string, userID int64, now tim
 			return ErrBotBindingChallenge
 		}
 		if challenge.UserID != 0 && challenge.UserID != userID {
-			return errors.New("链接已由其他平台账号确认，请回企业微信重新获取绑定链接")
+			return errors.New("O link já foi confirmado por outra conta da plataforma. Volte ao chat com o bot e peça um link novo.")
 		}
 		if challenge.Status == "claimed" {
 			return nil
@@ -121,7 +121,7 @@ func (r *UsersRepo) ConfirmBotUserBinding(bot, sender, code string, now time.Tim
 			return ErrBotBindingCode
 		}
 		if binding.UserID > 0 {
-			return errors.New("当前账号已经绑定，请在个人配置查看")
+			return errors.New("Esta conta já está vinculada. Veja nas configurações pessoais.")
 		}
 		var challenge domain.BotBindingChallenge
 		if err = tx.Where("binding_id = ? AND status = ?", binding.ID, "claimed").Order("created_at DESC").First(&challenge).Error; err != nil {

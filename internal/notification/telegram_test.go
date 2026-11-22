@@ -75,24 +75,6 @@ func TestTelegramSendSplitsLongPlainText(t *testing.T) {
 	}
 }
 
-func TestSplitTelegramTextCountsUTF16Units(t *testing.T) {
-	for name, content := range map[string]string{
-		"emoji":      strings.Repeat("😀", 5000),
-		"no newline": strings.Repeat("a", 9000),
-		"exact max":  strings.Repeat("a", 4096),
-	} {
-		parts := splitTelegramText(content)
-		if strings.Join(parts, "") != content {
-			t.Errorf("%s: parts do not rebuild the content", name)
-		}
-		for _, part := range parts {
-			if n := len(utf16.Encode([]rune(part))); n > 4096 {
-				t.Errorf("%s: part has %d units", name, n)
-			}
-		}
-	}
-}
-
 func TestTelegramSendSkipsBlankPartsAndStopsAfterPartialDelivery(t *testing.T) {
 	var texts []string
 	p := telegramServer(t, func(_ string, body map[string]any) string {

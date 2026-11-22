@@ -6,9 +6,11 @@ import (
 	"agentflow/internal/engine"
 	"agentflow/internal/notification"
 	"agentflow/internal/repo"
+	"agentflow/internal/tracker"
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -45,7 +47,7 @@ func TestBotUsesBoundSenderIdentityAutoModeAndSharedChatContext(t *testing.T) {
 		if user.ID != 43 || user.CodeBuddyAPIKey != "other-key" || user.CodeBuddyInternetEnvironment != "ioa" {
 			t.Fatal("wrong credentials")
 		}
-		if !strings.Contains(prompt, "当前审批模式为「完全权限」") || !strings.Contains(prompt, "发送者 new-wecom-user") || !strings.Contains(prompt, "历史回复") {
+		if !strings.Contains(prompt, "当前审批模式为「完全权限」") || !strings.Contains(prompt, "Remetente new-wecom-user") || !strings.Contains(prompt, "历史回复") || !strings.Contains(prompt, "conversa no WeCom") || !strings.Contains(prompt, "Responda em português do Brasil.") || strings.Contains(prompt, "sem Markdown") {
 			t.Fatal("missing shared context or auto mode")
 		}
 		agentToolSessions.mu.Lock()
@@ -91,7 +93,7 @@ func TestCardActionsAreScopedAndCannotApproveAnotherAttempt(t *testing.T) {
 		t.Fatal("foreign chat used card")
 	}
 	reply, err := h.handleBotCardAction(context.Background(), bot, item, conv)
-	if err != nil || !strings.Contains(reply, "操作已完成") {
+	if err != nil || !strings.Contains(reply, "Ação concluída") {
 		t.Fatal(reply, err)
 	}
 	updated, _ := s.RunState(run.ID)
@@ -99,7 +101,7 @@ func TestCardActionsAreScopedAndCannotApproveAnotherAttempt(t *testing.T) {
 		t.Fatal("button did not approve")
 	}
 	reply, _ = h.handleBotCardAction(context.Background(), bot, item, conv)
-	if !strings.Contains(reply, "过期") {
+	if !strings.Contains(reply, "expirou") {
 		t.Fatal("duplicate card remained actionable")
 	}
 	updated.Status = "waiting"
@@ -136,7 +138,7 @@ func TestBotMissingSubmissionRetriesOnlyTerminalStep(t *testing.T) {
 		if calls == 1 {
 			return "查询结果已经准备好，但未提交终态", nil
 		}
-		if strings.Contains(prompt, "原始查询标记") || !strings.Contains(prompt, "不要重新查询") {
+		if strings.Contains(prompt, "原始查询标记") || !strings.Contains(prompt, "Não consulte de novo") {
 			t.Fatal("retry restarted task", prompt)
 		}
 		agentToolSessions.mu.Lock()
@@ -189,7 +191,7 @@ func TestBotUnboundAndMissingCredentialsNeverUseOwner(t *testing.T) {
 	}
 	s.UpdateUserCredentials(43, repo.UserCredentialUpdate{CodeBuddyAPIKeyClear: true})
 	reply, err = h.generateBotReply(context.Background(), bot, domain.BotConversation{}, nil, domain.BotInteraction{SenderID: "new-wecom-user", Content: "创建需求"})
-	if err != nil || !strings.Contains(reply, "你的平台账号尚未配置") {
+	if err != nil || !strings.Contains(reply, "ainda não tem uma Key") {
 		t.Fatal(reply, err)
 	}
 	project, _ := s.Project("p")
@@ -206,12 +208,22 @@ func TestUnboundCardActorCannotMutateRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	reply, err := h.handleBotCardAction(context.Background(), bot, domain.BotInteraction{SenderID: "unknown", Action: "approve"}, domain.BotConversation{})
-	if err != botinteraction.ErrCardActionDeferred || !strings.Contains(reply, "关联你的平台账号") {
+	if err != botinteraction.ErrCardActionDeferred || !strings.Contains(reply, "vincule sua conta da plataforma") {
 		t.Fatal(reply, err)
 	}
 	after, _ := s.RunState(run.ID)
 	if after.Nodes["gate"].Status != "waiting_approval" {
 		t.Fatal("unbound click changed run")
+	}
+	project, _ := s.Project("p")
+	project.Members = []domain.ProjectMember{{UserID: 43, Role: "viewer"}}
+	s.PutProject(project)
+	reply, err = h.handleBotCardAction(context.Background(), bot, domain.BotInteraction{SenderID: "new-wecom-user", Action: "retry"}, domain.BotConversation{})
+	if err != botinteraction.ErrCardActionDeferred || !strings.Contains(reply, "não tem permissão para executar") {
+		t.Fatal(reply, err)
+	}
+	if after, _ = s.RunState(run.ID); after.Nodes["gate"].Status != "waiting_approval" {
+		t.Fatal("viewer click changed run")
 	}
 }
 
@@ -238,7 +250,7 @@ func TestBotRepliesOnClaudeCodeWithoutCodeBuddyKey(t *testing.T) {
 	}
 	item := domain.BotInteraction{SenderID: "new-wecom-user", Content: "现在有什么进展"}
 	reply, err := h.generateBotReply(context.Background(), bot, domain.BotConversation{ChatType: "single"}, nil, item)
-	if err != nil || !strings.Contains(reply, "Claude Code Key") || calls != 0 {
+	if err != nil || !strings.Contains(reply, "Key do Claude Code") || calls != 0 {
 		t.Fatalf("no Claude credential: reply=%q err=%v calls=%d", reply, err, calls)
 	}
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-bot")
@@ -248,17 +260,59 @@ func TestBotRepliesOnClaudeCodeWithoutCodeBuddyKey(t *testing.T) {
 	}
 }
 
-func TestTelegramBotTakesItsIDFromTheToken(t *testing.T) {
+// telegramFixture answers getMe with the id before the token's colon, unless
+// the token is listed in other.
+func telegramFixture(t *testing.T, other map[string]string) cvBHTTPFixture {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, method, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/bot"), "/")
+		if method != "getMe" {
+			_, _ = w.Write([]byte(`{"ok":true,"result":[]}`))
+			return
+		}
+		id, _, _ := strings.Cut(token, ":")
+		if reply, ok := other[token]; ok {
+			_, _ = w.Write([]byte(reply))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"id":` + id + `,"is_bot":true}}`))
+	}))
+	t.Cleanup(srv.Close)
 	f := cvBNewHTTPFixture(t)
+	svc := notification.New(f.s)
+	svc.Telegram = &notification.TelegramProvider{HTTP: srv.Client(), BaseURL: srv.URL}
+	f.h = NewWithNotifications(f.s, f.e, tracker.NewService(), "", "", svc)
+	return f
+}
+
+func TestTelegramBotTakesItsIDFromTheToken(t *testing.T) {
+	f := telegramFixture(t, map[string]string{
+		"777:other-bot": `{"ok":true,"result":{"id":999,"is_bot":true}}`,
+		"778:revoked":   `{"ok":false,"error_code":401,"description":"Unauthorized"}`,
+	})
 	body := map[string]any{"projectId": "platform", "name": "TG", "provider": "telegram", "botId": "ignored", "secret": "123456:AAE-token_x", "enabled": true, "interactionEnabled": true}
 	rec := cvBRequest(t, f, http.MethodPost, "/api/notification-bots", body, true)
 	var bot domain.NotificationBot
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &bot) != nil {
 		t.Fatalf("create %d %s", rec.Code, rec.Body.String())
 	}
-	if bot.Provider != domain.BotProviderTelegram || bot.BotID != "telegram-123456" || bot.InteractionEnabled {
+	if bot.Provider != domain.BotProviderTelegram || bot.BotID != "telegram-123456" || !bot.InteractionEnabled {
 		t.Fatalf("bot %+v", bot)
 	}
+	body["name"] = "TG copy"
+	if rec = cvBRequest(t, f, http.MethodPost, "/api/notification-bots", body, true); rec.Code != http.StatusConflict || strings.Contains(rec.Body.String(), "企业微信") {
+		t.Fatalf("second interactive config %d %s", rec.Code, rec.Body.String())
+	}
+	for _, token := range []string{"777:other-bot", "778:revoked"} {
+		body["secret"] = token
+		if rec = cvBRequest(t, f, http.MethodPost, "/api/notification-bots", body, true); rec.Code != http.StatusBadRequest || strings.Contains(rec.Body.String(), token) {
+			t.Fatalf("unconfirmed token %s accepted: %d %s", token, rec.Code, rec.Body.String())
+		}
+	}
+	bots, err := f.s.InteractiveNotificationBots()
+	if err != nil || len(bots) != 1 || bots[0].ID != bot.ID {
+		t.Fatalf("interactive bots %+v %v", bots, err)
+	}
+	body["secret"] = "123456:AAE-token_x"
 	// Editing without a new token keeps the provider and the derived id.
 	rec = cvBRequest(t, f, http.MethodPut, "/api/notification-bots/"+bot.ID, map[string]any{"projectId": "platform", "name": "TG 2", "provider": "", "botId": bot.BotID, "secret": "", "enabled": true}, true)
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &bot) != nil || bot.Provider != domain.BotProviderTelegram || bot.BotID != "telegram-123456" {
@@ -280,5 +334,12 @@ func TestBotSavesClaudeCodeModel(t *testing.T) {
 		if rec.Code != want {
 			t.Errorf("model %q = %d want %d: %s", model, rec.Code, want, rec.Body.String())
 		}
+	}
+}
+
+func TestTelegramBotPromptNamesTheAppAndAsksForPlainText(t *testing.T) {
+	tg := domain.NotificationBot{Provider: domain.BotProviderTelegram}
+	if botAppName(tg) != "Telegram" || !strings.Contains(botReplyFormat(tg), "sem Markdown") {
+		t.Fatalf("telegram prompt parts %q %q", botAppName(tg), botReplyFormat(tg))
 	}
 }
