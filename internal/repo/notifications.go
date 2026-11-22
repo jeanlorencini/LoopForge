@@ -356,19 +356,19 @@ func (r *NotificationsRepo) ValidateNotificationBindings(projectID string, bindi
 }
 func (r *NotificationsRepo) validateNotificationBindings(db *gorm.DB, projectID string, bindings []domain.NotificationBinding, task bool) error {
 	if len(bindings) > 3 {
-		return fmt.Errorf("最多配置 3 个通知 Bot")
+		return fmt.Errorf("Configure no máximo 3 bots de aviso")
 	}
 	seen := map[string]bool{}
 	for _, binding := range bindings {
 		if binding.BotID == "" || seen[binding.BotID] {
-			return fmt.Errorf("通知 Bot 不能为空或重复")
+			return fmt.Errorf("O bot de aviso não pode ficar vazio nem repetido")
 		}
 		seen[binding.BotID] = true
 		if err := domain.ValidateNotificationBinding(binding); err != nil {
 			return err
 		}
 		if task && (binding.Scope == "run" || notificationEventSelected(binding, "waiting")) {
-			return fmt.Errorf("定时任务通知仅支持成功或失败")
+			return fmt.Errorf("Aviso de tarefa agendada só aceita sucesso ou falha")
 		}
 		var row notificationBotRow
 		err := db.Where("id = ?", binding.BotID).First(&row).Error
@@ -377,10 +377,10 @@ func (r *NotificationsRepo) validateNotificationBindings(db *gorm.DB, projectID 
 			err = json.Unmarshal(row.Payload, &bot)
 		}
 		if err != nil || bot.ProjectID != projectID {
-			return fmt.Errorf("通知 Bot 不属于当前项目")
+			return fmt.Errorf("O bot de aviso não é deste projeto")
 		}
 		if bot.Target == nil {
-			return fmt.Errorf("请先为通知 Bot 绑定接收会话")
+			return fmt.Errorf("Vincule um chat de destino ao bot de aviso primeiro")
 		}
 	}
 	return nil

@@ -105,11 +105,11 @@ func (p *TelegramProvider) Sessions(ctx context.Context, _, token string) ([]dom
 
 // errPartialDelivery marks a send that stopped after some parts arrived:
 // retrying it would repeat those parts in the chat.
-var errPartialDelivery = errors.New("Telegram 消息仅部分送达")
+var errPartialDelivery = errors.New("A mensagem do Telegram chegou só em parte")
 
 func (p *TelegramProvider) Send(ctx context.Context, _, token, target, content string) error {
 	if strings.TrimSpace(content) == "" {
-		return errors.New("通知正文不能为空")
+		return errors.New("O texto do aviso não pode ficar vazio")
 	}
 	sent := 0
 	for _, part := range telegram.Split(content) {
@@ -118,7 +118,7 @@ func (p *TelegramProvider) Send(ctx context.Context, _, token, target, content s
 		}
 		if err := p.call(ctx, token, "sendMessage", map[string]any{"chat_id": target, "text": part}, nil); err != nil {
 			if sent > 0 {
-				return fmt.Errorf("%w（已发送 %d 段）：%w", errPartialDelivery, sent, err)
+				return fmt.Errorf("%w (%d partes enviadas): %w", errPartialDelivery, sent, err)
 			}
 			return err
 		}

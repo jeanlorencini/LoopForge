@@ -24,7 +24,7 @@ func (e *ReplyError) Error() string {
 	if e.Message != "" {
 		return e.Message
 	}
-	return "企业微信拒绝了这次回复，请检查接收会话和 Bot 授权"
+	return "O WeCom recusou esta resposta. Confira o chat de destino e a autorização do bot"
 }
 
 type Frame struct {
@@ -101,7 +101,7 @@ func sortedJSONKeys(raw json.RawMessage) ([]string, map[string]json.RawMessage) 
 func dial(ctx context.Context, url, botID, secret string, onFrame func(*socket, Frame)) (*socket, error) {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
 	if err != nil {
-		return nil, errors.New("企业微信长连接建立失败")
+		return nil, errors.New("Falha ao abrir a conexão longa com o WeCom")
 	}
 	socketCtx, cancel := context.WithCancel(ctx)
 	s := &socket{conn: conn, pending: map[string]chan int{}, done: make(chan struct{}), cancel: cancel}
@@ -134,7 +134,7 @@ func dial(ctx context.Context, url, botID, secret string, onFrame func(*socket, 
 	go func() { <-socketCtx.Done(); conn.Close() }()
 	if err := s.request(ctx, "aibot_subscribe", "", map[string]any{"bot_id": botID, "secret": secret}); err != nil {
 		s.close()
-		return nil, errors.New("企业微信长连接认证失败")
+		return nil, errors.New("Falha na autenticação da conexão longa com o WeCom")
 	}
 	go func() {
 		ticker := time.NewTicker(25 * time.Second)
@@ -165,7 +165,7 @@ func (s *socket) request(ctx context.Context, cmd, id string, body any) error {
 	s.mu.Lock()
 	if _, exists := s.pending[id]; exists {
 		s.mu.Unlock()
-		return errors.New("相同回复仍在等待回执")
+		return errors.New("A mesma resposta ainda aguarda confirmação")
 	}
 	s.pending[id] = ack
 	s.mu.Unlock()
@@ -179,7 +179,7 @@ func (s *socket) request(ctx context.Context, cmd, id string, body any) error {
 	err := s.conn.WriteJSON(payload)
 	s.writeMu.Unlock()
 	if err != nil {
-		return errors.New("企业微信回复连接中断")
+		return errors.New("A conexão de resposta com o WeCom caiu")
 	}
 	timer := time.NewTimer(10 * time.Second)
 	defer timer.Stop()
@@ -190,11 +190,11 @@ func (s *socket) request(ctx context.Context, cmd, id string, body any) error {
 		}
 		return nil
 	case <-timer.C:
-		return errors.New("企业微信回复回执超时")
+		return errors.New("A confirmação da resposta do WeCom demorou demais")
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.done:
-		return errors.New("企业微信连接已关闭")
+		return errors.New("A conexão com o WeCom foi fechada")
 	}
 }
 func (s *socket) send(ctx context.Context, chatID, text string) error {

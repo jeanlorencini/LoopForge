@@ -11,10 +11,10 @@ import (
 )
 
 var (
-	ErrReportCredentials = errors.New("本次 SOP 执行身份未配置所选模型的凭据（CodeBuddy 或 Claude Code）")
-	ErrReportModel       = errors.New("所选模型不可用")
-	ErrReportCLI         = errors.New("模型 CLI 调用失败，请检查 API 服务环境和日志")
-	ErrReportFormat      = errors.New("AI 未通过 submit_notification_report 提交有效报告")
+	ErrReportCredentials = errors.New("A conta que executa este SOP não tem credencial do modelo escolhido (CodeBuddy ou Claude Code)")
+	ErrReportModel       = errors.New("O modelo escolhido está indisponível")
+	ErrReportCLI         = errors.New("Falha ao chamar o CLI do modelo. Confira o ambiente do serviço de API e os logs")
+	ErrReportFormat      = errors.New("A IA não enviou um relatório válido por submit_notification_report")
 )
 
 func reportFailureReason(err error) string {
@@ -24,9 +24,9 @@ func reportFailureReason(err error) string {
 		}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return "整体汇报生成超时"
+		return "O relatório geral demorou demais para ser gerado"
 	}
-	return "整体汇报生成失败，已使用标准完成消息"
+	return "O relatório geral falhou e foi usada a mensagem padrão de conclusão"
 }
 
 type ReportGenerator func(context.Context, domain.Run, string, string) (domain.AINotificationContent, error)
@@ -78,7 +78,7 @@ func (s *Service) generateReport(ctx context.Context, item *domain.NotificationD
 	if err == nil {
 		run, ok := s.Store.RunState(item.RunID)
 		if !ok {
-			return errors.New("汇报对应的运行已删除")
+			return errors.New("A execução deste relatório foi apagada")
 		}
 		var content, source string
 		content, source, err = s.renderAIReport(ctx, run, item.ReportModel, request)
@@ -104,7 +104,7 @@ func (s *Service) generateReport(ctx context.Context, item *domain.NotificationD
 // caller should fall back to the standard completion message.
 func (s *Service) renderAIReport(ctx context.Context, run domain.Run, model string, request domain.NotificationReportRequest) (string, string, error) {
 	if s.GenerateReport == nil {
-		return "", "", errors.New("独立汇报服务不可用")
+		return "", "", errors.New("O serviço de relatório está indisponível")
 	}
 	reportCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	ai, err := s.GenerateReport(reportCtx, run, model, ReportPrompt(run, request))
@@ -113,7 +113,7 @@ func (s *Service) renderAIReport(ctx context.Context, run domain.Run, model stri
 		return "", "", err
 	}
 	if strings.TrimSpace(ai.Body) == "" {
-		return "", "", errors.New("AI 未返回有效整体报告")
+		return "", "", errors.New("A IA não devolveu um relatório geral válido")
 	}
 	raw, _ := json.Marshal(ai)
 	_, plain, _ := domain.ParseNotificationResult(request.Context.Result)

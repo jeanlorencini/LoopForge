@@ -73,7 +73,7 @@ func TestNotificationPreviewDoesNotSendOrMutate(t *testing.T) {
 	req := httptest.NewRequest("POST", "/preview", strings.NewReader(`{"projectId":"preview-project","sourceType":"schedule_job","binding":{"events":["succeeded"],"template":"{{task.name}} 完成\n{{ai.summary}}"}}`))
 	rec := httptest.NewRecorder()
 	g.ServeHTTP(rec, req)
-	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "每日进度汇总 完成") || provider.sent != 0 {
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Resumo diário de andamento 完成") || provider.sent != 0 {
 		t.Fatalf("preview %d %s", rec.Code, rec.Body.String())
 	}
 	items, _ := s.NotificationDeliveries("preview-project")

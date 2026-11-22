@@ -42,19 +42,19 @@ func NotificationUsesAI(binding NotificationBinding) bool {
 }
 func ValidateNotificationBinding(binding NotificationBinding) error {
 	if binding.WaitingPolicy != "" && binding.WaitingPolicy != "actionable" && binding.WaitingPolicy != "event" {
-		return fmt.Errorf("等待通知策略无效")
+		return fmt.Errorf("Regra de aviso de espera inválida")
 	}
 	if binding.Scope != "" && binding.Scope != "node" && binding.Scope != "run" {
-		return fmt.Errorf("通知触发范围无效")
+		return fmt.Errorf("Escopo do aviso inválido")
 	}
 	if binding.ContentMode != "" && binding.ContentMode != "template" && binding.ContentMode != "ai" {
-		return fmt.Errorf("通知内容方式无效")
+		return fmt.Errorf("Tipo de conteúdo do aviso inválido")
 	}
 	if len(binding.Template) > 12000 {
-		return fmt.Errorf("通知模板不能超过 12000 字节")
+		return fmt.Errorf("O modelo do aviso não pode passar de 12000 bytes")
 	}
 	if len(binding.AIInstruction) > 4000 {
-		return fmt.Errorf("AI 通知编写要求不能超过 4000 字节")
+		return fmt.Errorf("As instruções para a IA escrever o aviso não podem passar de 4000 bytes")
 	}
 	if err := validateNotificationTemplate(binding.Template); err != nil {
 		return err
@@ -67,12 +67,12 @@ func ValidateNotificationBinding(binding NotificationBinding) error {
 func validateNotificationTemplate(template string) error {
 	for _, match := range notificationVariable.FindAllStringSubmatch(template, -1) {
 		if !slices.Contains(NotificationVariableNames, match[1]) {
-			return fmt.Errorf("通知模板包含不支持的变量：%s", match[1])
+			return fmt.Errorf("O modelo do aviso tem uma variável não suportada: %s", match[1])
 		}
 	}
 	rest := notificationVariable.ReplaceAllString(template, "")
 	if strings.Contains(rest, "{{") || strings.Contains(rest, "}}") {
-		return fmt.Errorf("通知模板的变量格式无效")
+		return fmt.Errorf("Formato de variável inválido no modelo do aviso")
 	}
 	return nil
 }
@@ -81,13 +81,13 @@ func validateNotificationTemplate(template string) error {
 // run-scoped bindings cannot fire on waiting.
 func validateNotificationEvents(events []string, scope string) error {
 	if len(events) == 0 || len(events) > 3 {
-		return fmt.Errorf("请选择通知触发条件")
+		return fmt.Errorf("Escolha quando o aviso dispara")
 	}
 	seen := map[string]bool{}
 	for _, event := range events {
 		supported := event == "succeeded" || event == "failed" || event == "waiting"
 		if seen[event] || !supported || (scope == "run" && event == "waiting") {
-			return fmt.Errorf("不支持的通知触发条件")
+			return fmt.Errorf("Condição de disparo do aviso não suportada")
 		}
 		seen[event] = true
 	}
@@ -172,7 +172,7 @@ func RenderNotification(binding NotificationBinding, ctx NotificationContext) (s
 	// Expand once, so text inside AI/output values cannot inject further variables.
 	content := notificationVariable.ReplaceAllStringFunc(template, func(match string) string { return values[notificationVariable.FindStringSubmatch(match)[1]] })
 	if len(content) == 0 || len(content) > 19000 {
-		return "", "invalid", fmt.Errorf("渲染后的通知正文为空或超过 19000 字节，请缩短模板")
+		return "", "invalid", fmt.Errorf("O texto do aviso ficou vazio ou passou de 19000 bytes. Encurte o modelo")
 	}
 	return content, source, nil
 }

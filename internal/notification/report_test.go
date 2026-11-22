@@ -91,7 +91,7 @@ func TestReportFailureReasonDoesNotExposeRawCLIOutput(t *testing.T) {
 	if got := reportFailureReason(errors.New("raw key=private-secret")); strings.Contains(got, "private-secret") {
 		t.Fatal("leaked raw error")
 	}
-	if got := reportFailureReason(context.DeadlineExceeded); got != "整体汇报生成超时" {
+	if got := reportFailureReason(context.DeadlineExceeded); got != "O relatório geral demorou demais para ser gerado" {
 		t.Fatal(got)
 	}
 }

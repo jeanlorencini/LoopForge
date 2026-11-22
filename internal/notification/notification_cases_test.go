@@ -171,7 +171,7 @@ func TestGenerateReportMalformedFallback(t *testing.T) {
 	if item.ReportState != "fallback" || item.ContentSource != "fallback" || item.ReportError == "" {
 		t.Fatalf("fallback = %#v", item)
 	}
-	if reportFailureReason(context.DeadlineExceeded) != "整体汇报生成超时" {
+	if reportFailureReason(context.DeadlineExceeded) != "O relatório geral demorou demais para ser gerado" {
 		t.Fatal("deadline failure reason")
 	}
 }

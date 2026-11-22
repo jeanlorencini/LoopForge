@@ -24,7 +24,7 @@ type notificationHandlers struct {
 func (h *notificationHandlers) access(c *gin.Context, projectID string, write bool) bool {
 	project, ok := h.repo.Project(projectID)
 	if !ok {
-		c.JSON(404, gin.H{"error": "项目不存在"})
+		c.JSON(404, gin.H{"error": "O projeto não existe"})
 		return false
 	}
 	user, authenticated := h.requestUser(c.Request, true)
@@ -32,7 +32,7 @@ func (h *notificationHandlers) access(c *gin.Context, projectID string, write bo
 		if !authRequired() {
 			return true
 		}
-		c.JSON(401, gin.H{"error": "请先登录"})
+		c.JSON(401, gin.H{"error": "Faça login primeiro"})
 		return false
 	}
 	if h.isPlatformAdmin(c.Request) || project.OwnerID == user.ID {
@@ -43,7 +43,7 @@ func (h *notificationHandlers) access(c *gin.Context, projectID string, write bo
 			return true
 		}
 	}
-	c.JSON(403, gin.H{"error": "你没有该项目的通知管理权限"})
+	c.JSON(403, gin.H{"error": "Você não tem permissão para gerenciar os avisos deste projeto"})
 	return false
 }
 func (h *notificationHandlers) managed(c *gin.Context, bot domain.NotificationBot) bool {
@@ -66,13 +66,13 @@ func (h *notificationHandlers) managed(c *gin.Context, bot domain.NotificationBo
 			return true
 		}
 	}
-	c.JSON(403, gin.H{"error": "只有创建者或项目管理员可以修改机器人和发送测试通知"})
+	c.JSON(403, gin.H{"error": "Só quem criou o bot ou um administrador do projeto pode alterar o bot e enviar avisos de teste"})
 	return false
 }
 func (h *notificationHandlers) find(c *gin.Context, write bool) (domain.NotificationBot, bool) {
 	bot, err := h.repo.NotificationBot(c.Param("id"))
 	if err != nil {
-		c.JSON(404, gin.H{"error": "机器人不存在"})
+		c.JSON(404, gin.H{"error": "O bot não existe"})
 		return bot, false
 	}
 	if write {
@@ -139,14 +139,14 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 		provider = old.Provider
 	}
 	if provider != "" && provider != domain.BotProviderTelegram {
-		c.JSON(400, gin.H{"error": "不支持的通知渠道"})
+		c.JSON(400, gin.H{"error": "Canal de aviso não suportado"})
 		return
 	}
 	if provider == domain.BotProviderTelegram {
 		if req.Secret != "" {
 			m := telegramTokenPattern.FindStringSubmatch(req.Secret)
 			if m == nil {
-				c.JSON(400, gin.H{"error": "请填写 @BotFather 提供的 Telegram Bot Token"})
+				c.JSON(400, gin.H{"error": "Preencha o token do bot do Telegram fornecido pelo @BotFather"})
 				return
 			}
 			req.BotID = domain.TelegramBotIDPrefix + m[1]
@@ -155,7 +155,7 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 		}
 	}
 	if req.Name == "" || len([]rune(req.Name)) > 80 || req.BotID == "" || len(req.BotID) > 191 || len(req.Secret) > 512 {
-		c.JSON(400, gin.H{"error": "请填写有效的名称、Bot ID 和 Secret"})
+		c.JSON(400, gin.H{"error": "Preencha nome, Bot ID e Secret válidos"})
 		return
 	}
 	bot := domain.NotificationBot{ID: "bot-" + randomID(), ProjectID: strings.TrimSpace(req.ProjectID), Provider: provider, Name: req.Name, BotID: req.BotID, Enabled: req.Enabled, Health: "unchecked"}
@@ -165,7 +165,7 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 		bot.Enabled = req.Enabled
 		if old.BotID != req.BotID {
 			if req.Secret == "" {
-				c.JSON(400, gin.H{"error": "修改 Bot ID 时必须同时填写新 Secret"})
+				c.JSON(400, gin.H{"error": "Ao mudar o Bot ID, preencha também o novo Secret"})
 				return
 			}
 			bot.BotID = req.BotID
@@ -184,7 +184,7 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 		}
 		// Claude Code ids run on the sender's key or the platform subscription.
 		if engine, name := assistantModelEngine(model); !(engine == assistantEngineClaude && name != "") && assistantAllowedModel(model, assistantKnownCatalog()) != model {
-			c.JSON(400, gin.H{"error": "请选择有效的 CodeBuddy 或 Claude Code 模型"})
+			c.JSON(400, gin.H{"error": "Escolha um modelo CodeBuddy ou Claude Code válido"})
 			return
 		}
 		bot.Model = model
@@ -200,7 +200,7 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 			bot.OwnerID = user.ID
 		}
 		if req.Secret == "" {
-			c.JSON(400, gin.H{"error": "新建机器人需要 Secret"})
+			c.JSON(400, gin.H{"error": "Um bot novo precisa de Secret"})
 			return
 		}
 	}
@@ -212,7 +212,7 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 	// A target is accepted only after refreshing the real provider list. Never trust a posted name/type.
 	if bot.InteractionEnabled {
 		if bot.OwnerID == 0 {
-			c.JSON(400, gin.H{"error": "请登录后创建支持对话的 Bot，平台需要记录创建者的执行身份"})
+			c.JSON(400, gin.H{"error": "Faça login para criar um bot com conversa. A plataforma precisa registrar a conta de execução de quem o criou"})
 			return
 		}
 		bots, err := h.repo.InteractiveNotificationBots()
@@ -247,7 +247,7 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 			bot.Target = nil
 		} else {
 			if old == nil || req.Secret != "" || old.BotID != req.BotID {
-				c.JSON(400, gin.H{"error": "请先保存凭据，再刷新并选择接收会话"})
+				c.JSON(400, gin.H{"error": "Salve as credenciais antes de atualizar e escolher o chat de destino"})
 				return
 			}
 			chats, err := h.service.Sessions(c.Request.Context(), bot)
@@ -265,7 +265,7 @@ func (h *notificationHandlers) save(c *gin.Context, old *domain.NotificationBot)
 				}
 			}
 			if !found {
-				c.JSON(409, gin.H{"error": "目标会话已不可用，请刷新列表"})
+				c.JSON(409, gin.H{"error": "O chat de destino não está mais disponível. Atualize a lista"})
 				return
 			}
 			bot.Health = "ready"
@@ -313,7 +313,7 @@ func (h *notificationHandlers) test(c *gin.Context) {
 		return
 	}
 	if bot.Target == nil {
-		c.JSON(400, gin.H{"error": "请先选择并保存接收会话"})
+		c.JSON(400, gin.H{"error": "Escolha e salve o chat de destino primeiro"})
 		return
 	}
 	content := "### Teste de notificação\nBot: " + bot.Name + "\nEsta é uma notificação de teste e não representa o status de nenhuma tarefa."
@@ -381,7 +381,7 @@ func (h *notificationHandlers) retry(c *gin.Context) {
 		if item.ID == c.Param("deliveryId") {
 			bot, err := h.repo.NotificationBot(item.BotID)
 			if err != nil {
-				c.JSON(404, gin.H{"error": "机器人已删除"})
+				c.JSON(404, gin.H{"error": "O bot foi apagado"})
 				return
 			}
 			if !h.managed(c, bot) {
@@ -389,14 +389,14 @@ func (h *notificationHandlers) retry(c *gin.Context) {
 			}
 			err = h.repo.RetryNotification(projectID, item.ID)
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				c.JSON(409, gin.H{"error": "当前记录不可重试"})
+				c.JSON(409, gin.H{"error": "Este registro não pode ser reenviado"})
 				return
 			}
 			respond(c, err)
 			return
 		}
 	}
-	c.JSON(404, gin.H{"error": "发送记录不存在"})
+	c.JSON(404, gin.H{"error": "O registro de envio não existe"})
 }
 
 func (h *notificationHandlers) preview(c *gin.Context) {
@@ -412,7 +412,7 @@ func (h *notificationHandlers) preview(c *gin.Context) {
 		return
 	}
 	project, _ := h.repo.Project(req.ProjectID)
-	values := map[string]string{"project": project.Name, "workflow": "需求交付流程", "node": "实现功能", "status": "Nó concluído", "issue.title": "登录校验优化", "issue.id": "示例需求", "task.name": "每日进度汇总", "input": "优化登录校验并完成验证", "error": "示例错误（仅失败时可用）"}
+	values := map[string]string{"project": project.Name, "workflow": "Fluxo de entrega de requisito", "node": "Implementar a funcionalidade", "status": "Nó concluído", "issue.title": "Melhorar a validação de login", "issue.id": "Requisito de exemplo", "task.name": "Resumo diário de andamento", "input": "Melhorar a validação de login e concluir a verificação", "error": "Erro de exemplo (só em falhas)"}
 	if req.Binding.Scope == "run" {
 		values["status"] = "SOP concluído"
 		values["node"] = "Todos os nós"
@@ -420,16 +420,16 @@ func (h *notificationHandlers) preview(c *gin.Context) {
 	if req.SourceType == "schedule_job" || req.SourceType == "assistant_task" {
 		values["status"] = "Tarefa concluída"
 	}
-	result := "已完成登录校验优化，并通过相关测试。\n\n```notification\n{\"title\":\"登录校验优化进展\",\"summary\":\"已完成校验优化，相关测试通过。\",\"body\":\"已完成校验优化，相关测试通过。后续可进行人工验收。\"}\n```"
+	result := "A validação de login foi melhorada e os testes relacionados passaram.\n\n```notification\n{\"title\":\"Andamento da validação de login\",\"summary\":\"Validação melhorada e testes aprovados.\",\"body\":\"Validação melhorada e testes aprovados. Falta a aceitação manual.\"}\n```"
 	if req.Binding.Scope == "run" {
-		result = domain.BuildWorkflowNotificationResult(domain.Run{WorkflowSnapshot: domain.WorkflowDefinition{Name: "需求交付流程", Nodes: []domain.WorkflowNode{{ID: "plan", Name: "需求分析"}, {ID: "impl", Name: "实现与验证"}}}, Nodes: map[string]*domain.NodeRun{"plan": {Status: "succeeded", Output: "已明确验收标准"}, "impl": {Status: "succeeded", Output: result}}})
+		result = domain.BuildWorkflowNotificationResult(domain.Run{WorkflowSnapshot: domain.WorkflowDefinition{Name: "Fluxo de entrega de requisito", Nodes: []domain.WorkflowNode{{ID: "plan", Name: "Análise do requisito"}, {ID: "impl", Name: "Implementação e verificação"}}}, Nodes: map[string]*domain.NodeRun{"plan": {Status: "succeeded", Output: "Critérios de aceite definidos"}, "impl": {Status: "succeeded", Output: result}}})
 	}
-	content, source, err := domain.RenderNotification(req.Binding, domain.NotificationContext{Values: values, Result: result, Fallback: "示例执行已完成", SourceType: req.SourceType})
+	content, source, err := domain.RenderNotification(req.Binding, domain.NotificationContext{Values: values, Result: result, Fallback: "Execução de exemplo concluída", SourceType: req.SourceType})
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 	link := strings.TrimRight(h.service.PublicURL, "/") + "/#/runs/example"
 	content = strings.ReplaceAll(content, domain.NotificationURLMarker, link)
-	c.JSON(200, gin.H{"content": content, "contentSource": source, "note": "示例预览，不发送消息；AI 内容在实际执行时生成"})
+	c.JSON(200, gin.H{"content": content, "contentSource": source, "note": "Prévia de exemplo, nenhuma mensagem é enviada. O conteúdo da IA é gerado na execução real"})
 }

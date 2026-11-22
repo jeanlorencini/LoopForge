@@ -36,7 +36,7 @@ func (s *Service) provider(bot domain.NotificationBot) Provider {
 func (s *Service) secret(bot domain.NotificationBot) (string, error) {
 	secret, err := s.Store.BotCredential(bot.ID)
 	if err != nil || secret == "" {
-		return "", errors.New("机器人凭据不可用，请重新填写 Secret")
+		return "", errors.New("A credencial do bot está indisponível. Preencha o Secret de novo")
 	}
 	return secret, nil
 }
@@ -119,7 +119,7 @@ func botHealth(err error) string {
 	return "error"
 }
 
-var errNotificationExpired = errors.New("节点已无需人工处理")
+var errNotificationExpired = errors.New("O nó não precisa mais de ação manual")
 
 func (s *Service) Send(ctx context.Context, bot domain.NotificationBot, targetID, content string) error {
 	return s.send(ctx, bot, targetID, content, nil)
@@ -128,7 +128,7 @@ func (s *Service) send(ctx context.Context, bot domain.NotificationBot, targetID
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	if !bot.Enabled {
-		return errors.New("机器人已停用")
+		return errors.New("O bot está desativado")
 	}
 	// Telegram keeps updates for 24 hours only, so a quiet chat drops out of
 	// Sessions; sendMessage reports an unusable chat itself.
@@ -144,7 +144,7 @@ func (s *Service) send(ctx context.Context, bot domain.NotificationBot, targetID
 			}
 		}
 		if !found {
-			return &ProviderError{Code: 404, Message: "接收会话当前不可用，请与机器人互动后刷新列表"}
+			return &ProviderError{Code: 404, Message: "O chat de destino está indisponível. Mande uma mensagem ao bot e atualize a lista"}
 		}
 	}
 	secret, err := s.secret(bot)
@@ -217,34 +217,34 @@ func (s *Service) ProcessOne(ctx context.Context) (bool, error) {
 		return true, s.Store.FinishNotification(*item, status, detail, now)
 	}
 	if now.Sub(item.CreatedAt) > 24*time.Hour {
-		return finish("expired", "通知已超过有效期")
+		return finish("expired", "O aviso passou da validade")
 	}
 	bot, err := s.Store.NotificationBot(item.BotID)
 	if err != nil {
-		return finish("cancelled", "机器人已删除")
+		return finish("cancelled", "O bot foi apagado")
 	}
 	if !bot.Enabled {
-		return finish("cancelled", "机器人已停用")
+		return finish("cancelled", "O bot está desativado")
 	}
 	if bot.ProjectID != item.ProjectID {
-		return finish("cancelled", "通知项目不匹配")
+		return finish("cancelled", "O aviso é de outro projeto")
 	}
 	if item.SourceType == "schedule_job" {
 		job, ok := s.Store.ScheduleJob(item.SourceID)
 		if !ok || job.ProjectID != item.ProjectID {
-			return finish("cancelled", "定时任务已删除或项目已变更")
+			return finish("cancelled", "A tarefa agendada foi apagada ou mudou de projeto")
 		}
 	}
 	if item.SourceType == "assistant_task" && !s.Store.AssistantTaskExists(item.ProjectID, item.SourceID) {
-		return finish("cancelled", "AI 助手任务已删除或项目已变更")
+		return finish("cancelled", "A tarefa do assistente foi apagada ou mudou de projeto")
 	}
 	if item.RunID != "" {
 		run, ok := s.Store.RunState(item.RunID)
 		if !ok {
-			return finish("expired", "运行已删除")
+			return finish("expired", "A execução foi apagada")
 		}
 		if item.EventType == "waiting" && item.WaitingPolicy != "event" && waitingNodeStale(run, *item) {
-			return finish("expired", "节点已无需人工处理")
+			return finish("expired", "O nó não precisa mais de ação manual")
 		}
 	}
 	if item.EventType == "waiting" && item.WaitingPolicy == "event" {
@@ -300,7 +300,7 @@ func (s *Service) ProcessOne(ctx context.Context) (bool, error) {
 		return finish("sent", "")
 	}
 	status := "pending"
-	detail := "发送失败，等待重试"
+	detail := "O envio falhou. Nova tentativa em breve"
 	var pe *ProviderError
 	if errors.As(err, &pe) {
 		detail = pe.Error()
@@ -313,7 +313,7 @@ func (s *Service) ProcessOne(ctx context.Context) (bool, error) {
 	}
 	if item.Attempts >= 5 && status == "pending" {
 		status = "failed"
-		detail = "多次发送失败，请检查通知通道后重试"
+		detail = "O envio falhou várias vezes. Confira o canal de avisos e tente de novo"
 	}
 	delay := time.Duration(1<<min(item.Attempts, 6)) * 10 * time.Second
 	jitter := make([]byte, 1)

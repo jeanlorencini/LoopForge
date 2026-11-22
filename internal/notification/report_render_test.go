@@ -10,7 +10,7 @@ import (
 
 func TestRenderAIReportErrors(t *testing.T) {
 	request := domain.NotificationReportRequest{Binding: domain.NotificationBinding{Scope: "run", Events: []string{"succeeded"}, ContentMode: "ai"}}
-	if _, _, err := (&Service{}).renderAIReport(context.Background(), domain.Run{}, "m", request); err == nil || err.Error() != "独立汇报服务不可用" {
+	if _, _, err := (&Service{}).renderAIReport(context.Background(), domain.Run{}, "m", request); err == nil || err.Error() != "O serviço de relatório está indisponível" {
 		t.Fatalf("missing generator err = %v", err)
 	}
 	failed := errors.New("generator failed")
@@ -23,7 +23,7 @@ func TestRenderAIReportErrors(t *testing.T) {
 	svc.GenerateReport = func(context.Context, domain.Run, string, string) (domain.AINotificationContent, error) {
 		return domain.AINotificationContent{Title: "t", Body: "  "}, nil
 	}
-	if _, _, err := svc.renderAIReport(context.Background(), domain.Run{}, "m", request); err == nil || err.Error() != "AI 未返回有效整体报告" {
+	if _, _, err := svc.renderAIReport(context.Background(), domain.Run{}, "m", request); err == nil || err.Error() != "A IA não devolveu um relatório geral válido" {
 		t.Fatalf("blank body err = %v", err)
 	}
 }

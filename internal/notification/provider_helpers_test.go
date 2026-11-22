@@ -44,7 +44,7 @@ func TestWecomResultCode(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			code, err := wecomResultCode([]byte(tc.raw))
 			if tc.wantErr {
-				if err == nil || err.Error() != "企业微信 CLI 响应格式异常" {
+				if err == nil || err.Error() != "Resposta do CLI do WeCom em formato inesperado" {
 					t.Fatalf("want format error, got code=%d err=%v", code, err)
 				}
 				return
