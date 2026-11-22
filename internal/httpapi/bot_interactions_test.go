@@ -136,7 +136,7 @@ func TestBotMissingSubmissionRetriesOnlyTerminalStep(t *testing.T) {
 	h.generate = func(ctx context.Context, prompt string, user domain.User) (string, error) {
 		calls++
 		if calls == 1 {
-			return "查询结果已经准备好，但未提交终态", nil
+			return "请稍等，我正在查询项目的运行记录。", nil
 		}
 		if strings.Contains(prompt, "原始查询标记") || !strings.Contains(prompt, "Não consulte de novo") {
 			t.Fatal("retry restarted task", prompt)
@@ -157,6 +157,19 @@ func TestBotMissingSubmissionRetriesOnlyTerminalStep(t *testing.T) {
 	}
 	reply, err := h.generateBotReply(context.Background(), bot, domain.BotConversation{SessionID: "bot-session", ChatType: "single"}, nil, domain.BotInteraction{SenderID: "new-wecom-user", Content: "原始查询标记"})
 	if err != nil || reply != "查询已提交" || calls != 2 {
+		t.Fatal(reply, err, calls)
+	}
+}
+
+func TestBotPlainAnswerNeedsNoSubmission(t *testing.T) {
+	_, h, bot := botFixture(t)
+	calls := 0
+	h.generate = func(ctx context.Context, prompt string, user domain.User) (string, error) {
+		calls++
+		return "O requisito 8 está em implementação, na etapa de revisão.", nil
+	}
+	reply, err := h.generateBotReply(context.Background(), bot, domain.BotConversation{SessionID: "bot-session", ChatType: "single"}, nil, domain.BotInteraction{SenderID: "new-wecom-user", Content: "qual o status do requisito?"})
+	if err != nil || reply != "O requisito 8 está em implementação, na etapa de revisão." || calls != 1 {
 		t.Fatal(reply, err, calls)
 	}
 }

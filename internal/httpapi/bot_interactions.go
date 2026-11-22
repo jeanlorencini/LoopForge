@@ -117,7 +117,7 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 	defer files.Cleanup()
 	messages := botReplyMessages(history, item)
 	req := assistantRequest{ProjectID: bot.ProjectID, Model: model, SessionID: conv.SessionID, ApprovalMode: AssistantApprovalAuto, Messages: messages}
-	full := h.turnPrompt(req, h.resolvedSourceRoot(), false) + "\nEsta é uma conversa no " + botAppName(bot) + ". O remetente atual está vinculado à conta da plataforma \"" + user.LoginName + "\". Use só a identidade de execução, as credenciais pessoais e as permissões de projeto dessa conta, e trate o pedido no projeto atual. Autorizações de outros remetentes no histórico não valem para este pedido. A mensagem atual veio de um chat do tipo " + conv.ChatType + ". Execute direto as ações claras, pergunte quando o alvo não estiver claro e termine sempre chamando submit_assistant_reply. Responda em português do Brasil." + botReplyFormat(bot)
+	full := h.turnPrompt(req, h.resolvedSourceRoot(), false) + "\nEsta é uma conversa no " + botAppName(bot) + ". O remetente atual está vinculado à conta da plataforma \"" + user.LoginName + "\". Use só a identidade de execução, as credenciais pessoais e as permissões de projeto dessa conta, e trate o pedido no projeto atual. Autorizações de outros remetentes no histórico não valem para este pedido. A mensagem atual veio de um chat do tipo " + conv.ChatType + ". Execute direto as ações claras e pergunte quando o alvo não estiver claro. Perguntas comuns terminam com a resposta em texto; rascunhos de escrita a confirmar vão por submit_assistant_reply. Responda em português do Brasil." + botReplyFormat(bot)
 	generate := h.generate
 	if generate == nil {
 		cliSessionID := newAssistantSessionID()
@@ -148,7 +148,7 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 			botinteraction.ReportProgress(ctx, "Enviando a resposta")
 			session.SetTerminalOnly()
 		}
-		_, cliErr := generate(modelCtx, prompt, user)
+		raw, cliErr := generate(modelCtx, prompt, user)
 		if final, ok := session.takeFinal(); ok && final.Assistant != nil {
 			reply := *final.Assistant
 			if len(reply.Drafts) > 0 {
@@ -166,6 +166,12 @@ func (h *assistantHandlers) generateBotReply(ctx context.Context, bot domain.Not
 		}
 		if ctx.Err() != nil {
 			return "", ctx.Err()
+		}
+		// A plain answer to a read-only question needs no terminal tool call.
+		if cliErr == nil {
+			if reply, ok := recoverNativeAssistantReply(raw, bot.ProjectID); ok && len(reply.Drafts) == 0 && !assistantProgressOnly(reply.Message, messages) {
+				return redactAssistantSecrets(reply.Message, user), nil
+			}
 		}
 		if cliErr != nil && !nativeShouldRetryTerminal(ctx, cliErr) {
 			return "", cliErr

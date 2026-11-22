@@ -433,6 +433,7 @@ func (s *Service) process(ctx context.Context, bot domain.NotificationBot, owner
 			if errors.Is(err, ErrCardActionDeferred) {
 				detail = ErrCardActionDeferred.Error()
 			} else if err != nil {
+				log.Printf("bot reply failed bot=%s interaction=%s: %v", bot.ID, item.ID, err)
 				detail = "Falha no processamento"
 				reply = "O pedido não foi concluído. Tente de novo mais tarde ou confira o status na plataforma."
 				if errors.Is(err, context.DeadlineExceeded) {
