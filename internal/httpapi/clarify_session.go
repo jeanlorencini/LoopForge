@@ -72,7 +72,7 @@ func clarifySessionOutputError(output string) error {
 		}
 		lower := strings.ToLower(line)
 		if strings.Contains(lower, "sessionnotfounderror") || strings.Contains(lower, "no conversation found with session id") {
-			return fmt.Errorf("澄清会话不存在，无法续接")
+			return fmt.Errorf("A sessão de esclarecimento não existe mais; não dá para continuar")
 		}
 	}
 	return nil
@@ -347,7 +347,7 @@ func runClarifyCodexTurn(ctx context.Context, workDir, bin, model, prompt, sessi
 		return "", err
 	}
 	if inv.resumeMissing {
-		return "", fmt.Errorf("澄清会话不存在，无法续接")
+		return "", fmt.Errorf("A sessão de esclarecimento não existe mais; não dá para continuar")
 	}
 	ok := false
 	defer func() { inv.finish(ok) }()
@@ -386,11 +386,11 @@ func runClarifyCodexTurn(ctx context.Context, workDir, bin, model, prompt, sessi
 	if err == nil && turnErr != "" {
 		switch {
 		case strings.Contains(strings.ToLower(turnErr), "no conversation found with session id"):
-			err = fmt.Errorf("澄清会话不存在，无法续接")
+			err = fmt.Errorf("A sessão de esclarecimento não existe mais; não dá para continuar")
 		case assistantAuthFailureText(turnErr):
-			err = fmt.Errorf("平台的 Codex 登录无效或已过期，请在服务器上重新执行 codex login")
+			err = fmt.Errorf("O login do Codex da plataforma é inválido ou expirou; rode codex login de novo no servidor")
 		default:
-			err = fmt.Errorf("Codex：%s", turnErr)
+			err = fmt.Errorf("Codex: %s", turnErr)
 		}
 	}
 	ok = err == nil
@@ -417,10 +417,10 @@ func clarifyResumeTurnPrompt(title, message string, assistantRounds int) string 
 	var b strings.Builder
 	b.WriteString("这是用户对本轮澄清的回复。结合会话中已读过的代码、原单、评论和对话继续，不要重复已问过的问题，不要再读已经成功读过的同一原单/评论/文档。")
 	if title = strings.TrimSpace(title); title != "" {
-		b.WriteString("\n范围锚点：本次只澄清「" + title + "」本身，遵守首轮约定的范围规则；用户回答若带出这条需求以外的新诉求，不要沿着追问，写进 summary 的「不在本次范围」并建议另建需求。")
+		b.WriteString("\n范围锚点：本次只澄清「" + title + "」本身，遵守首轮约定的范围规则；用户回答若带出这条需求以外的新诉求，不要沿着追问，写进 summary 的「Fora do escopo」并建议另建需求。")
 	}
 	b.WriteString(clarifyRoundBudgetHint(assistantRounds))
-	b.WriteString("完成后调用 submit_clarification。\n用户：")
+	b.WriteString("\n所有给用户看的内容继续用巴西葡萄牙语（português do Brasil）书写。完成后调用 submit_clarification。\n用户：")
 	b.WriteString(msg)
 	return b.String()
 }
@@ -488,17 +488,17 @@ func clarifySystemPrompt(intro, mcpStep, focus string) string {
 范围规则（最重要）：
 - 「## 需求」里的标题和描述就是本次范围的边界。只澄清把这一条需求做完所必需的信息，不负责规划整个模块或项目
 - 读代码是为了定位改动点、确认现有行为，不是为了寻找还能顺带做的事。代码里看到的相邻功能、历史问题、可优化点、未来扩展，都不要提问
-- 不要提出会扩大范围的问题或选项（例如「是否同时支持 X」「要不要顺便改 Y」「其他页面要不要一起改」）。确实值得提醒的相邻事项，只在 summary 的「不在本次范围」里列一句
-- 用户回答里带出这条需求以外的新诉求时，不要沿着追问，记入「不在本次范围」并建议另建需求
+- 不要提出会扩大范围的问题或选项（例如「是否同时支持 X」「要不要顺便改 Y」「其他页面要不要一起改」）。确实值得提醒的相邻事项，只在 summary 的「Fora do escopo」里列一句
+- 用户回答里带出这条需求以外的新诉求时，不要沿着追问，记入「Fora do escopo」并建议另建需求
 - 不要为了凑问题而提问：能按现有代码惯例合理假设的细节直接假设，写进 summary；没有阻塞开工的缺口就设 ready=true
 
 问题要具体、基于代码：
 - 不问"范围是什么"，而是问"需求说改 X，代码里 X 由 A 处理，是在 A 上改还是新增入口？"——问题必须落在需求原文已经提到的东西上
 - 每轮只问 1-3 个最关键的新问题，放入 questions，不要只在 summary 中列出缺口
 - ready=false 时必须有问题。选择题 options 至少提供两个不同、具体可操作的选项，选项都应在本需求范围内；需要用户填写路径、数量等内容时使用 freeText=true、options=[]、multiSelect=false，不编造选项
-- ready=true 时 summary 按「本次范围 / 不在本次范围 / 验收标准 / 假设」分段给出结论
+- ready=true 时 summary 按「Escopo / Fora do escopo / Critérios de aceite / Premissas」分段给出结论
 - 工具校验失败时修正参数并重新提交
 - TAPD 的 id、workspace_id、entry_id 必须用字符串
-- 思考用中文对用户说正在读代码或原单
+- 用户看到的所有内容（思考进度、questions、options、summary）都用巴西葡萄牙语（português do Brasil）书写，代码标识符和文件路径保持原样
 `, intro, mcpStep, focus)
 }

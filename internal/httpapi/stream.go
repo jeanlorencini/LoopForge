@@ -607,7 +607,7 @@ func (h *streamHandlers) executeClarify(ctx context.Context, issue domain.Issue,
 			workDir = homeDir
 		}
 		reason, _ := repoInfo["reason"].(string)
-		prompt.WriteString("\n\n## 重要限制\n本次未能读取代码仓库（原因：" + reason + "）。不要使用 Read/Grep/Glob，也不要假设或声称已阅读任何代码；请仅基于需求描述与对话历史进行澄清，并在 summary 开头注明「未基于代码分析」。")
+		prompt.WriteString("\n\n## 重要限制\n本次未能读取代码仓库（原因：" + reason + "）。不要使用 Read/Grep/Glob，也不要假设或声称已阅读任何代码；请仅基于需求描述与对话历史进行澄清，并在 summary 开头注明「Sem análise do código」。")
 	}
 	// Multi-repository analysis: every selected repository is checked out as a
 	// real sibling directory in the analysis workspace; the prompt lists each
@@ -668,7 +668,7 @@ func (h *streamHandlers) executeClarify(ctx context.Context, issue domain.Issue,
 		}
 		if len(analyzedRepos) == 0 {
 			reason, _ := repoInfo["reason"].(string)
-			turnPrompt += "\n\n本轮未能读取代码仓库（原因：" + reason + "）。不要使用 Read/Grep/Glob 或声称已分析当前代码；请仅基于需求与已有回答继续，并在 summary 开头注明「未基于代码分析」。"
+			turnPrompt += "\n\n本轮未能读取代码仓库（原因：" + reason + "）。不要使用 Read/Grep/Glob 或声称已分析当前代码；请仅基于需求与已有回答继续，并在 summary 开头注明「Sem análise do código」。"
 		}
 	}
 	sessionContext := userMsg

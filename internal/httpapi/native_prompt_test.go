@@ -57,7 +57,7 @@ func TestNativePromptsAreToolFirst(t *testing.T) {
 
 func TestClarifyPromptsAnchorScopeWithoutScoring(t *testing.T) {
 	system := clarifySystemPrompt("i", "m", "f")
-	for _, want := range []string{"范围规则", "就是本次范围的边界", "不要提出会扩大范围的问题或选项", "不在本次范围", "没有阻塞开工的缺口就设 ready=true"} {
+	for _, want := range []string{"范围规则", "就是本次范围的边界", "不要提出会扩大范围的问题或选项", "Fora do escopo", "português do Brasil", "没有阻塞开工的缺口就设 ready=true"} {
 		if !strings.Contains(system, want) {
 			t.Fatalf("system prompt missing %q:\n%s", want, system)
 		}
@@ -68,7 +68,7 @@ func TestClarifyPromptsAnchorScopeWithoutScoring(t *testing.T) {
 		}
 	}
 	resume := clarifyResumeTurnPrompt("国际站绑定对齐", "顺便把国内站也改了", 1)
-	if !strings.Contains(resume, "「国际站绑定对齐」") || !strings.Contains(resume, "不在本次范围") || strings.Contains(resume, "已经澄清了") {
+	if !strings.Contains(resume, "「国际站绑定对齐」") || !strings.Contains(resume, "Fora do escopo") || !strings.Contains(resume, "português do Brasil") || strings.Contains(resume, "已经澄清了") {
 		t.Fatalf("resume prompt must re-anchor on the title:\n%s", resume)
 	}
 	if late := clarifyResumeTurnPrompt("x", "y", 3); !strings.Contains(late, "已经澄清了 3 轮") || !strings.Contains(late, "ready=true") {

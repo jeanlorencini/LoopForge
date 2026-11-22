@@ -173,7 +173,7 @@ func TestRunClarifyTurnDetectsMissingSessionWithZeroExitCode(t *testing.T) {
 	h := &streamHandlers{}
 	_, _, _, err := h.runClarifyTurn(context.Background(), root, bin, "default", "continue", "test", "old-session", root, true,
 		runtime.RunCredentials{CodeBuddy: runtime.CodeBuddyCredential{APIKey: "test-key"}}, func(string, any) {}, clarifyTurnOpts{Native: true})
-	if err == nil || !strings.Contains(err.Error(), "澄清会话不存在") {
+	if err == nil || !strings.Contains(err.Error(), "A sessão de esclarecimento não existe mais") {
 		t.Fatalf("zero-exit missing session must trigger fallback: %v", err)
 	}
 }
