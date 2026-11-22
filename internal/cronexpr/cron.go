@@ -7,10 +7,12 @@ import (
 	"time"
 )
 
+// Location is the zone cron fields are read in: Brasília in this fork.
 var Location = func() *time.Location {
-	loc, err := time.LoadLocation("Asia/Shanghai")
+	loc, err := time.LoadLocation("America/Sao_Paulo")
 	if err != nil {
-		return time.Local
+		// Brazil has had no daylight saving time since 2019.
+		return time.FixedZone("America/Sao_Paulo", -3*3600)
 	}
 	return loc
 }()

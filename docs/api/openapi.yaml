@@ -434,7 +434,7 @@ paths:
                 prompt: {type: string}
                 notifications: {type: array, maxItems: 3, items: {$ref: "#/components/schemas/NotificationBinding"}}
                 intervalSec: {type: integer, minimum: 60, description: Used when cron is empty. Minimum 60 seconds.}
-                cron: {type: string, description: Optional 5-field cron (minute hour day month weekday) in Asia/Shanghai. When set, intervalSec is ignored.}
+                cron: {type: string, description: Optional 5-field cron (minute hour day month weekday) in America/Sao_Paulo. When set, intervalSec is ignored.}
                 enabled: {type: boolean}
                 model: {type: string, description: CodeBuddy model id used when the task runs}
                 projectId: {type: string, description: Studio project that owns this assistant task}
@@ -5336,7 +5336,7 @@ components:
           description: Used when cron is empty. Common values are 300, 900, 3600, 86400.
         cron:
           type: string
-          description: Optional 5-field cron (minute hour day month weekday) in Asia/Shanghai. When set, intervalSec is ignored.
+          description: Optional 5-field cron (minute hour day month weekday) in America/Sao_Paulo. When set, intervalSec is ignored.
         assistantPrompt:
           type: string
           description: User-written prompt executed at schedule time. Required for independent AI jobs. Subscriptions resolve their pinned shared version. Cleared on trigger jobs.

@@ -89,9 +89,9 @@ func TestBeijingTimestampsKeepTheInstant(t *testing.T) {
 	in := `{"startedAt":"2026-11-01T06:16:29.123456789Z","finishedAt":"2026-11-01T06:18:47Z","note":"retry at 2026-10-31T23:30:00Z","local":"2026-11-01T14:00:00+08:00","id":"run-2026-11-01T06"}`
 	out := beijingTimestamps(in)
 	for _, want := range []string{
-		`"startedAt":"2026-11-01T14:16:29.123456789+08:00"`,
-		`"finishedAt":"2026-11-01T14:18:47+08:00"`,
-		`retry at 2026-11-01T07:30:00+08:00`,
+		`"startedAt":"2026-11-01T03:16:29.123456789-03:00"`,
+		`"finishedAt":"2026-11-01T03:18:47-03:00"`,
+		`retry at 2026-10-31T20:30:00-03:00`,
 		`"local":"2026-11-01T14:00:00+08:00"`,
 		`"id":"run-2026-11-01T06"`,
 	} {
@@ -118,7 +118,7 @@ func TestBeijingTimestampsKeepTheInstant(t *testing.T) {
 	if got := assistantPlatformResultForModel("runs_artifact_get", artifact); got != artifact {
 		t.Fatalf("artifact body rewritten: %s", got)
 	}
-	if got := assistantPlatformResultForModel("runs_get", artifact); !strings.Contains(got, "2026-11-01T14:16:29+08:00") {
+	if got := assistantPlatformResultForModel("runs_get", artifact); !strings.Contains(got, "2026-11-01T03:16:29-03:00") {
 		t.Fatalf("run result not converted: %s", got)
 	}
 }
@@ -128,13 +128,13 @@ func TestAssistantTurnContextStatesBeijingTimeAndProjectSwitching(t *testing.T) 
 	assistantNow = func() time.Time { return time.Date(2026, 11, 1, 6, 16, 0, 0, time.UTC) }
 	t.Cleanup(func() { assistantNow = old })
 	inProject := assistantTurnContext(assistantRequest{ProjectID: "skillhub"})
-	for _, want := range []string{"当前北京时间：2026-11-01 14:16（星期日）", "不要写 UTC", "+08:00", "右上角的项目名称", "不要让用户去输入框上方", "generic-backend-delivery", "不要说「暂不绑定」"} {
+	for _, want := range []string{"Horário atual de Brasília: 2026-11-01 03:16 (domingo)", "não escreva UTC", "-03:00", "右上角的项目名称", "不要让用户去输入框上方", "generic-backend-delivery", "不要说「暂不绑定」"} {
 		if !strings.Contains(inProject, want) {
 			t.Errorf("project context missing %q", want)
 		}
 	}
 	personal := assistantTurnContext(assistantRequest{})
-	for _, want := range []string{"个人对话", "右上角的项目名称", "直接绑定", "当前北京时间"} {
+	for _, want := range []string{"个人对话", "右上角的项目名称", "直接绑定", "Horário atual de Brasília"} {
 		if !strings.Contains(personal, want) {
 			t.Errorf("personal context missing %q", want)
 		}
