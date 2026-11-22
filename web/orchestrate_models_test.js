@@ -1,6 +1,7 @@
 'use strict';
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const {isDeepStrictEqual} = require('node:util');
 const {createDOM} = require('./hui_fake_dom');
 
 const dom = createDOM();
@@ -8,6 +9,7 @@ const html = fs.readFileSync('index.html', 'utf8');
 dom.html(html.slice(html.indexOf('<aside id="aiOrchestrator"'), html.indexOf('</aside>', html.indexOf('<aside id="aiOrchestrator"')) + 8));
 const store = new Map([['agentflow.assistantModel', 'cb-model']]);
 const requests = [];
+const transcripts = new Map();
 const catalog = {
   default: 'cb-model',
   engines: [{id: 'codebuddy', name: 'CodeBuddy', configured: true}, {id: 'codex', name: 'Codex', configured: true}, {id: 'claude-code', name: 'Claude Code', configured: true}, {id: 'pi', name: 'Pi', configured: true}, {id: 'opencode', name: 'OpenCode', configured: false}],
@@ -24,13 +26,36 @@ Object.assign(dom.window, {
   localStorage: {getItem: key => store.get(key) || null, setItem: (key, value) => store.set(key, value)},
   state: {projectFilter: 'project-a', workflow: null},
   AbortController,
+  TextDecoder,
+  api: async (url, options) => (await dom.window.fetch(url, options)).json(),
+  toast: message => assert.fail(message),
   fetch: async (url, options) => {
     if (url === '/api/assistant/models') return {ok: true, json: async () => catalog};
     if (url === '/api/runners/default') return {ok: true, json: async () => ({runnerId: 'runner-1'})};
+    if (url.startsWith('/api/assistant/sessions/')) {
+      const id = decodeURIComponent(url.split('/').at(-1));
+      assert.ok(transcripts.has(id));
+      return Response.json({messages: transcripts.get(id)});
+    }
     assert.equal(url, '/api/assistant/chat');
-    requests.push(JSON.parse(options.body));
+    const request = JSON.parse(options.body);
+    requests.push(request);
     dom.document.querySelectorAll('[data-model-toggle]').forEach(toggle => assert.equal(toggle.disabled, true));
-    return {ok: true, headers: {get: () => 'application/json'}, json: async () => ({sessionId: 'session-' + requests.length, message: 'draft ready', drafts: []})};
+    const sessionId = request.sessionId || 'session-' + requests.length;
+    const saved = transcripts.get(sessionId) || [];
+    if (!isDeepStrictEqual(request.messages.slice(0, -1), saved)) {
+      return Response.json({error: 'Shared conversation was updated'}, {status: 409});
+    }
+    const message = 'draft ready';
+    const drafts = [];
+    const createdAt = '2026-11-22T12:00:00Z';
+    transcripts.set(sessionId, [
+      ...saved,
+      {...request.messages.at(-1), createdAt},
+      {role: 'assistant', content: JSON.stringify({drafts, message}), model: request.model, createdAt},
+    ]);
+    const result = JSON.stringify({sessionId, message, drafts});
+    return new Response(`event: result\ndata: ${result}\n\n`, {headers: {'Content-Type': 'text/event-stream'}});
   },
 });
 dom.load('app/hui-select.js');
@@ -120,8 +145,13 @@ dom.run(`
   assert.equal(request.messages[1].model, 'codex:gpt-test', 'history retains CLI identity');
   pick('codex:gpt-other');
   request = await send();
-  assert.equal(request.sessionId, 'session-2', 'same CLI model change keeps history');
+  assert.equal(request.sessionId, 'session-1', 'same CLI model change keeps history');
   assert.equal(request.model, 'codex:gpt-other');
+  for (let turn = 4; turn <= 6; turn++) {
+    request = await send();
+    assert.equal(request.sessionId, 'session-1');
+    assert.equal(request.messages.length, 2 * turn - 1, 'follow-ups retain the full transcript');
+  }
   choose(cli, 'codex');
   assert.equal(store.get('agentflow.orchestratorModel'), 'codex:gpt-other', 'reselecting CLI keeps its current model');
   pick('claude-code:sonnet-test');
@@ -129,6 +159,8 @@ dom.run(`
   assert.equal(request.sessionId, '', 'different CLI starts a fresh session');
   assert.equal(request.messages.length, 1);
   assert.equal(request.model, 'claude-code:sonnet-test');
+  const claudeSessionId = 'session-' + requests.length;
+  assert.equal((await send()).sessionId, claudeSessionId, 'Claude Code can continue its conversation');
   pick('pi:custom-test');
   assert.equal((await send()).model, 'pi:custom-test', 'additional CLIs use the same path');
   pick('cb-model');

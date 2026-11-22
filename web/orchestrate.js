@@ -1,7 +1,7 @@
 let aiBuildToken = 0;
 let aiBuild = null;
 let aiAbort = null;
-const aiHistory = {};
+const aiSessions = {};
 
 function aiOrchestratorEngine(model) {
   const listed = window.AgentFlowAssistantModels?.catalog().models.find(item => item.id === model);
@@ -363,7 +363,7 @@ function resetAIOrchestrator() {
   aiBuildToken++;
   aiAbort?.abort();
   finishAIBuildVisuals();
-  if (state.projectFilter) delete aiHistory[state.projectFilter];
+  if (state.projectFilter) delete aiSessions[state.projectFilter];
   const log = $('#aiOrchestratorLog');
   const intro = $('#aiOrchestratorIntro');
   if (log) {
@@ -969,8 +969,8 @@ async function runAIOrchestrator() {
   const build = await beginAIOrchestration(goal);
   if (!build) return;
   const model = selectedAIOrchestratorModel();
-  const previous = aiHistory[project];
-  const history = previous && aiOrchestratorEngine(previous.model) === aiOrchestratorEngine(model) ? previous : {sessionId: '', messages: []};
+  const previous = aiSessions[project];
+  const sessionId = previous && aiOrchestratorEngine(previous.model) === aiOrchestratorEngine(model) ? previous.sessionId : '';
   build.goal = goal;
   build.referenced = referenced;
   if (button) button.disabled = true;
@@ -981,20 +981,26 @@ async function runAIOrchestrator() {
   appendOrchestratorNote(goal, 'mine');
   setAIBuildStatus(editing ? '正在按当前流程修改，画布先保持原样' : '正在连接 AI…');
   if (!editing) placeAIGhost();
-  const messages = history.messages.concat([{role: 'user', content: aiOrchestratePrompt(goal, canvas, referenced)}]);
+  const message = {role: 'user', content: aiOrchestratePrompt(goal, canvas, referenced)};
   aiAbort = new AbortController();
   try {
+    const signal = aiAbort.signal;
+    let history = [];
     // A new chat runs on the user's default runner, like the main chat. The server pins the target per session.
     let executionTarget;
-    if (!history.sessionId) {
+    if (sessionId) {
+      // The shared conversation accepts only an exact match of the saved history.
+      const session = await api(`/api/assistant/sessions/${encodeURIComponent(sessionId)}`, {silent: true, cache: 'no-store', signal});
+      history = session.messages || [];
+    } else {
       const def = await fetch('/api/runners/default').then(r => r.ok ? r.json() : {}).catch(() => ({}));
       if (def.runnerId) executionTarget = {pool: 'runner', runnerId: def.runnerId};
     }
     const res = await fetch('/api/assistant/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json', 'Accept': 'text/event-stream'},
-      signal: aiAbort.signal,
-      body: JSON.stringify({projectId: project, sessionId: history.sessionId, model, approvalMode: 'confirm', executionTarget, messages})
+      signal,
+      body: JSON.stringify({projectId: project, sessionId, model, approvalMode: 'confirm', executionTarget, messages: [...history, message]})
     });
     if (!res.ok) {
       let msg = 'HTTP ' + res.status;
@@ -1003,7 +1009,7 @@ async function runAIOrchestrator() {
     }
     const reply = (res.headers.get('Content-Type') || '').includes('text/event-stream') ? await readAssistantSSE(res, pushAIThought) : await res.json();
     if (build.token !== aiBuildToken) return;
-    aiHistory[project] = {sessionId: reply.sessionId || history.sessionId, model, messages: messages.concat([{role: 'assistant', model, content: reply.message || '已提交草稿'}]).slice(-8)};
+    aiSessions[project] = {sessionId: reply.sessionId || sessionId, model};
     document.querySelectorAll('.ai-live-thought.live').forEach(box => box.classList.remove('live'));
     if (reply.message) appendOrchestratorNote(reply.message, '');
     const draft = (reply.drafts || []).find(item => item.tool === 'workflows_save' && item.body);
