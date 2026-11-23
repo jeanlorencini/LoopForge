@@ -67,6 +67,9 @@ func (e *Engine) startWorkflow(workflowID, input string, repositories []domain.R
 func (e *Engine) startWorkflowDefinition(wf domain.WorkflowDefinition, input string, repositories []domain.RepositoryContext, executionContext domain.TelemetryContext, workspace bool) (domain.Run, error) {
 	workflowID := wf.ID
 	repositories = normalizeRepositories(repositories)
+	if err := wf.ValidateRepositoryCount(len(repositories)); err != nil {
+		return domain.Run{}, err
+	}
 	domain.AssignRepositoryDirs(repositories)
 	e.mu.Lock()
 	draining, executeRuns := e.draining, e.executeRuns

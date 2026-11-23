@@ -399,6 +399,12 @@ async function createIssueFromChat(target,mode){
   const useSOP=reqUsesSOP();
   const workflowId=selectedReqWorkflowId();
   if(useSOP&&!workflowId)return toast('请选择 SOP，或改为不使用 SOP');
+  const repositoryIds=selectedReqRepositoryIds();
+  if((state.data.workflows||[]).some(w=>w.id===workflowId&&w.singleRepository)&&repositoryIds.length!==1){
+    renderReqRepoChip();
+    toggleReqRepoPopover(true);
+    return toast('此 SOP 需要选择一个代码仓库');
+  }
   state.reqCreating=toChat?'chat':'issue';
   renderReqFooter();
   const project=currentProject();
@@ -410,8 +416,8 @@ async function createIssueFromChat(target,mode){
       sopMode:useSOP?'':'none',
       workflowId,
       playbookId:selectedReqPlaybookId(),
-      repositoryId:selectedReqRepositoryId(),
-      repositoryIds:selectedReqRepositoryIds(),
+      repositoryId:repositoryIds[0]||'',
+      repositoryIds,
       baseBranch:selectedReqBaseBranch(),
       assigneeUserId:Number(state.currentUser?.id)||0,
       title:draft.title||'新工作项',

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,6 +10,24 @@ import (
 	"agentflow/internal/repo"
 	"agentflow/internal/runtime"
 )
+
+func TestSingleRepositoryWorkflowRequiresOneCheckout(t *testing.T) {
+	wf := domain.WorkflowDefinition{
+		ID: "single-checkout", Name: "Single checkout", SandboxProfileID: "local",
+		SingleRepository: true, Nodes: []domain.WorkflowNode{scriptNode("start", "true")},
+	}
+	e, _ := parallelTestEngine(t, wf)
+	e.executeRuns = false
+	repositories := []domain.RepositoryContext{{RepositoryID: "app"}, {RepositoryID: "other"}}
+	for _, selected := range [][]domain.RepositoryContext{nil, repositories} {
+		if _, err := e.StartWithRepositoriesContext(wf.ID, "run", selected, domain.TelemetryContext{}); err == nil || !strings.Contains(err.Error(), "requires exactly one repository") {
+			t.Fatalf("start with %d repositories: %v", len(selected), err)
+		}
+	}
+	if _, err := e.StartWithRepositoriesContext(wf.ID, "run", repositories[:1], domain.TelemetryContext{}); err != nil {
+		t.Fatalf("start with one repository: %v", err)
+	}
+}
 
 func parallelTestEngine(t *testing.T, wf domain.WorkflowDefinition) (*Engine, *repo.Store) {
 	t.Helper()

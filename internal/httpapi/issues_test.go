@@ -643,6 +643,28 @@ func TestManualRunKeepsSelectedProjectContext(t *testing.T) {
 			t.Fatal("manual run leaked into another project list")
 		}
 	}
+
+	workflow, _ = s.Workflow(workflow.ID)
+	workflow.SingleRepository = true
+	if err := s.PutWorkflow(workflow); err != nil {
+		t.Fatal(err)
+	}
+	input := map[string]any{"workflowId": workflow.ID, "projectId": "project-a", "input": "single repo"}
+	requestJSON[map[string]string](t, h, http.MethodPost, "/api/runs", input, http.StatusBadRequest)
+	repository := domain.Repository{ID: "project-a-code", Name: "Project A code", ProjectID: "project-a"}
+	if err := s.PutRepository(repository); err != nil {
+		t.Fatal(err)
+	}
+	project, _ := s.Project("project-a")
+	project.DefaultRepositoryID = repository.ID
+	if err := s.PutProject(project); err != nil {
+		t.Fatal(err)
+	}
+	single := requestJSON[domain.Run](t, h, http.MethodPost, "/api/runs", input, http.StatusCreated)
+	t.Cleanup(func() { _ = e.Cancel(single.ID) })
+	if repos := single.RepositoryContexts(); len(repos) != 1 || repos[0].RepositoryID != repository.ID {
+		t.Fatalf("manual run did not use the default checkout: %+v", repos)
+	}
 }
 
 func TestRepositoryBindingIsValidatedAndFrozenAtDispatch(t *testing.T) {
@@ -652,7 +674,7 @@ func TestRepositoryBindingIsValidatedAndFrozenAtDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
-	if err := s.PutWorkflow(domain.WorkflowDefinition{ID: "repo-flow", Name: "Repo flow", SandboxProfileID: "local", Nodes: []domain.WorkflowNode{{ID: "approval", Name: "Approval", Type: "approval", MaxAttempts: 1}}}); err != nil {
+	if err := s.PutWorkflow(domain.WorkflowDefinition{ID: "repo-flow", Name: "Repo flow", SandboxProfileID: "local", SingleRepository: true, Nodes: []domain.WorkflowNode{{ID: "approval", Name: "Approval", Type: "approval", MaxAttempts: 1}}}); err != nil {
 		t.Fatal(err)
 	}
 	h := New(s, engine.New(s, runtime.NewManager(filepath.Join(root, "workspaces"))), tracker.NewService(), "", "")
@@ -686,6 +708,19 @@ func TestRepositoryBindingIsValidatedAndFrozenAtDispatch(t *testing.T) {
 		t.Fatalf("projects must not expose project-level credentials: %+v", savedProject)
 	}
 	issue := domain.Issue{ID: "iss-bound", ProjectID: "platform", Title: "Bound work", AssigneeType: "agent", AssigneeID: "developer", WorkflowID: "repo-flow", RepositoryID: repo.ID, BaseBranch: "release/1.0"}
+	multiple := issue
+	multiple.ID, multiple.BaseBranch = "iss-bound-multiple", ""
+	multiple.RepositoryIDs = []string{repo.ID, releaseRepo.ID}
+	if err := s.PutIssue(multiple); err != nil {
+		t.Fatal(err)
+	}
+	rejected := requestJSON[map[string]string](t, h, http.MethodPost, "/api/issues/"+multiple.ID+"/dispatch", map[string]any{}, http.StatusBadRequest)
+	if !strings.Contains(rejected["error"], "requires exactly one repository") {
+		t.Fatalf("unexpected dispatch error: %v", rejected)
+	}
+	if saved, _ := s.Issue(multiple.ID); saved.LatestTaskID != "" {
+		t.Fatalf("invalid dispatch reserved task %s", saved.LatestTaskID)
+	}
 	if err := s.PutIssue(issue); err != nil {
 		t.Fatal(err)
 	}

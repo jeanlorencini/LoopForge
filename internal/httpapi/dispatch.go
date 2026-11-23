@@ -115,6 +115,11 @@ func dispatchIssue(d *deps, req dispatchRequest) (domain.Task, error) {
 		}
 		boundRepositories = append(boundRepositories, repository)
 	}
+	if wf, ok := d.repo.Workflow(workflowID); ok {
+		if err := wf.ValidateRepositoryCount(len(boundRepositories)); err != nil {
+			return domain.Task{}, HTTPError{http.StatusBadRequest, err.Error()}
+		}
+	}
 	branchSelection := issue
 	if len(boundRepositories) > 0 && legacyIssueDefaultBranch(branchSelection.BaseBranch, boundRepositories[0]) {
 		branchSelection.BaseBranch = ""

@@ -366,6 +366,30 @@ func TestRefreshRunSOPPreservesCompletedNodesAndAddsLatestNodes(t *testing.T) {
 	}
 }
 
+func TestRefreshRunSOPRejectsIncompatibleRepositoryCount(t *testing.T) {
+	e, s := newRecoveryEngine(t)
+	old := domain.WorkflowDefinition{ID: "refresh-checkout", Name: "Checkout", Version: 1, SandboxProfileID: "local"}
+	latest := old
+	latest.Version, latest.SingleRepository = 2, true
+	if err := s.PutWorkflow(latest); err != nil {
+		t.Fatal(err)
+	}
+	run := domain.Run{
+		ID: "run-refresh-checkout", WorkflowID: old.ID, WorkflowSnapshot: old, Status: "failed",
+		Repositories: []domain.RepositoryContext{{RepositoryID: "app"}, {RepositoryID: "other"}},
+	}
+	if err := s.PutRun(run); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RefreshRunSOP(run.ID); err == nil || !strings.Contains(err.Error(), "requires exactly one repository") {
+		t.Fatalf("refresh with two frozen checkouts: %v", err)
+	}
+	got, _ := s.Run(run.ID)
+	if got.WorkflowSnapshot.Version != old.Version {
+		t.Fatalf("refresh replaced the original snapshot: %+v", got.WorkflowSnapshot)
+	}
+}
+
 func TestRefreshRunSOPTakesOverExpiredLease(t *testing.T) {
 	t.Parallel()
 	e, s := newRecoveryEngine(t)
