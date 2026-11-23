@@ -91,6 +91,35 @@ func TestWindowsGitShellPreservesNativeLinkerPrecedence(t *testing.T) {
 	}
 }
 
+func TestWindowsGitShellUsesTERMOnlyAsFallback(t *testing.T) {
+	shell := windowsTestShell(t)
+	for _, tc := range []struct {
+		name, inherited, want string
+		profile, command      map[string]string
+	}{
+		{name: "absent", want: "dumb"},
+		{name: "inherited", inherited: "fixture-host", want: "fixture-host"},
+		{name: "profile", profile: map[string]string{"TERM": "fixture-profile"}, want: "fixture-profile"},
+		{name: "command", inherited: "fixture-host", profile: map[string]string{"TERM": "fixture-profile"}, command: map[string]string{"TERM": "fixture-command"}, want: "fixture-command"},
+		{name: "explicit-empty", command: map[string]string{"TERM": ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TERM", tc.inherited)
+			if tc.inherited == "" {
+				if err := os.Unsetenv("TERM"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sandbox := &localSandbox{workspace: t.TempDir(), environment: tc.profile}
+			command := WithCommandEnvironment(CommandSpec{Argv: []string{shell, "-lc", `printf '<%s>' "$TERM"`}}, tc.command)
+			out, err := sandbox.Exec(t.Context(), command, nil)
+			if err != nil || strings.TrimSuffix(out, "\n") != "<"+tc.want+">" {
+				t.Fatalf("shell TERM: got %q, want %q, error=%v", out, tc.want, err)
+			}
+		})
+	}
+}
+
 func TestWindowsHostShellRejectsWSLAliasesAndPrefersGit(t *testing.T) {
 	root := t.TempDir()
 	aliases := filepath.Join(root, "WindowsApps")

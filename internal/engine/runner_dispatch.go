@@ -123,25 +123,28 @@ func (e *Engine) requireWorkBranchCapabilities(runnerID string, repositories []d
 	if runnerID == "" {
 		return nil
 	}
+	var runner *domain.Runner
 	for _, repository := range repositories {
-		if repository.Provider == domain.RepositoryProviderSSH {
-			runner, ok := e.repo.Runner(runnerID)
-			if !ok || !runner.SupportsGitSSH() {
-				return fmt.Errorf("Git SSH 仓库需要执行机器升级至 %s 或更新版本，请先更新 Runner", domain.RunnerVersionGitSSH)
+		if repository.Provider != domain.RepositoryProviderSSH && !repository.CreateNewWorkBranch && !repository.RequireExistingWorkBranch {
+			continue
+		}
+		if runner == nil {
+			registered, err := e.readRunnerBeforeClaim(runnerID)
+			if err != nil {
+				return err
 			}
+			runner = &registered
+		}
+		if repository.Provider == domain.RepositoryProviderSSH && !runner.SupportsGitSSH() {
+			return fmt.Errorf("Git SSH 仓库需要执行机器升级至 %s 或更新版本，请先更新 Runner", domain.RunnerVersionGitSSH)
 		}
 		if repository.CreateNewWorkBranch {
-			runner, ok := e.repo.Runner(runnerID)
-			if !ok || !runner.SupportsCreateNewWorkBranch() {
+			if !runner.SupportsCreateNewWorkBranch() {
 				return fmt.Errorf("按指定名字新建分支需要执行机器升级至 %s 或更新版本，请先更新 Runner", domain.RunnerVersionCreateNewWorkBranch)
 			}
 			continue
 		}
-		if !repository.RequireExistingWorkBranch {
-			continue
-		}
-		runner, ok := e.repo.Runner(runnerID)
-		if !ok || !runner.SupportsExistingWorkBranch() {
+		if repository.RequireExistingWorkBranch && !runner.SupportsExistingWorkBranch() {
 			return fmt.Errorf("继续已有分支需要执行机器升级至 %s 或更新版本，请先更新 Runner", domain.RunnerVersionExistingWorkBranch)
 		}
 	}
@@ -151,9 +154,6 @@ func (e *Engine) requireWorkBranchCapabilities(runnerID string, repositories []d
 func (e *Engine) runnerSandboxSpec(run domain.Run) (*domain.RunnerSandboxSpec, error) {
 	runnerID := e.defaultExecutionRunner(run)
 	if err := e.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts()); err != nil {
-		if _, unavailable := e.requireAvailableRunner(runnerID); unavailable != nil {
-			return nil, unavailable
-		}
 		return nil, err
 	}
 	profile, resources, err := e.workspaceSandboxProfile(run)
@@ -798,7 +798,8 @@ func (e *Engine) awaitRunnerTask(ctx context.Context, taskID string, sink runtim
 
 func (e *Engine) awaitWorkflowRunnerTask(ctx context.Context, taskID string, sink runtime.EventSink) (domain.RunnerTask, error) {
 	task, err := e.awaitRunnerTask(ctx, taskID, sink)
-	if err != nil || task.RunnerID == "" || task.Attempt != 0 || task.Error == "" {
+	if err != nil || task.RunnerID == "" || task.Attempt != 0 ||
+		task.ExitCode != nil || task.CompletedAt == nil || task.Error == "" {
 		return task, err
 	}
 	// Only queue reconciliation and runner removal record an error before the first claim.
@@ -897,13 +898,21 @@ func runnerIsAvailable(runner domain.Runner) bool {
 		(runner.LastSeenAt == nil || !runner.LastSeenAt.Before(time.Now().UTC().Add(-repo.RunnerOfflineThreshold)))
 }
 
-func (e *Engine) requireAvailableRunner(runnerID string) (domain.Runner, error) {
+func (e *Engine) readRunnerBeforeClaim(runnerID string) (domain.Runner, error) {
 	runner, err := e.repo.ReadRunner(strings.TrimSpace(runnerID))
 	if errors.Is(err, repo.ErrRunnerNotFound) {
 		return runner, runnerUnavailableBeforeClaimError(fmt.Sprintf("runner %q is missing before claim. To continue, reconnect that runner and retry", runnerID))
 	}
 	if err != nil {
 		return runner, fmt.Errorf("read runner %q before claim: %w", runnerID, err)
+	}
+	return runner, nil
+}
+
+func (e *Engine) requireAvailableRunner(runnerID string) (domain.Runner, error) {
+	runner, err := e.readRunnerBeforeClaim(runnerID)
+	if err != nil {
+		return runner, err
 	}
 	if !runnerIsAvailable(runner) {
 		return runner, runnerUnavailableBeforeClaimError(fmt.Sprintf("runner %q is offline or its heartbeat has expired before claim. To continue, reconnect that runner and retry", runnerID))

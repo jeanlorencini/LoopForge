@@ -52,6 +52,16 @@ func TestQueuedGateFailsForUnavailableRunner(t *testing.T) {
 
 func TestUnavailableRunnerClassificationPreservesDatabaseReadErrors(t *testing.T) {
 	e, store := cvEEngine(t)
+	repositories := []domain.RepositoryContext{
+		{Provider: domain.RepositoryProviderSSH},
+		{CreateNewWorkBranch: true},
+		{RequireExistingWorkBranch: true},
+	}
+	for _, repository := range repositories {
+		if err := e.requireWorkBranchCapabilities("bound-runner", []domain.RepositoryContext{repository}); !isRunnerUnavailableBeforeClaim(err) {
+			t.Errorf("capability check for absent runner misclassified %v", err)
+		}
+	}
 	want := errors.New("fixture runner read failed")
 	if err := store.DB.Callback().Query().Before("gorm:query").Register("fixture:runner_read_error", func(tx *gorm.DB) {
 		if tx.Statement.Table == "runners" {
@@ -63,6 +73,12 @@ func TestUnavailableRunnerClassificationPreservesDatabaseReadErrors(t *testing.T
 	err := e.requireRunnerProvider("bound-runner", "terminal")
 	if !errors.Is(err, want) || isRunnerUnavailableBeforeClaim(err) {
 		t.Fatalf("expected the storage error, got %v", err)
+	}
+	for _, repository := range repositories {
+		err := e.requireWorkBranchCapabilities("bound-runner", []domain.RepositoryContext{repository})
+		if !errors.Is(err, want) || isRunnerUnavailableBeforeClaim(err) {
+			t.Errorf("capability check lost the storage error: %v", err)
+		}
 	}
 }
 
