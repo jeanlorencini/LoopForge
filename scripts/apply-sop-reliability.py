@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import runpy
 import tempfile
+from textwrap import dedent, indent
 
 
 LEGACY = runpy.run_path(str(Path(__file__).with_name("apply-sop-runtime-preflight.py")))
@@ -27,12 +28,24 @@ SOURCE_SCRIPTS = {
 }
 
 # The transformed scripts preserve parts of their source without storing the export.
-INSTALLED_SCRIPTS = {
+PREVIOUS_SCRIPTS = {
     "git-branch": SOURCE_SCRIPTS["git-branch"],
     "validate-spec": "8d16833106b454a0f68c12ca64e18316fca1e1a21c95b4505a16083d719b3b95",
     "validate-tests": "fe0ccaa869227e09ff5ad2a9de75ff530f77b620ffd8119f52a6b4447a6842bf",
+    "reserve": "2a427f6dd305bca3a745650e4955c23749ae44a9df181d27a81c7635c341ab91",
+    "verify": "bd53595c1e97fa2c8f3a2490a91c530ac9fa79c6d65fea628623f4f06b9419fb",
+    "bind-review": "aefc537ed33125ac6b8b50a1e172e7381a855a2fc6eff29dfc4ffbbdc4d2840b",
+    "verify-final": "3e49e7573f17ba9e4f9062a690dacc2f09d3be7d971af40ec96c3bedd5a7c530",
     "git-commit": "810f802267ee1e06947ff07babf17f9f5177fd14d319c551bdadc982f4d1403e",
     "git-merge": "47e661d1270ef5b5946a0f8edb875951db5a8adf5ba00a894c21e76f6a00efce",
+}
+
+INSTALLED_SCRIPTS = {
+    "git-branch": SOURCE_SCRIPTS["git-branch"],
+    "validate-spec": "5b1ef088c7d11702f18e54404104d1c6f93a55cf3c0156cd18c0817a4cc55a37",
+    "validate-tests": "5cf5b6ac2e9af44bd177bffbe78f2296af3c67bcd247009c7591681a13955954",
+    "git-commit": "b388b11032201c9b8841a7e8e901ded296fa8b0935f89f495574ac82f03ef331",
+    "git-merge": "33a0b75f73b7b3301d9463de8a26f06e118602df47eb2f95e4512079a98d46c2",
 }
 
 INSTRUCTIONS = {
@@ -66,6 +79,15 @@ INSTRUCTIONS = {
     ),
 }
 
+CASE_PROMPT = (
+    "Em cada script declare uma linha '# SOP-CASE: identificador' por caso. Use identificadores únicos "
+    "na suíte com os códigos CA correspondentes, como test_CA001_visible. A união precisa cobrir toda "
+    "a especificação. Quando SOP_SUITE_RECEIPT estiver definido, grave nesse caminho um JSON com "
+    "nonce igual a SOP_SUITE_NONCE e cases como objeto de identificador para resultado. Extraia os "
+    "resultados do executor real. Use pass somente para casos executados e aprovados e registre "
+    "casos ignorados ou falhos como skip ou fail."
+)
+
 SHELL_PREFIX = r'''sop_guard() {
     sop_python=python3
     if ! "$sop_python" -c 'import sys; sys.exit(sys.version_info < (3, 9))' </dev/null >/dev/null 2>&1; then
@@ -84,6 +106,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -92,7 +115,9 @@ import sys
 import tempfile
 
 ROOT = Path(sys.argv[1]).resolve()
-STORE = ROOT.with_name("." + ROOT.name + ".sop-reservado")
+CONTROL = ROOT / ".sop"
+STORE = CONTROL / "workflow-state"
+RUNTIME = ROOT / ".agentflow"
 RECOVERY = "Restaure a reserva a partir da origem aprovada ou volte à validação e aprovação dos testes."
 VISIBLE = ("spec.md", "testes.md", "verify.sh", "tests")
 RESERVED = ("verify-reservado.sh", "tests-reservados")
@@ -127,10 +152,15 @@ def digest(path):
     return checksum.hexdigest()
 
 
+def directory(path):
+    path.mkdir(mode=0o700, exist_ok=True)
+    if not stat.S_ISDIR(ordinary(path).st_mode):
+        raise PrerequisiteError("O diretório de controle da SOP está indisponível.")
+
+
 def store():
-    STORE.mkdir(mode=0o700, exist_ok=True)
-    if not stat.S_ISDIR(ordinary(STORE).st_mode):
-        raise PrerequisiteError("O diretório externo da SOP está indisponível.")
+    directory(CONTROL)
+    directory(STORE)
 
 
 def record(path, data):
@@ -166,22 +196,41 @@ def read(path, message):
 
 
 def latest_attempt(producer):
-    runtime = ROOT / ".agentflow/runtime"
+    runtime = RUNTIME / "runtime"
     pattern = re.compile(re.escape(producer) + r"-([1-9][0-9]*)-[1-9][0-9]*")
-    if not runtime.is_dir():
-        return 0
+    for path in (RUNTIME, runtime):
+        if not os.path.lexists(path):
+            return 0
+        if not stat.S_ISDIR(ordinary(path).st_mode):
+            raise PrerequisiteError("O contexto da tentativa precisa de diretórios locais.")
     return max((int(match[1]) for path in runtime.iterdir()
-                if (match := pattern.fullmatch(path.name)) and path.is_dir() and not path.is_symlink()), default=0)
+                if (match := pattern.fullmatch(path.name)) and stat.S_ISDIR(ordinary(path).st_mode)), default=0)
 
 
 def attempt_proof(producer, attempt):
-    control = ROOT / ".agentflow"
-    start = control / "runtime" / f"{producer}-{attempt}-1" / "run-context.json"
-    result = control / "gate-results" / producer / f"attempt-{attempt}.json"
+    start = RUNTIME / "runtime" / f"{producer}-{attempt}-1" / "run-context.json"
+    result = RUNTIME / "gate-results" / producer / f"attempt-{attempt}.json"
     verdict = read(result, "O resultado da tentativa atual está indisponível.")
     if not isinstance(verdict.get("decision"), str) or verdict["decision"].strip().lower() != "pass":
         raise PrerequisiteError("A tentativa atual precisa de um resultado aprovado pelo gate.")
     return [attempt, digest(start), digest(result)], ordinary(start).st_mtime_ns
+
+
+def check_attempt(producer, token):
+    if (not isinstance(token, list) or len(token) != 3 or type(token[0]) is not int or token[0] < 1
+            or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value) for value in token[1:])):
+        raise PrerequisiteError("A evidência da tentativa está incompleta.")
+    latest = latest_attempt(producer)
+    if latest and (latest != token[0] or attempt_proof(producer, latest)[0] != token):
+        raise PrerequisiteError("A evidência da tentativa mudou.")
+
+
+def workspace_input(name):
+    path = ROOT / name
+    resolved = path.resolve()
+    if not resolved.is_relative_to(ROOT) or ".agentflow" in (part.casefold() for part in resolved.relative_to(ROOT).parts):
+        raise OSError()
+    return path
 '''
 
 CRITERIA = r'''DECLARATION = re.compile(
@@ -195,7 +244,11 @@ def criterion_number(value):
     return value.lstrip("0") or "0"
 
 
-def declared_criteria(text):
+def invalid_criterion(message):
+    raise PrerequisiteError(message)
+
+
+def declared_criteria(text, fail=invalid_criterion):
     numbers = [criterion_number(value) for value in DECLARATION.findall(text)]
     if not numbers:
         fail("declare pelo menos um critério de aceitação numérico, por exemplo CA001")
@@ -206,6 +259,27 @@ def declared_criteria(text):
 
 def case_criteria(text):
     return {criterion_number(first or second) for first, second in CASE_CODE.findall(text)}
+
+
+def suite_contract():
+    required = declared_criteria((ROOT / "spec.md").read_text(encoding="utf-8-sig"))
+    suites = {}
+    covered = set()
+    for name in ("verify.sh", "verify-reservado.sh"):
+        declarations = re.findall(r"(?m)^[ \t]*#[ \t]*SOP-CASE:[ \t]*([^\r\n]*)",
+                                  (ROOT / name).read_text(encoding="utf-8-sig"))
+        cases = [case.strip() for case in declarations]
+        if not cases or len(cases) != len(set(cases)):
+            raise PrerequisiteError(f"Declare casos SOP-CASE únicos em {name}.")
+        for case in cases:
+            criteria = case_criteria(case)
+            if not re.fullmatch(r"[a-zA-Z0-9_.-]+", case) or not criteria or not criteria <= required:
+                raise PrerequisiteError(f"Associe cada caso de {name} a CAs declarados em spec.md.")
+            covered.update(criteria)
+        suites[name] = sorted(cases)
+    if covered != required:
+        raise PrerequisiteError("As suítes precisam cobrir todos os CAs de spec.md.")
+    return suites
 '''
 
 PREFLIGHT = r'''import platform
@@ -263,11 +337,11 @@ def preflight():
     if missing:
         problems.append("variáveis que exigem valor: " + ", ".join(missing))
     for name in requirements["inputs"]:
-        if any(part.strip() in ("", ".", "..") for part in name.split("/")):
+        if any(part.strip() in ("", ".", "..") or part.casefold() == ".agentflow" for part in name.split("/")):
             raise PrerequisiteError("Use caminhos relativos ao workspace em inputs.")
-        path = ROOT / name
         try:
-            if not path.resolve().is_relative_to(ROOT) or not stat.S_ISREG(ordinary(path).st_mode) or not path.stat().st_size:
+            info = ordinary(workspace_input(name))
+            if not stat.S_ISREG(info.st_mode) or not info.st_size:
                 raise OSError()
         except OSError:
             problems.append(f"arquivo obrigatório ausente ou vazio: {name}")
@@ -288,7 +362,11 @@ def preflight():
     return commands["sh"]
 '''
 
-SEAL = r'''def inventory(root, names, partial=False):
+SEAL = r'''VALIDATION = STORE / "validation.json"
+CURRENT_SEAL = STORE / "current-seal.json"
+
+
+def inventory(root, names, partial=False):
     result = {}
 
     def visit(path):
@@ -310,26 +388,49 @@ SEAL = r'''def inventory(root, names, partial=False):
     return result
 
 
+def input_hashes():
+    manifest = read(ROOT / "tests/ambiente.json", "Forneça tests/ambiente.json válido.")
+    return {name: digest(workspace_input(name)) for name in manifest["inputs"]}
+
+
+def approved_inputs(token):
+    return {"tests": token, "visible": inventory(ROOT, VISIBLE), "reserved": inventory(ROOT, RESERVED),
+            "cases": suite_contract(), "inputs": input_hashes()}
+
+
 def acceptance(attempt):
     token, _ = attempt_proof("tests", attempt)
-    return {"tests": token, "visible": inventory(ROOT, VISIBLE), "reserved": inventory(ROOT, RESERVED)}
+    return approved_inputs(token)
+
+
+def seal_path(selection):
+    name = selection["directory"]
+    if not isinstance(name, str) or not re.fullmatch(f"seal-{selection['tests'][0]}-[a-z0-9_]+", name):
+        raise PrerequisiteError(RECOVERY)
+    return STORE / name
 
 
 def approved_seal():
     try:
         store()
-        latest = latest_attempt("tests")
-        sealed = STORE / f"seal-{latest}"
+        selected = read(CURRENT_SEAL, RECOVERY)
+        token = selected["tests"]
+        check_attempt("tests", token)
+        sealed = seal_path(selected)
         if not stat.S_ISDIR(ordinary(sealed).st_mode):
             raise OSError()
         payload = read(sealed / "approval.json", RECOVERY)
-        token, _ = attempt_proof("tests", latest)
-        if payload["tests"] != token or payload["reserved"] != inventory(sealed, RESERVED):
+        if (selected["seal"] != digest(sealed / "approval.json") or payload["tests"] != token
+                or payload["reserved"] != inventory(sealed, RESERVED)):
+            raise PrerequisiteError(RECOVERY)
+        if os.path.lexists(VALIDATION) and read(VALIDATION, RECOVERY) != payload:
             raise PrerequisiteError(RECOVERY)
     except (KeyError, OSError, PrerequisiteError):
         raise PrerequisiteError("Reserva ausente, desatualizada ou inválida. " + RECOVERY) from None
     if payload.get("visible") != inventory(ROOT, VISIBLE):
         raise PrerequisiteError("Os testes visíveis ou a especificação divergiram da aprovação. " + RECOVERY)
+    if payload.get("inputs") != input_hashes():
+        raise PrerequisiteError("Os insumos declarados divergiram da aprovação. " + RECOVERY)
     return sealed, payload
 
 
@@ -346,42 +447,45 @@ def remove_reserved():
             path.unlink(missing_ok=True)
 
 
+def publish_seal(payload):
+    token = payload["tests"]
+    check_attempt("tests", token)
+    if payload["visible"] != inventory(ROOT, VISIBLE) or payload["inputs"] != input_hashes():
+        raise PrerequisiteError("O material mudou desde a validação anterior à aprovação. " + RECOVERY)
+    if payload["reserved"] != inventory(ROOT, RESERVED):
+        raise PrerequisiteError("Os bytes reservados mudaram antes do congelamento. " + RECOVERY)
+    prepared = Path(tempfile.mkdtemp(dir=STORE, prefix=f"seal-{token[0]}-"))
+    try:
+        shutil.copy2(ROOT / RESERVED[0], prepared / RESERVED[0])
+        shutil.copytree(ROOT / RESERVED[1], prepared / RESERVED[1])
+        check_attempt("tests", token)
+        if payload != approved_inputs(token) or payload["reserved"] != inventory(prepared, RESERVED):
+            raise PrerequisiteError("O material mudou durante o congelamento. " + RECOVERY)
+        record(prepared / "approval.json", payload)
+        seal = digest(prepared / "approval.json")
+    except (OSError, PrerequisiteError):
+        shutil.rmtree(prepared, ignore_errors=True)
+        raise
+    # Publish the pointer atomically because a Windows-hosted bind can deny directory renames.
+    record(CURRENT_SEAL, {"tests": token, "directory": prepared.name, "seal": seal})
+
+
 def reserve():
     store()
-    token, _ = attempt_proof("tests", latest_attempt("tests"))
-    sealed = STORE / f"seal-{token[0]}"
-    if os.path.lexists(sealed):
-        _, payload = approved_seal()
-    else:
-        payload = read(STORE / "validation.json", RECOVERY)
-        if payload["tests"] != token or payload["visible"] != inventory(ROOT, VISIBLE):
-            raise PrerequisiteError("O material mudou desde a validação anterior à aprovação. " + RECOVERY)
-        if payload["reserved"] != inventory(ROOT, RESERVED):
-            raise PrerequisiteError("Os bytes reservados mudaram antes do congelamento. " + RECOVERY)
-        with tempfile.TemporaryDirectory(dir=STORE, prefix=".seal-") as temporary:
-            prepared = Path(temporary)
-            shutil.copy2(ROOT / RESERVED[0], prepared / RESERVED[0])
-            shutil.copytree(ROOT / RESERVED[1], prepared / RESERVED[1])
-            if payload != acceptance(token[0]) or payload["reserved"] != inventory(prepared, RESERVED):
-                raise PrerequisiteError("O material mudou durante o congelamento. " + RECOVERY)
-            record(prepared / "approval.json", payload)
-            try:
-                prepared.rename(sealed)
-            except OSError:
-                if not sealed.is_dir():
-                    raise
-
-    _, committed = approved_seal()
+    if os.path.lexists(VALIDATION):
+        payload = read(VALIDATION, RECOVERY)
+        previous = read(CURRENT_SEAL, RECOVERY) if os.path.lexists(CURRENT_SEAL) else None
+        if previous is None or previous["tests"][0] < payload["tests"][0]:
+            publish_seal(payload)
+    _, payload = approved_seal()
     present = inventory(ROOT, RESERVED, partial=True)
-    if committed != payload or any(key not in payload["reserved"] or payload["reserved"][key] != value
-                                   for key, value in present.items()):
+    if any(key not in payload["reserved"] or payload["reserved"][key] != value for key, value in present.items()):
         raise PrerequisiteError("A reserva existente não corresponde ao material aprovado. " + RECOVERY)
     remove_reserved()
-    print("I3: reserva conferida e selada fora do checkout.")
+    print("I3: reserva conferida e selada na área de estado da SOP.")
 '''
 
 GIT = r'''REPORT = ROOT / "review.md"
-CONTROL = ROOT / ".sop"
 REVIEW_INPUT = STORE / "review-input.json"
 REVIEW_PROOF = STORE / "review-proof.json"
 FINAL_PROOF = STORE / "final-proof.json"
@@ -427,8 +531,8 @@ def git_tree():
     repo = repository()
     metadata = [".sop", ".agentflow"]
     if repo == ROOT:
-        if git(repo, "ls-files", "-z", "--", *RESERVED):
-            raise PrerequisiteError("Mantenha as suítes reservadas fora do índice do Git.")
+        if git(repo, "ls-files", "-z", "--", STORE.relative_to(ROOT).as_posix(), *RESERVED):
+            raise PrerequisiteError("Mantenha a reserva e a evidência da SOP fora do índice do Git.")
         metadata.extend((*VISIBLE, *RESERVED, "plan.md", "implementation.md", "review.md"))
     scope = ["--", ".", *(f":(top,exclude,literal){name}" for name in metadata)]
     if git(repo, "diff", "--name-only", "-z", "--ignore-submodules=none", *scope) or git(
@@ -438,64 +542,88 @@ def git_tree():
     return git_oid(repo, "write-tree")
 
 
-def control_directory():
-    CONTROL.mkdir(exist_ok=True)
-    if not stat.S_ISDIR(ordinary(CONTROL).st_mode):
-        raise PrerequisiteError("O diretório de controle da SOP está indisponível.")
-
-
-def review_input(tree, seal):
-    control_directory()
+def review_input(tree, seal, suites):
+    directory(CONTROL)
     file = CONTROL / "review-tree"
     if os.path.lexists(file):
         ordinary(file)
     file.write_text(tree + "\n", encoding="ascii")
-    record(REVIEW_INPUT, {"tree": tree, "seal": seal, "before": latest_attempt("review")})
+    before = latest_attempt("review")
+    if os.path.lexists(REVIEW_PROOF):
+        prior = read(REVIEW_PROOF, "A evidência da revisão mudou.")
+        before = max(before, prior["attempt"][0])
+    record(REVIEW_INPUT, {"tree": tree, "seal": seal, "before": before, "suites": suites})
 
 
-def check_report(tree, before):
-    proof, started = attempt_proof("review", latest_attempt("review"))
-    if proof[0] <= before or ordinary(REPORT).st_mtime_ns < started:
+def check_report(target, bound=None):
+    if bound is None:
+        proof, started = attempt_proof("review", latest_attempt("review"))
+        if ordinary(REPORT).st_mtime_ns < started:
+            raise PrerequisiteError("Execute a revisão atual e gere review.md para a árvore testada.")
+    else:
+        proof = bound["attempt"]
+        check_attempt("review", proof)
+    if proof[0] <= target["before"] or not stat.S_ISREG(ordinary(REPORT).st_mode):
         raise PrerequisiteError("Execute a revisão atual e gere review.md para a árvore testada.")
+    tree = target["tree"]
     raw = REPORT.read_bytes()
     report = raw.decode("utf-8-sig")
     if [line.strip() for line in report.splitlines() if line.startswith("Reviewed-Git-Tree:")] != [
         "Reviewed-Git-Tree: " + tree
     ]:
         raise PrerequisiteError("Registre a árvore Git testada em review.md e execute a revisão dessa árvore.")
-    return {"tree": tree, "attempt": proof, "report": hashlib.sha256(raw).hexdigest()}
+    return {"tree": tree, "attempt": proof, "report": hashlib.sha256(raw).hexdigest(),
+            "input": digest(REVIEW_INPUT)}
 
 
-def review_target(seal):
+def suite_proofs_valid(proofs, cases):
+    return isinstance(proofs, dict) and proofs.keys() == cases.keys() and all(
+        isinstance(proof, dict) and proof.keys() == {"nonce", "sha256", "passed"}
+        and proof["passed"] == len(cases[name])
+        and all(isinstance(proof[field], str) and re.fullmatch(r"[0-9a-f]{64}", proof[field])
+                for field in ("nonce", "sha256"))
+        for name, proof in proofs.items()
+    )
+
+
+def review_target(seal, cases):
     target = read(REVIEW_INPUT, "Execute a verificação que prepara a árvore para revisão.")
-    if target["seal"] != seal:
+    if target["seal"] != seal or not suite_proofs_valid(target.get("suites"), cases):
         raise PrerequisiteError("A aprovação dos testes mudou. Verifique a árvore antes de revisar.")
     return target
 
 
 def bind_review():
-    sealed, _ = approved_seal()
-    target = review_target(digest(sealed / "approval.json"))
+    sealed, payload = approved_seal()
+    target = review_target(digest(sealed / "approval.json"), payload["cases"])
     if target["tree"] != git_tree():
         raise PrerequisiteError("A árvore mudou durante a revisão. Volte à verificação e revise a nova árvore.")
-    record(REVIEW_PROOF, check_report(target["tree"], target["before"]))
+    if not latest_attempt("review"):
+        current_review(target["seal"], payload["cases"])
+    else:
+        record(REVIEW_PROOF, check_report(target))
     print("Revisão vinculada à árvore Git testada.")
 
 
-def current_review(seal):
-    target = review_target(seal)
+def current_review(seal, cases):
+    target = review_target(seal, cases)
     proof = read(REVIEW_PROOF, "Vincule a revisão atual antes de entregar.")
-    if proof != check_report(target["tree"], target["before"]):
+    try:
+        actual = check_report(target, proof)
+    except PrerequisiteError as exc:
+        raise PrerequisiteError("A evidência da revisão mudou. " + str(exc)) from None
+    if proof != actual:
         raise PrerequisiteError("A evidência da revisão mudou. Execute novamente a revisão da árvore.")
     return proof
 
 
 def delivery_gate(action):
-    sealed, _ = approved_seal()
+    sealed, payload = approved_seal()
     seal = digest(sealed / "approval.json")
-    reviewed = current_review(seal)
+    reviewed = current_review(seal, payload["cases"])
     final = read(FINAL_PROOF, "Execute a verificação final da árvore revisada.")
-    if final != {"review": reviewed, "seal": seal} or reviewed["tree"] != git_tree():
+    if (final.get("review") != reviewed or final.get("seal") != seal or reviewed["tree"] != git_tree()
+            or not suite_proofs_valid(final.get("suites"), payload["cases"])):
         raise PrerequisiteError("A árvore ou a evidência mudou depois da verificação final. Verifique e revise a candidata atual.")
     if action == "before-commit":
         return
@@ -519,14 +647,23 @@ def delivery_gate(action):
         raise PrerequisiteError("As referências de entrega divergiram do commit verificado. Confira a publicação e a aprovação.")
 '''
 
-VERIFY = r'''def suite(shell, name, output):
-    result = subprocess.run([shell, name], cwd=ROOT, stdin=subprocess.DEVNULL, stdout=output,
-                            stderr=subprocess.STDOUT, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}).returncode
-    if result in (2, 78, 126, 127) or result < 0 or result >= 128:
-        raise PrerequisiteError(f"A suíte {name} informou falha de execução ({result}). Confira os pré-requisitos.")
-    if result != 0:
-        print(f"Não passou a suíte {name}. Confira a evidência da verificação.", file=sys.stderr)
-        raise SystemExit(1)
+VERIFY = r'''def suite(shell, name, output, cases):
+    with tempfile.TemporaryDirectory(dir=RUNTIME, prefix="sop-suite-") as temporary:
+        receipt = Path(temporary) / "receipt.json"
+        nonce = secrets.token_hex(32)
+        environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                       "SOP_SUITE_RECEIPT": str(receipt), "SOP_SUITE_NONCE": nonce}
+        result = subprocess.run([shell, name], cwd=ROOT, stdin=subprocess.DEVNULL, stdout=output,
+                                stderr=subprocess.STDOUT, env=environment).returncode
+        if result in (2, 78, 126, 127) or result < 0 or result >= 128:
+            raise PrerequisiteError(f"A suíte {name} informou falha de execução ({result}). Confira os pré-requisitos.")
+        if result != 0:
+            print(f"Não passou a suíte {name}. Confira a evidência da verificação.", file=sys.stderr)
+            raise SystemExit(1)
+        data = read(receipt, f"A suíte {name} não produziu resultado da execução atual.")
+        if data != {"nonce": nonce, "cases": dict.fromkeys(cases, "pass")}:
+            raise PrerequisiteError(f"O resultado de {name} precisa comprovar todos os casos da execução atual.")
+        return {"nonce": nonce, "sha256": digest(receipt), "passed": len(cases)}
 
 
 def verify(final):
@@ -543,14 +680,14 @@ def verify(final):
         raise PrerequisiteError("Há arquivos reservados no checkout sem registro da verificação. " + RECOVERY)
 
     shell = preflight()
-    reviewed = current_review(seal) if final else None
+    reviewed = current_review(seal, payload["cases"]) if final else None
     tree = git_tree()
-    control_directory()
-    log = CONTROL / "verify.log"
+    directory(RUNTIME)
+    log = RUNTIME / "sop-verify.log"
     if os.path.lexists(log):
         ordinary(log)
     with log.open("w", encoding="utf-8") as output:
-        suite(shell, "verify.sh", output)
+        visible = suite(shell, "verify.sh", output, payload["cases"]["verify.sh"])
     if any(os.path.lexists(ROOT / name) for name in RESERVED):
         raise PrerequisiteError("A suíte visível criou arquivos com nomes reservados. " + RECOVERY)
     record(exposed, {"seal": seal})
@@ -559,20 +696,21 @@ def verify(final):
         shutil.copytree(sealed / RESERVED[1], ROOT / RESERVED[1])
         if inventory(ROOT, RESERVED) != payload["reserved"]:
             raise PrerequisiteError("Os insumos reservados mudaram durante a verificação. " + RECOVERY)
-        suite(shell, "verify-reservado.sh", subprocess.DEVNULL)
+        reserved = suite(shell, "verify-reservado.sh", subprocess.DEVNULL, payload["cases"]["verify-reservado.sh"])
     finally:
         remove_reserved()
         exposed.unlink(missing_ok=True)
 
     if tree != git_tree() or payload != approved_seal()[1]:
         raise PrerequisiteError("A árvore ou os insumos mudaram durante os testes. Execute novamente a verificação.")
+    suites = {"verify.sh": visible, "verify-reservado.sh": reserved}
     if not final or reviewed["tree"] != tree:
-        review_input(tree, seal)
+        review_input(tree, seal, suites)
         if final:
             print("I5 final: a árvore ajustada passou nos testes e precisa de uma nova revisão.", file=sys.stderr)
             raise SystemExit(79)
     else:
-        record(FINAL_PROOF, {"review": reviewed, "seal": seal})
+        record(FINAL_PROOF, {"review": reviewed, "seal": seal, "suites": suites})
     print("Verificação das suítes concluída para a árvore " + tree + ".")
 '''
 
@@ -606,7 +744,7 @@ def replace_once(text, marker, replacement):
 
 
 def spec_stage(script):
-    body = replace_once(script, "\nprint(", '\ndeclared_criteria(Path("spec.md").read_text(encoding="utf-8-sig"))\nprint(')
+    body = replace_once(script, "\nprint(", '\ndeclared_criteria(Path("spec.md").read_text(encoding="utf-8-sig"), fail)\nprint(')
     return shell_stage(CRITERIA, body)
 
 
@@ -636,8 +774,65 @@ def git_stage(script, commit):
         anchor = 'git push origin "$HEAD_SHA:refs/heads/$BR"'
         body = replace_once(body, anchor, 'sop_guard before-push "$BR" "$BASE" "$BASE_SHA" "$HEAD_SHA"\n' + anchor)
     else:
-        body = replace_once(body, "python3 - <<'PY'", 'PYTHONIOENCODING=utf-8 "$sop_python" -X utf8 - <<\'PY\'')
+        body = merge_stage(body)
     return body
+
+
+MERGE_STATE = r'''
+store()
+identity = {"repo": os.environ["SLUG"].casefold(), "head": approved_head, "base_sha": approved_base,
+            "branch": br, "base": base}
+attempt_key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+attempt_path = STORE / f"merge-{attempt_key}.json"
+attempt = read(attempt_path, "A tentativa de merge está ilegível.") if os.path.lexists(attempt_path) else None
+if attempt is not None:
+    number = attempt.get("number")
+    if type(number) is not int or number < 1 or attempt != dict(identity, number=number):
+        fail("A tentativa de merge não corresponde ao PR aprovado.")
+
+
+def confirm_merge(sha):
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        fail("O provedor não confirmou o commit do merge.")
+    status, commit = call("GET", "/git/commits/" + sha)
+    if (status != 200 or commit.get("sha") != sha
+            or [parent.get("sha") for parent in commit.get("parents", [])] != [approved_base, approved_head]):
+        fail("O commit do merge não corresponde às duas referências aprovadas.")
+'''
+
+
+def merge_stage(script):
+    opener = "python3 - <<'PY'\n"
+    launcher = 'PYTHONIOENCODING=utf-8 "$sop_python" -X utf8 - "$SOP_ROOT" <<\'PY\'\n'
+    script = replace_once(script, opener, launcher + COMMON)
+    select = script.index("\ncheck_refs()\n")
+    poll = script.index("\nBAD = ", select)
+    script = script[:select] + MERGE_STATE + "\n\nif attempt is None:\n" + indent(script[select:poll].strip(), "    ") + "\n" + script[poll:]
+    merged = script.index('\n    if pr.get("merged"):\n', poll)
+    open_checks = script.index("\n    check_refs()\n", merged)
+    script = script[:merged] + '''
+    if (pr.get("number") != number or pr["head"].get("ref") != br
+            or any((pr[side].get("repo") or {}).get("full_name", "").casefold() != identity["repo"]
+                   for side in ("base", "head"))):
+        fail("A identidade do PR divergiu da tentativa aprovada.")
+    if pr.get("merged") is True:
+        if attempt is None:
+            fail("O PR foi concluído sem um registro de tentativa da SOP.")
+        confirm_merge(pr.get("merge_commit_sha"))
+        print(f"PR #{number}: merge já confirmado para as referências aprovadas.")
+        sys.exit(0)
+''' + script[open_checks:]
+    request = '        status, res = call("PUT", "/pulls/%d/merge" % number, '
+    script = replace_once(script, request, '''        if type(number) is not int or number < 1:
+            fail("O provedor não identificou o PR aprovado.")
+        attempt = dict(identity, number=number)
+        record(attempt_path, attempt)
+        try:
+    ''' + request)
+    success = '        if status == 200 and res.get("merged"):\n'
+    return replace_once(script, success, '''        except OSError:
+            fail("A resposta do merge se perdeu. Repita a etapa para consultar o mesmo PR.")
+''' + success + '            confirm_merge(res.get("sha"))\n')
 
 
 def fingerprint(script):
@@ -671,11 +866,37 @@ def check_graph(workflow, nodes, installed):
         raise ValueError("Expected candidate rework at verify.")
 
 
-def instructions(name, node):
+def instructions(name, node, previous=False):
     prior = node.get("taskPrompt", "")
     if name == "tests":
         prior = prior.removesuffix(LEGACY["TEST_PROMPT"])
-    return "\n\n".join(filter(None, (prior, INSTRUCTIONS[name])))
+    return "\n\n".join(filter(None, (prior, INSTRUCTIONS[name], CASE_PROMPT if name == "tests" and not previous else "")))
+
+
+def previous_body(script):
+    return dedent(script.rsplit("\n\ntry:\n", 1)[1].split(END, 1)[0])
+
+
+def previous_git(script, commit):
+    stage = "before-commit" if commit else "before-merge"
+    before, after = script.split(f"\nsop_guard {stage}\n", 1)
+    marker = 'SOP_ROOT="$PWD"\n'
+    source = before.split(marker, 1)[0] + marker + after
+    if commit:
+        return replace_once(source, 'sop_guard before-push "$BR" "$BASE" "$BASE_SHA" "$HEAD_SHA"\n', "")
+    return replace_once(source, 'PYTHONIOENCODING=utf-8 "$sop_python" -X utf8 - <<\'PY\'', "python3 - <<'PY'")
+
+
+def upgrade_scripts(nodes):
+    spec = replace_once(previous_body(nodes["validate-spec"]["script"]),
+                        'declared_criteria(Path("spec.md").read_text(encoding="utf-8-sig"))',
+                        'declared_criteria(Path("spec.md").read_text(encoding="utf-8-sig"), fail)')
+    return {
+        "validate-spec": shell_stage(CRITERIA, spec),
+        "validate-tests": shell_stage(CRITERIA + PREFLIGHT + SEAL, previous_body(nodes["validate-tests"]["script"])),
+        "git-commit": git_stage(previous_git(nodes["git-commit"]["script"], commit=True), commit=True),
+        "git-merge": git_stage(previous_git(nodes["git-merge"]["script"], commit=False), commit=False),
+    }
 
 
 def apply_reliability(workflow):
@@ -685,22 +906,29 @@ def apply_reliability(workflow):
     installed = "bind-review" in nodes
     check_graph(workflow, nodes, installed)
     generated = {
-        "reserve": shell_stage(SEAL, "reserve()"),
+        "reserve": shell_stage(CRITERIA + SEAL, "reserve()"),
         "verify": shell_stage(PREFLIGHT + SEAL + GIT + VERIFY, "verify(False)"),
         "bind-review": shell_stage(SEAL + GIT, "bind_review()"),
         "verify-final": shell_stage(PREFLIGHT + SEAL + GIT + VERIFY, "verify(True)"),
     }
     final_policy = {"onFailure": "reject", "rejectTo": "review", "maxReworks": 1}
     if installed:
+        previous = fingerprint(nodes["reserve"]["script"]) == PREVIOUS_SCRIPTS["reserve"]
         expected = {**INSTALLED_SCRIPTS, **{name: fingerprint(code) for name, code in generated.items()}}
         if expected.keys() != (SOURCE_SCRIPTS.keys() | {"bind-review"}):
             raise ValueError("Incomplete published SOP script fingerprints.")
-        check_scripts(nodes, expected, installed=True)
+        check_scripts(nodes, PREVIOUS_SCRIPTS if previous else expected, installed=True)
         check_manifest(nodes)
-        if any(nodes[name].get("agentInstructions") != instructions(name, nodes[name]) for name in INSTRUCTIONS):
+        if any(nodes[name].get("agentInstructions") != instructions(name, nodes[name], previous) for name in INSTRUCTIONS):
             raise ValueError("Expected active SOP agent instructions.")
         if any(nodes["verify-final"].get(key) != value for key, value in final_policy.items()):
             raise ValueError("Expected bounded re-review of the final tree.")
+        if previous:
+            generated.update(upgrade_scripts(nodes))
+            for name, script in generated.items():
+                nodes[name]["script"] = script
+            nodes["tests"]["agentInstructions"] = instructions("tests", nodes["tests"])
+            check_scripts(nodes, expected, installed=True)
         return
 
     if any(edge["id"] == "bind-review-fix" for edge in workflow["edges"]):
