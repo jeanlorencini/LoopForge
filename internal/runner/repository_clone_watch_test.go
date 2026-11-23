@@ -40,7 +40,7 @@ func TestRunnerCloneStopsAStalledTransferAndKeepsItsLastOutput(t *testing.T) {
     exec sleep 60`)
 	repo := &domain.RunnerRepository{Name: "web", CloneURL: "https://git.example.invalid/team/web.git", GitToken: token}
 	started := time.Now()
-	err := cloneRepository(context.Background(), t.TempDir(), repo)
+	err := cloneRepository(context.Background(), t.TempDir(), repo, true)
 	if elapsed := time.Since(started); elapsed > 6*time.Second {
 		t.Fatalf("stalled clone held preparation for %s", elapsed)
 	}
@@ -61,7 +61,7 @@ func TestRunnerCloneKeepsItsTotalLimitConfigurable(t *testing.T) {
 	}
 	t.Setenv(gitwork.CloneTimeoutEnv, "500ms")
 	installFakeRunnerClone(t, `    while :; do echo "Receiving objects: 1%" >&2; sleep 0.05; done`)
-	err := cloneRepository(context.Background(), t.TempDir(), &domain.RunnerRepository{Name: "web", CloneURL: "https://git.example.invalid/team/web.git"})
+	err := cloneRepository(context.Background(), t.TempDir(), &domain.RunnerRepository{Name: "web", CloneURL: "https://git.example.invalid/team/web.git"}, true)
 	if !procwatch.Stopped(err) || !strings.Contains(err.Error(), "超过 500ms 仍未完成") || !strings.Contains(err.Error(), gitwork.CloneTimeoutEnv) {
 		t.Fatalf("err = %v", err)
 	}
