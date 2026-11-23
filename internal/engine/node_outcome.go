@@ -6,6 +6,7 @@ import (
 	"agentflow/internal/runtime"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -50,6 +51,12 @@ func shouldCommitNodeOutcome(r domain.Run, nr *domain.NodeRun, generation, attem
 func (e *Engine) nodeFailedAt(runID string, node domain.WorkflowNode, attempt, generation int, err error, allowReject bool) {
 	shouldReject := false
 	configurationFailure := errors.Is(err, ErrWorkspaceControlConfiguration)
+	var exit scriptExitError
+	stopReprocessing := isScriptNode(node) && errors.As(err, &exit) && slices.Contains(node.NonRetryableExitCodes, int(exit))
+	if stopReprocessing {
+		err = fmt.Errorf("%w. Fix the prerequisite reported in the script logs, then retry manually", err)
+		allowReject = false
+	}
 	e.updateRun(runID, func(r *domain.Run) {
 		nr := r.Nodes[node.ID]
 		if !shouldCommitNodeOutcome(*r, nr, generation, attempt, false) {
@@ -58,7 +65,7 @@ func (e *Engine) nodeFailedAt(runID string, node domain.WorkflowNode, attempt, g
 		nr.Error = err.Error()
 		nr.FinishedAt = time.Now().UTC()
 		reworkBudget := node.RejectTo != "" && r.Nodes[node.RejectTo] != nil && r.Nodes[node.RejectTo].ReworkCount >= max(1, node.MaxReworks)
-		if shouldRetryFailedAttempt(node, nr.Attempt, err) && !gateReworkReject(allowReject, nr) {
+		if !stopReprocessing && shouldRetryFailedAttempt(node, nr.Attempt, err) && !gateReworkReject(allowReject, nr) {
 			// The retry gets a clean workspace, so carry the concrete failure into
 			// {{feedback}} instead of making the next attempt rediscover it.
 			nr.Feedback = err.Error()
@@ -84,6 +91,12 @@ func (e *Engine) nodeFailedAt(runID string, node domain.WorkflowNode, attempt, g
 	if shouldReject {
 		_ = e.Reject(runID, domain.RejectRequest{NodeID: node.ID, TargetID: node.RejectTo, Reason: "节点失败自动打回：" + err.Error()})
 	}
+}
+
+type scriptExitError int
+
+func (e scriptExitError) Error() string {
+	return fmt.Sprintf("script exited with code %d", int(e))
 }
 
 func shouldRetryFailedAttempt(node domain.WorkflowNode, attempt int, err error) bool {

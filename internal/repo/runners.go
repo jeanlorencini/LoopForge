@@ -12,8 +12,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// CLI Runner connection store (cli-connect.md). Task state is always
-// durable: a runner disconnect only affects delivery, never the task itself.
+// CLI Runner connection store (cli-connect.md). Task state is durable.
 
 var (
 	ErrRunnerTaskNotClaimable = errors.New("runner task is not claimable")
@@ -417,6 +416,8 @@ func (r *RunnersRepo) updateRunnerRuntimes(runnerID string, mutate func([]domain
 	}).Error
 }
 
+const RunnerOfflineThreshold = 90 * time.Second
+
 // MarkOfflineRunners flags runners whose heartbeat is older than threshold.
 // Callers decide their own thresholds; the store only persists the state.
 func (r *RunnersRepo) MarkOfflineRunners(threshold time.Duration, now time.Time) {
@@ -734,6 +735,50 @@ func (r *RunnersRepo) CancelRunnerTask(id string, now time.Time) error {
 			Where("id = ? AND status IN ?", id, []string{domain.RunnerTaskLeased, domain.RunnerTaskRunning}).
 			Updates(map[string]any{"desired_state": domain.RunnerTaskDesiredCancel, "updated_at": now}).Error
 	})
+}
+
+// FailQueuedRunnerTaskIfUnavailable settles an unclaimed task whose bound runner
+// is missing, offline, or silent past the heartbeat cutoff.
+func (r *RunnersRepo) FailQueuedRunnerTaskIfUnavailable(id, runnerID string, now time.Time) (bool, error) {
+	if runnerID == "" {
+		return false, nil
+	}
+	cutoff := now.Add(-RunnerOfflineThreshold)
+	online := func(db *gorm.DB) (bool, error) {
+		var runner runnerRow
+		res := db.Select("status", "last_seen_at").Where("id = ?", runnerID).Find(&runner)
+		return res.RowsAffected == 1 && runner.Status == domain.RunnerStatusOnline &&
+			(runner.LastSeenAt == nil || !runner.LastSeenAt.Before(cutoff)), res.Error
+	}
+	if live, err := online(r.DB); live || err != nil {
+		return false, err
+	}
+
+	queued := func(db *gorm.DB) *gorm.DB {
+		return db.Where("id = ? AND runner_id = ? AND status = ?", id, runnerID, domain.RunnerTaskQueued)
+	}
+	failed := false
+	err := r.DB.Transaction(func(tx *gorm.DB) error {
+		var row runnerTaskRow
+		if res := queued(r.locking(tx)).Find(&row); res.Error != nil || res.RowsAffected == 0 {
+			return res.Error
+		}
+		if live, err := online(r.locking(tx)); live || err != nil {
+			return err
+		}
+
+		task := runnerTaskFromRow(row)
+		task.Status = domain.RunnerTaskFailed
+		task.Error = fmt.Sprintf("runner %q is unavailable before claim for task %s. To continue, reconnect that runner and retry", runnerID, id)
+		task.LeaseOwner, task.DesiredState = "", ""
+		task.LeaseUntil, task.ExitCode = nil, nil
+		task.CompletedAt, task.UpdatedAt = &now, now
+		scrubRunnerTaskCredentials(&task)
+		res := queued(tx.Model(&runnerTaskRow{})).Updates(runnerTaskRowValues(task))
+		failed = res.RowsAffected == 1
+		return res.Error
+	})
+	return failed && err == nil, err
 }
 
 // ExpireRunnerTasks recovers tasks whose lease was never renewed (runner

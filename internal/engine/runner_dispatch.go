@@ -479,10 +479,10 @@ func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run 
 	case domain.RunnerTaskCanceled:
 		return final.Result, errors.New("runner script canceled")
 	default:
-		message := strings.TrimSpace(final.Error)
-		if message == "" {
-			message = strings.TrimSpace(final.Result)
+		if final.ExitCode != nil && *final.ExitCode > 0 {
+			return final.Result, scriptExitError(*final.ExitCode)
 		}
+		message := strings.TrimSpace(final.Error)
 		if message == "" {
 			message = "script failed on runner"
 		}
@@ -746,6 +746,11 @@ func (e *Engine) awaitRunnerTask(ctx context.Context, taskID string, sink runtim
 			})
 		}
 	}
+	changed, unsubscribe := e.subscribeRunnerTask(taskID)
+	defer unsubscribe()
+	// API and worker processes can share the queue without sharing notifications.
+	poll := time.NewTicker(time.Second)
+	defer poll.Stop()
 	for {
 		current, ok := e.repo.RunnerTask(taskID)
 		if !ok {
@@ -758,37 +763,20 @@ func (e *Engine) awaitRunnerTask(ctx context.Context, taskID string, sink runtim
 			e.flushAllObservations()
 			return current, nil
 		}
-		changed, unsubscribe := e.subscribeRunnerTask(taskID)
-		// Re-read after subscribing to close the check/subscribe race.
-		current, ok = e.repo.RunnerTask(taskID)
-		if !ok {
-			unsubscribe()
-			return domain.RunnerTask{}, fmt.Errorf("runner task %s disappeared", taskID)
+		if current.Status == domain.RunnerTaskQueued && current.RunnerID != "" && ctx.Err() == nil {
+			// Leave the task claimable when a transient database error prevents reconciliation.
+			if failed, err := e.repo.FailQueuedRunnerTaskIfUnavailable(taskID, current.RunnerID, time.Now().UTC()); err == nil && failed {
+				e.NotifyRunnerTaskChanged(taskID)
+				continue
+			}
 		}
-		lastEventSeq = bridgeRunnerEventsToSink(current, e.repo.RunnerTaskEventsAfter(taskID, lastEventSeq), lastEventSeq, sink)
-		reportStatus(current)
-		switch current.Status {
-		case domain.RunnerTaskSuccess, domain.RunnerTaskFailed, domain.RunnerTaskCanceled:
-			unsubscribe()
-			e.flushAllObservations()
-			return current, nil
-		}
-		// Runner events and completion are written through the API process in
-		// production, while this await loop belongs to the worker process. Poll
-		// the shared durable queue frequently enough to preserve live telemetry;
-		// the in-process subscription still provides an immediate fast path.
-		fallback := time.NewTimer(time.Second)
 		select {
 		case <-ctx.Done():
-			fallback.Stop()
-			unsubscribe()
 			_ = e.repo.CancelRunnerTask(taskID, time.Now().UTC())
 			return domain.RunnerTask{}, ctx.Err()
 		case <-changed:
-		case <-fallback.C:
+		case <-poll.C:
 		}
-		fallback.Stop()
-		unsubscribe()
 	}
 }
 

@@ -38,8 +38,7 @@ type WorkflowRequirement struct {
 
 type WorkflowNode struct {
 	// TaskPrompt is what an approval node asks its approver to check
-	// (「需要确认什么」). Role nodes take their whole brief from the role's
-	// prompt; the field is not read for them.
+	// (「需要确认什么」).
 	TaskPrompt   string   `json:"taskPrompt,omitempty"`
 	RequestedBy  string   `json:"requestedBy,omitempty"`
 	RequestID    string   `json:"requestId,omitempty"`
@@ -53,30 +52,34 @@ type WorkflowNode struct {
 	MetricStage string `json:"metricStage,omitempty"` // clarification, development, testing, none
 	AgentID     string `json:"agentId,omitempty"`
 	ExecutorID  string `json:"executorId,omitempty"`
+	// AgentInstructions supplements the role prompt for this agent node.
+	AgentInstructions string `json:"agentInstructions,omitempty"`
 	// SOPWorkflowID is the referenced workflow when Type is "sop".
 	SOPWorkflowID string `json:"sopWorkflowId,omitempty"`
 	// RunOnWorkspaceRebuild replays this script when restoring an already-used environment.
-	RunOnWorkspaceRebuild bool               `json:"runOnWorkspaceRebuild,omitempty"`
-	ScriptLanguage        string             `json:"scriptLanguage,omitempty"` // shell, python
-	Script                string             `json:"script,omitempty"`
+	RunOnWorkspaceRebuild bool   `json:"runOnWorkspaceRebuild,omitempty"`
+	ScriptLanguage        string `json:"scriptLanguage,omitempty"` // shell, python
+	Script                string `json:"script,omitempty"`
+	// NonRetryableExitCodes stops automatic retry and rework for matching script exits.
+	NonRetryableExitCodes []int `json:"nonRetryableExitCodes,omitempty"`
 	// CredentialEnv requests platform-managed credentials as environment
 	// variables for script and verification commands: each entry maps an
 	// environment variable name to a credential kind (a RunCredentials.Extra
 	// key registered by the deployment). A declared credential the
 	// responsible user has not saved fails the node up front; the secret
 	// itself never appears in workflow definitions, node configs or logs.
-	CredentialEnv  map[string]string `json:"credentialEnv,omitempty"`
-	ExecutionScope string            `json:"executionScope,omitempty"` // run, repositories; empty = run
-	Command               string             `json:"command,omitempty"`        // legacy command-node payload
-	ArtifactOutputs       []ArtifactContract `json:"artifactOutputs,omitempty"`
-	RejectTo              string             `json:"rejectTo,omitempty"`
-	OnFailure             string             `json:"onFailure,omitempty"`     // fail, reject
-	RetryStrategy         string             `json:"retryStrategy,omitempty"` // targeted_fix, full_redo
-	CarryOver             []string           `json:"carryOver,omitempty"`
-	MaxAttempts           int                `json:"maxAttempts"`
-	MaxReworks            int                `json:"maxReworks"`
-	Notifications         []NodeNotification `json:"notifications,omitempty"`
-	Position              Position           `json:"position"`
+	CredentialEnv   map[string]string  `json:"credentialEnv,omitempty"`
+	ExecutionScope  string             `json:"executionScope,omitempty"` // run, repositories; empty = run
+	Command         string             `json:"command,omitempty"`        // legacy command-node payload
+	ArtifactOutputs []ArtifactContract `json:"artifactOutputs,omitempty"`
+	RejectTo        string             `json:"rejectTo,omitempty"`
+	OnFailure       string             `json:"onFailure,omitempty"`     // fail, reject
+	RetryStrategy   string             `json:"retryStrategy,omitempty"` // targeted_fix, full_redo
+	CarryOver       []string           `json:"carryOver,omitempty"`
+	MaxAttempts     int                `json:"maxAttempts"`
+	MaxReworks      int                `json:"maxReworks"`
+	Notifications   []NodeNotification `json:"notifications,omitempty"`
+	Position        Position           `json:"position"`
 }
 
 // ValidateWorkflowMetricStages prevents silently dropping a mistyped stage.

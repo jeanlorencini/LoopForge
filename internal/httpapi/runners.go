@@ -77,7 +77,6 @@ import (
 const (
 	runnerLongPollDefault    = 30 * time.Second
 	runnerDBPollDefault      = time.Second
-	runnerOfflineThreshold   = 90 * time.Second
 	runnerTaskLeaseTTL       = 120 * time.Second
 	runnerSweepInterval      = 15 * time.Second
 	runnerSessionTokenPrefix = "afr_"
@@ -162,7 +161,7 @@ func (h *runnersHandlers) startRunnerSweeper() {
 		defer ticker.Stop()
 		for range ticker.C {
 			now := time.Now().UTC()
-			h.repo.MarkOfflineRunners(runnerOfflineThreshold, now)
+			h.repo.MarkOfflineRunners(repo.RunnerOfflineThreshold, now)
 			recovered, err := h.repo.ExpireRunnerTasks(now)
 			if err != nil {
 				continue

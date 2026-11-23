@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -653,7 +654,19 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				if err != nil {
 					return "", err
 				}
-				return sb.Exec(ctx, scriptSpec, targetSink)
+				var exitCode int
+				output, execErr := sb.Exec(ctx, scriptSpec, func(event domain.TelemetryEvent) {
+					if event.Name == "process.finished" {
+						exitCode, _ = event.Attributes["exitCode"].(int)
+					}
+					targetSink(event)
+				})
+				// Exec can fail during sandbox preparation, before the script process starts.
+				var processErr *exec.ExitError
+				if exitCode > 0 && errors.As(execErr, &processErr) && processErr.ExitCode() == exitCode {
+					execErr = fmt.Errorf("%w: %w", scriptExitError(exitCode), execErr)
+				}
+				return output, execErr
 			})
 			if execMachine := e.defaultExecutionRunner(current); execMachine != "" {
 				workspace := runnerWorkspaceRel(current, node.ID)
@@ -671,10 +684,15 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			if runErr != nil {
 				status, level = "失败", "error"
 			}
+			attributes := map[string]any{"language": language, "status": status, "durationMs": duration.Milliseconds(), "outputBytes": len(rawOutput)}
+			var exit scriptExitError
+			if errors.As(runErr, &exit) {
+				attributes["exitCode"] = int(exit)
+			}
 			sink(domain.TelemetryEvent{
 				Category: "script", Name: "script.completed", Phase: "finish", Level: level,
 				Message:    fmt.Sprintf("%s 脚本执行%s · %d ms · 输出 %d bytes", scriptLanguageLabel(language), status, duration.Milliseconds(), len(rawOutput)),
-				Attributes: map[string]any{"language": language, "status": status, "durationMs": duration.Milliseconds(), "outputBytes": len(rawOutput)},
+				Attributes: attributes,
 			})
 			if strings.TrimSpace(rawOutput) == "" {
 				rawOutput = fmt.Sprintf("# 脚本执行结果\n\n- 语言：%s\n- 状态：%s\n- 耗时：%d ms\n- 标准输出：无\n", scriptLanguageLabel(language), status, duration.Milliseconds())
@@ -752,6 +770,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				if resumeFeedback != "" {
 					prompt += "\n\n操作员补充了以下信息，请结合它继续：\n\n" + resumeFeedback
 				}
+				prompt = appendNodeAgentInstructions(prompt, effectiveNode)
 			}
 			if requiresSubmit {
 				prompt = appendSubmitGateInstruction(prompt, node.RejectTo, feedback == gateMissingRetryMarker)
@@ -834,10 +853,10 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			}
 		}
 		output, err = runOnce(loopFeedback)
-		if e.dropLostCLISession(runID, node.ID, output, err) {
+		if requiresSubmit && e.dropLostCLISession(runID, node.ID, output, err) {
 			output, err = runOnce("")
 		}
-		if err != nil && strings.Contains(err.Error(), "without a terminal result") {
+		if requiresSubmit && err != nil && strings.Contains(err.Error(), "without a terminal result") {
 			e.observe(runID, node.ID, domain.TelemetryEvent{Category: "orchestration", Name: "agent.loop", Phase: "finish", Message: "执行器未返回 result，按工作区产物继续门禁，不再重跑 Agent", Attributes: map[string]any{"iteration": iteration}})
 			err = nil
 		}
@@ -1022,7 +1041,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			}
 			return
 		}
-		if isMaxTurnsErr(err) {
+		if requiresSubmit && isMaxTurnsErr(err) {
 			e.updateRun(runID, func(r *domain.Run) {
 				nr := r.Nodes[node.ID]
 				if !shouldCommitNodeOutcome(*r, nr, executionGeneration, executionAttempt, false) {
