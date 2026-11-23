@@ -20,11 +20,14 @@ func TestScriptExitPolicyUsesProcessStatus(t *testing.T) {
 		remote       bool
 		policy       string
 		exit         int
+		observed     bool
 		wantAttempts int
 		wantReworks  int
 	}{
 		{name: "local-configured", policy: `,"nonRetryableExitCodes":[78]`, exit: 78, wantAttempts: 1},
 		{name: "remote-configured", remote: true, policy: `,"nonRetryableExitCodes":[78]`, exit: 78, wantAttempts: 1},
+		{name: "remote-test-failure", remote: true, policy: `,"nonRetryableExitCodes":[1,78]`, exit: 1, wantAttempts: 1},
+		{name: "remote-cleanup-failed-after-exit-zero", remote: true, policy: `,"nonRetryableExitCodes":[0,78]`, observed: true, wantAttempts: 3, wantReworks: 1},
 		{name: "remote-unlisted", remote: true, policy: `,"nonRetryableExitCodes":[78]`, exit: 74, wantAttempts: 3, wantReworks: 1},
 		{name: "remote-prepare-failed", remote: true, policy: `,"nonRetryableExitCodes":[0,78]`, wantAttempts: 3, wantReworks: 1},
 		{name: "local-legacy", exit: 78, wantAttempts: 3, wantReworks: 1},
@@ -33,6 +36,12 @@ func TestScriptExitPolicyUsesProcessStatus(t *testing.T) {
 			diagnostic := "verification tool unavailable"
 			if tc.exit == 0 {
 				diagnostic = "workspace preparation failed"
+			}
+			if tc.observed {
+				diagnostic = "停止 CLI 子进程失败: exit status 126"
+			}
+			if tc.exit == 1 {
+				diagnostic = "fixture assertion failed"
 			}
 			_, store := cvEEngine(t)
 			e := New(store, runtime.NewManager(t.TempDir()))
@@ -80,8 +89,10 @@ func TestScriptExitPolicyUsesProcessStatus(t *testing.T) {
 							t.Errorf("append stdout: %v", err)
 						}
 					}
-					if err := store.CompleteRunnerTask(task.ID, runner.ID, status, &code, result, detail, nil, nil, now); err != nil {
-						t.Errorf("complete mocked result: %v", err)
+					report := domain.RunnerTaskCompletion{Attempt: task.Attempt, Status: status, ExitCode: &code, Result: result, Error: detail}
+					report.ExitCodeObserved = tc.observed && task.NodeID == "verify"
+					if changed, err := store.CompleteRunnerTaskAttempt(task.ID, runner.ID, report, now); err != nil || !changed {
+						t.Errorf("complete mocked result: changed=%v, error=%v", changed, err)
 					}
 				})
 			}
@@ -103,7 +114,7 @@ func TestScriptExitPolicyUsesProcessStatus(t *testing.T) {
 			if finished.Status != "failed" || state == nil || upstream == nil || state.Attempt != tc.wantAttempts || upstream.ReworkCount != tc.wantReworks {
 				t.Fatalf("run = %s, verify = %+v, prepare = %+v", finished.Status, state, upstream)
 			}
-			if tc.exit > 0 && !strings.Contains(state.Error, fmt.Sprintf("code %d", tc.exit)) {
+			if (tc.observed || tc.exit > 0) && !strings.Contains(state.Error, fmt.Sprintf("code %d", tc.exit)) {
 				t.Errorf("error should give the actual exit code: %q", state.Error)
 			}
 			if strings.Contains(state.Error, output) || tc.remote && !strings.Contains(state.Error, diagnostic) {
@@ -114,6 +125,9 @@ func TestScriptExitPolicyUsesProcessStatus(t *testing.T) {
 			}
 			if tc.wantAttempts == 1 && !strings.Contains(state.Error, "retry manually") {
 				t.Fatalf("error should explain how to recover: %q", state.Error)
+			}
+			if tc.exit == 1 && strings.Contains(strings.ToLower(state.Error), "fix the prerequisite") {
+				t.Errorf("ordinary test failure should give neutral guidance: %q", state.Error)
 			}
 			page, err := store.QueryRunTelemetry(run.ID, "", "", 0, 0, false, false, 500)
 			if err != nil {
@@ -131,7 +145,7 @@ func TestScriptExitPolicyUsesProcessStatus(t *testing.T) {
 						}
 					case "verify":
 						verified = true
-						if hasExit != (tc.exit > 0) || hasExit && code != float64(tc.exit) {
+						if hasExit != (tc.observed || tc.exit > 0) || hasExit && code != float64(tc.exit) {
 							t.Errorf("failed script completion exit code = %v", event.Attributes["exitCode"])
 						}
 					}

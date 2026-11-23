@@ -52,9 +52,12 @@ func (e *Engine) nodeFailedAt(runID string, node domain.WorkflowNode, attempt, g
 	shouldReject := false
 	configurationFailure := errors.Is(err, ErrWorkspaceControlConfiguration)
 	var exit scriptExitError
-	stopReprocessing := isScriptNode(node) && errors.As(err, &exit) && slices.Contains(node.NonRetryableExitCodes, exit.code)
+	configuredExit := isScriptNode(node) && errors.As(err, &exit) && exit.code > 0 && slices.Contains(node.NonRetryableExitCodes, exit.code)
+	if configuredExit {
+		err = fmt.Errorf("%w. Check the script logs for the cause of this exit code, then retry manually", err)
+	}
+	stopReprocessing := configuredExit || isRunnerUnavailableBeforeClaim(err)
 	if stopReprocessing {
-		err = fmt.Errorf("%w. Fix the prerequisite reported in the script logs, then retry manually", err)
 		allowReject = false
 	}
 	e.updateRun(runID, func(r *domain.Run) {
@@ -94,23 +97,22 @@ func (e *Engine) nodeFailedAt(runID string, node domain.WorkflowNode, attempt, g
 }
 
 type scriptExitError struct {
-	code         int
-	runnerDetail string
+	code   int
+	detail string
 }
 
 func (e scriptExitError) Error() string {
 	message := fmt.Sprintf("script exited with code %d", e.code)
-	if e.runnerDetail != "" {
-		message += ": " + e.runnerDetail
+	if e.detail != "" {
+		message += ": " + e.detail
 	}
 	return message
 }
 
-// A reported process exit has already classified the failure. The runner's
-// diagnostic text is for the operator and cannot override that decision.
-func withoutRunnerDetail(err error) error {
+// A known process exit has already classified the failure.
+func withoutScriptExitDetail(err error) error {
 	var exit scriptExitError
-	if errors.As(err, &exit) && exit.runnerDetail != "" {
+	if errors.As(err, &exit) && exit.detail != "" {
 		return scriptExitError{code: exit.code}
 	}
 	return err
@@ -121,7 +123,7 @@ func shouldRetryFailedAttempt(node domain.WorkflowNode, attempt int, err error) 
 	if errors.Is(err, ErrWorkspaceControlConfiguration) || errors.Is(err, errSOPArtifactWrite) {
 		return false
 	}
-	err = withoutRunnerDetail(err)
+	err = withoutScriptExitDetail(err)
 	if err != nil && (isMaxTurnsErr(err) || strings.Contains(err.Error(), "verification ") || runtime.IsCwdMountFailure(err)) {
 		return false
 	}

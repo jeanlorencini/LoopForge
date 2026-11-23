@@ -20,6 +20,10 @@ func TestWindowsSOPShellRunsNodeAndCollectsOutputs(t *testing.T) {
 	if _, err := exec.LookPath("node.exe"); err != nil {
 		t.Skip("Node.js is not installed")
 	}
+	t.Setenv("TERM", "")
+	if err := os.Unsetenv("TERM"); err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	defer server.Close()
 	d := &Daemon{cfg: Config{DefaultWorkspaceRoot: t.TempDir()}, client: NewClient(server.URL), controls: map[string]chan string{}, pendingControls: map[string]string{}}

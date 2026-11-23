@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chooseOption, loadApp, settle } from '../lib/load-app.mjs';
 
-async function traceFixture(t) {
+async function traceFixture(t, { enter = 'showRunDetail', holdDetail = false } = {}) {
   const app = await loadApp();
   t.after(app.close);
   const run = {
@@ -38,6 +38,7 @@ async function traceFixture(t) {
       return [...app.document.querySelectorAll('.telemetry-feed article p')].map(item => item.textContent);
     },
   };
+  if (holdDetail) fixture.detail = new Promise(resolve => { fixture.finishDetail = resolve; });
   fixture.makeEvents(2);
   app.router.get('/api/runs/run-1', () => fixture.detail);
   app.router.get(/^\/api\/runs\/run-1\/logs\?/, { logs: [], sequence: 0, hasMore: false });
@@ -55,13 +56,27 @@ async function traceFixture(t) {
     afters.push(Number(after));
     return fixture.delay ? fixture.delay(body) : body;
   });
-  app.evaluate(`state.data.runs=[${JSON.stringify(run)}];switchView('runs');showRunDetail('run-1')`);
+  app.evaluate(`state.data.runs=[${JSON.stringify(run)}];switchView('runs');${enter}('run-1')`);
   await settle(7);
   app.document.querySelector('[data-run-tab="trace"]').click();
   fixture.stream = app.evaluate('state.runStream');
   assert.deepEqual(fixture.rendered(), ['Trace event 2', 'Trace event 1']);
   return fixture;
 }
+
+test('both detail entry points recover the terminal revision from the initial GET', async (t) => {
+  for (const enter of ['showRunDetail', 'selectRun']) {
+    await t.test(enter, async (t) => {
+      const f = await traceFixture(t, { enter, holdDetail: true });
+      f.makeEvents(232);
+      f.finishDetail({ ...f.run, status: 'succeeded', revision: 2, telemetrySequence: 232 });
+      await settle(10);
+      assert.deepEqual(f.afters, [2, 102, 202]);
+      assert.deepEqual(f.rendered(), Array.from({ length: 232 }, (_, i) => `Trace event ${232 - i}`));
+      assert.equal(f.app.evaluate('state.runStream'), null);
+    });
+  }
+});
 
 test('the live trace drains missed pages once before closing on the terminal revision', async (t) => {
   const f = await traceFixture(t);

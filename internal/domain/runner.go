@@ -365,12 +365,14 @@ type RunnerTask struct {
 	Attempt      int        `json:"attempt"`
 	MaxAttempts  int        `json:"maxAttempts"`
 	ExitCode     *int       `json:"exitCode,omitempty"`
-	Result       string     `json:"result,omitempty"`
-	Error        string     `json:"error,omitempty"`
-	StartedAt    *time.Time `json:"startedAt,omitempty"`
-	CompletedAt  *time.Time `json:"completedAt,omitempty"`
-	CreatedAt    time.Time  `json:"createdAt"`
-	UpdatedAt    time.Time  `json:"updatedAt"`
+	// ExitCodeObserved distinguishes an actual exit from legacy setup failures reporting zero.
+	ExitCodeObserved bool       `json:"exitCodeObserved,omitempty"`
+	Result           string     `json:"result,omitempty"`
+	Error            string     `json:"error,omitempty"`
+	StartedAt        *time.Time `json:"startedAt,omitempty"`
+	CompletedAt      *time.Time `json:"completedAt,omitempty"`
+	CreatedAt        time.Time  `json:"createdAt"`
+	UpdatedAt        time.Time  `json:"updatedAt"`
 	// RunID/NodeID link a task to a workflow execution. Runner events for a
 	// linked task are bridged into the run timeline (adapter runner-v1).
 	RunID      string            `json:"runId,omitempty"`
@@ -616,13 +618,15 @@ type RunnerInputFile struct {
 
 // RunnerTaskCompletion reports the final result of a claimed attempt.
 type RunnerTaskCompletion struct {
-	Attempt   int                `json:"attempt,omitempty"`
-	Status    string             `json:"status"`
-	ExitCode  *int               `json:"exitCode"`
-	Result    string             `json:"result"`
-	Error     string             `json:"error"`
-	Artifacts map[string]string  `json:"artifacts,omitempty"`
-	Outputs   *RunnerTaskOutputs `json:"outputs,omitempty"`
+	Attempt  int    `json:"attempt,omitempty"`
+	Status   string `json:"status"`
+	ExitCode *int   `json:"exitCode"`
+	// ExitCodeObserved records that the command exited even if later cleanup failed.
+	ExitCodeObserved bool               `json:"exitCodeObserved,omitempty"`
+	Result           string             `json:"result"`
+	Error            string             `json:"error"`
+	Artifacts        map[string]string  `json:"artifacts,omitempty"`
+	Outputs          *RunnerTaskOutputs `json:"outputs,omitempty"`
 }
 
 // RunnerTaskOutputs is what a runner reports about the task workspace after

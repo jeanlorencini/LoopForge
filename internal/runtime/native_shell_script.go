@@ -40,6 +40,8 @@ func PrepareHostShellCommand(command CommandSpec) (CommandSpec, func(), error) {
 		// Git's login profile puts Unix tools ahead of the native PATH.
 		prelude = "export PATH=\"$PATH:/usr/bin:/bin:/cmd\"\n"
 		if flags != "-c" {
+			// These commands have no terminal. Avoid the login profile's winpty aliases.
+			command = WithCommandEnvironment(command, map[string]string{"TERM": "dumb"})
 			prelude = "export PATH=\"${ORIGINAL_PATH:+$ORIGINAL_PATH:}$PATH:/cmd\"\n"
 		}
 	}

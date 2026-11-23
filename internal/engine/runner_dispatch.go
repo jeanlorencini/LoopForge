@@ -12,6 +12,7 @@ import (
 
 	"agentflow/internal/domain"
 	"agentflow/internal/gitwork"
+	"agentflow/internal/repo"
 	"agentflow/internal/runtime"
 )
 
@@ -150,6 +151,9 @@ func (e *Engine) requireWorkBranchCapabilities(runnerID string, repositories []d
 func (e *Engine) runnerSandboxSpec(run domain.Run) (*domain.RunnerSandboxSpec, error) {
 	runnerID := e.defaultExecutionRunner(run)
 	if err := e.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts()); err != nil {
+		if _, unavailable := e.requireAvailableRunner(runnerID); unavailable != nil {
+			return nil, unavailable
+		}
 		return nil, err
 	}
 	profile, resources, err := e.workspaceSandboxProfile(run)
@@ -184,10 +188,10 @@ func (e *Engine) runnerSandboxSpec(run domain.Run) (*domain.RunnerSandboxSpec, e
 // task-scoped invocation. The run's repository travels with the task so the
 // sandbox/workspace is created on that machine.
 func (e *Engine) dispatchRunnerTask(ctx context.Context, runnerID string, run domain.Run, node domain.WorkflowNode, sb *runEnvironment, workspace string, ex domain.ExecutorDefinition, agent domain.AgentDefinition, assets domain.AgentAssetBundle, prompt, invocationID string, options runtime.InvocationOptions, sink runtime.EventSink) (string, error) {
-	if err := e.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts()); err != nil {
+	if err := e.requireRunnerProvider(runnerID, ex.Kind); err != nil {
 		return "", err
 	}
-	if err := e.requireRunnerProvider(runnerID, ex.Kind); err != nil {
+	if err := e.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts()); err != nil {
 		return "", err
 	}
 	runner, _ := e.repo.Runner(runnerID)
@@ -288,7 +292,7 @@ func (e *Engine) dispatchRunnerTask(ctx context.Context, runnerID string, run do
 			Attributes: map[string]any{"provider": ex.Kind, "runnerId": runnerID, "taskId": task.ID},
 		})
 	}
-	final, err := e.awaitRunnerTask(ctx, task.ID, sink)
+	final, err := e.awaitWorkflowRunnerTask(ctx, task.ID, sink)
 	if err != nil {
 		return "", err
 	}
@@ -402,10 +406,10 @@ func shellSingleQuote(value string) string {
 // the first node; subsequent shared-layout nodes reuse the same checkout and
 // its workspace-local Git index flags.
 func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run domain.Run, nodeID, workspace, language, script, artifactDirectory string, artifacts []domain.ArtifactContract, sb *runEnvironment, gitToken, gitUserName, gitUserEmail string, assets domain.AgentAssetBundle, sink runtime.EventSink) (string, *int, error) {
-	if err := e.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts()); err != nil {
+	if err := e.requireRunnerProvider(runnerID, "terminal"); err != nil {
 		return "", nil, err
 	}
-	if err := e.requireRunnerProvider(runnerID, "terminal"); err != nil {
+	if err := e.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts()); err != nil {
 		return "", nil, err
 	}
 	command := script
@@ -460,7 +464,7 @@ func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run 
 			Attributes: map[string]any{"provider": "terminal", "runnerId": runnerID, "taskId": task.ID},
 		})
 	}
-	final, err := e.awaitRunnerTask(ctx, task.ID, sink)
+	final, err := e.awaitWorkflowRunnerTask(ctx, task.ID, sink)
 	if err != nil {
 		return "", nil, err
 	}
@@ -485,8 +489,8 @@ func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run 
 	default:
 		message := clipHumanGateDetail(final.Error)
 		// Older runners use zero for failures that occur before a command starts.
-		if final.ExitCode != nil && *final.ExitCode > 0 {
-			return final.Result, final.ExitCode, scriptExitError{code: *final.ExitCode, runnerDetail: message}
+		if final.ExitCode != nil && (*final.ExitCode > 0 || *final.ExitCode == 0 && final.ExitCodeObserved) {
+			return final.Result, final.ExitCode, scriptExitError{code: *final.ExitCode, detail: message}
 		}
 		if message == "" {
 			message = "script failed on runner"
@@ -521,7 +525,7 @@ func (e *Engine) validateExecutionReconnect(run domain.Run, nodeID string) error
 	if !ok {
 		return fmt.Errorf("无法重连原执行环境：执行机器 %s 不存在", runnerID)
 	}
-	if runner.Status != domain.RunnerStatusOnline {
+	if !runnerIsAvailable(runner) {
 		return fmt.Errorf("无法重连原执行环境：执行机器 %s（%s）当前离线", runnerID, runner.Name)
 	}
 	for _, node := range run.WorkflowSnapshot.Nodes {
@@ -654,7 +658,7 @@ func (e *Engine) dispatchRunnerCommand(ctx context.Context, runnerID, runID, nod
 	if gateSink != nil {
 		gateSink(domain.TelemetryEvent{Category: "process", Name: "process.started", Phase: "start", Message: "门禁命令下发到执行器：" + command})
 	}
-	final, err := e.awaitRunnerTask(ctx, task.ID, gateSink)
+	final, err := e.awaitWorkflowRunnerTask(ctx, task.ID, gateSink)
 	if err != nil {
 		return "", err
 	}
@@ -792,6 +796,21 @@ func (e *Engine) awaitRunnerTask(ctx context.Context, taskID string, sink runtim
 	}
 }
 
+func (e *Engine) awaitWorkflowRunnerTask(ctx context.Context, taskID string, sink runtime.EventSink) (domain.RunnerTask, error) {
+	task, err := e.awaitRunnerTask(ctx, taskID, sink)
+	if err != nil || task.RunnerID == "" || task.Attempt != 0 || task.Error == "" {
+		return task, err
+	}
+	// Only queue reconciliation and runner removal record an error before the first claim.
+	switch task.Status {
+	case domain.RunnerTaskFailed:
+		return task, runnerUnavailableBeforeClaimError(task.Error)
+	case domain.RunnerTaskCanceled:
+		return task, runnerUnavailableBeforeClaimError(task.Error + ". To continue, reconnect that runner and retry")
+	}
+	return task, nil
+}
+
 // bridgeRunnerEventsToSink normalizes durable runner events in the process
 // that owns the Run lease. The API process must not mutate a worker-owned Run:
 // doing so is rejected by updateRun and previously made remote observability
@@ -864,16 +883,39 @@ func bridgeRunnerEventsToSink(task domain.RunnerTask, events []domain.RunnerTask
 	return after
 }
 
-// requireRunnerProvider validates that the bound runner is online and has the
-// executor's CLI enabled, so a misbound role fails fast with a clear message
-// instead of queueing a task nobody can claim.
-func (e *Engine) requireRunnerProvider(runnerID, provider string) error {
-	runner, ok := e.repo.Runner(strings.TrimSpace(runnerID))
-	if !ok {
-		return fmt.Errorf("执行器 %s 不存在：请到「个人 → 执行器」页面重新绑定", runnerID)
+type runnerUnavailableBeforeClaimError string
+
+func (e runnerUnavailableBeforeClaimError) Error() string { return string(e) }
+
+func isRunnerUnavailableBeforeClaim(err error) bool {
+	var unavailable runnerUnavailableBeforeClaimError
+	return errors.As(err, &unavailable)
+}
+
+func runnerIsAvailable(runner domain.Runner) bool {
+	return runner.Status == domain.RunnerStatusOnline &&
+		(runner.LastSeenAt == nil || !runner.LastSeenAt.Before(time.Now().UTC().Add(-repo.RunnerOfflineThreshold)))
+}
+
+func (e *Engine) requireAvailableRunner(runnerID string) (domain.Runner, error) {
+	runner, err := e.repo.ReadRunner(strings.TrimSpace(runnerID))
+	if errors.Is(err, repo.ErrRunnerNotFound) {
+		return runner, runnerUnavailableBeforeClaimError(fmt.Sprintf("runner %q is missing before claim. To continue, reconnect that runner and retry", runnerID))
 	}
-	if runner.Status != domain.RunnerStatusOnline {
-		return fmt.Errorf("执行器 %s（%s）当前离线，无法路由 %s 任务", runnerID, runner.Name, provider)
+	if err != nil {
+		return runner, fmt.Errorf("read runner %q before claim: %w", runnerID, err)
+	}
+	if !runnerIsAvailable(runner) {
+		return runner, runnerUnavailableBeforeClaimError(fmt.Sprintf("runner %q is offline or its heartbeat has expired before claim. To continue, reconnect that runner and retry", runnerID))
+	}
+	return runner, nil
+}
+
+// requireRunnerProvider keeps a task off the queue when the bound CLI cannot claim it.
+func (e *Engine) requireRunnerProvider(runnerID, provider string) error {
+	runner, err := e.requireAvailableRunner(runnerID)
+	if err != nil {
+		return err
 	}
 	if !runner.SupportsProvider(provider) {
 		return fmt.Errorf("执行器 %s（%s）未启用 %s CLI：请在执行器页面开启或改用云端 API Key 模式", runnerID, runner.Name, provider)

@@ -230,6 +230,38 @@ func (s *dockerSandbox) Exec(ctx context.Context, command CommandSpec, sink Even
 	return out, err
 }
 
+type dockerExecCleanupError struct {
+	error
+	commandErr error
+	exitCode   *int
+}
+
+const dockerExecCleanupMessage = "停止 CLI 子进程失败"
+
+func (e *dockerExecCleanupError) Unwrap() error { return e.error }
+
+// SandboxExitBeforeCleanupFailure separates the command's exit from a failed cleanup.
+// A nil exit code means the command's exit status was not available.
+func SandboxExitBeforeCleanupFailure(err error) (*int, bool) {
+	var cleanup *dockerExecCleanupError
+	if errors.As(err, &cleanup) {
+		return cleanup.exitCode, true
+	}
+	return nil, false
+}
+
+func dockerCommandExitCode(state *os.ProcessState, out string, err error) *int {
+	if state == nil || state.ExitCode() < 0 {
+		return nil
+	}
+	var processErr *exec.ExitError
+	if err != nil && (!errors.As(err, &processErr) || isDockerCwdUnsafe(out, err) || IsSandboxInterrupt(annotateDockerExecError(out, err))) {
+		return nil
+	}
+	code := state.ExitCode()
+	return &code
+}
+
 func (s *dockerSandbox) execOnce(ctx context.Context, command CommandSpec, sink EventSink) (out string, err error) {
 	command = s.conversationCommand(command)
 	command, cliPath, err := s.prepareSOPCLI(ctx, command)
@@ -255,6 +287,7 @@ func (s *dockerSandbox) execOnce(ctx context.Context, command CommandSpec, sink 
 			`cd "$1" && shift && exec "$@"`, "conversation", command.WorkingDir}, dropShellLoginFlag(command.Argv)...)
 	}
 	processFile := ""
+	var cmd *exec.Cmd
 	if command.OwnProcessGroup || goruntime.GOOS == "windows" {
 		processFile = path.Join(filepath.ToSlash(conversationExecutionRoot(s.requirements.ConversationRoot, true)), "home", "tmp", fmt.Sprintf("process-%d.pid", time.Now().UnixNano()))
 		if goruntime.GOOS == "windows" {
@@ -289,12 +322,16 @@ func (s *dockerSandbox) execOnce(ctx context.Context, command CommandSpec, sink 
 				stopErr = exec.CommandContext(stopCtx, "docker", stopArgs...).Run()
 			}
 			if stopErr != nil {
-				err = errors.Join(err, fmt.Errorf("停止 CLI 子进程失败: %w", stopErr))
+				err = &dockerExecCleanupError{
+					error:      errors.Join(err, fmt.Errorf("%s: %w", dockerExecCleanupMessage, stopErr)),
+					commandErr: err,
+					exitCode:   dockerCommandExitCode(cmd.ProcessState, out, err),
+				}
 			}
 		}()
 	}
 	args = append(args, argv...)
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd = exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdin = command.Stdin
 	out, err = runCommand(cmd, sink, command)
 	if goruntime.GOOS == "windows" && err != nil && strings.Contains(out, dockerWindowsPythonRequired) {
@@ -517,10 +554,17 @@ func dockerInterruptExcerpt(out string) string {
 const dockerInterruptTailLines = 5
 
 func isDockerCwdUnsafe(out string, err error) bool {
+	// A failed stop must not replay the command or replace its container.
+	var cleanup *dockerExecCleanupError
+	if errors.As(err, &cleanup) {
+		err = cleanup.commandErr
+	}
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(out + "\n" + err.Error())
+	// Persisted node errors retain the diagnostic text without the error type.
+	commandError, _, _ := strings.Cut(err.Error(), dockerExecCleanupMessage+": ")
+	msg := strings.ToLower(out + "\n" + commandError)
 	return strings.Contains(msg, "outside of container mount") || strings.Contains(msg, "container breakout") || strings.Contains(msg, "oci runtime exec failed") || strings.Contains(msg, "exit status 126")
 }
 

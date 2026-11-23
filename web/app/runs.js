@@ -309,7 +309,7 @@ function showRunDetail(id){
     if(state.selectedRun!==id)return;
     state.activeRun=r;
     if(shouldPatchRunLive(r))patchRunLive(r);else renderRunDetail(r);
-    if(['queued','running','waiting'].includes(r.status))startLiveRun(r.id);else stopLiveRun();
+    await followRunDetail(r);
   }).catch(e=>toast(e.message,'err'));
 }
 function showRunList(){
@@ -342,8 +342,19 @@ function selectRun(id,keepPages=false){
     state.activeRun=r;
     renderRuns();
     if(shouldPatchRunLive(r))patchRunLive(r);else renderRunDetail(r);
-    if(['queued','running','waiting'].includes(r.status))startLiveRun(r.id);else stopLiveRun();
+    await followRunDetail(r);
   }).catch(e=>toast(e.message,'err'));
+}
+async function followRunDetail(run){
+  if(['queued','running','waiting'].includes(run.status)){startLiveRun(run.id);return}
+  stopLiveRun();
+  if(!['succeeded','failed','cancelled'].includes(run.status))return;
+  const current=()=>state.selectedRun===run.id&&state.activeRun===run;
+  try{
+    await refreshRunPagesDelta(run.id,{terminal:true,current});
+  }catch{
+    if(current())startPollingFallback(run.id);
+  }
 }
 function runStatus(s){return ({queued:'排队中',running:'运行中',waiting:'待确认',paused:'已暂停',succeeded:'已完成',failed:'失败',cancelled:'已取消'}[s]||s)}
 function runControlSignature(r){return `${r?.status||''}:${Boolean(r?.pauseRequested)}:${Boolean(r?.cancelRequested)}:${r?.admissionState||''}`}

@@ -197,7 +197,7 @@ exec)
     *) test -f "$s/running"; cat "$AF_TEST_PARK_WORKSPACE/sentinel" "$s/layer" ;;
   esac
   ;;
-image) exit 0 ;;
+image|pull) exit 0 ;;
 run) test -f "$s/running"; touch "$s/browser" ;;
 rm)
   case "$last" in

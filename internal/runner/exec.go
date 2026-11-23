@@ -97,6 +97,9 @@ func (d *Daemon) executeSandboxProcess(ctx context.Context, task domain.RunnerTa
 				return result
 			}
 			result.exitCode = exitCode(completed.err)
+			if code, _ := flowruntime.SandboxExitBeforeCleanupFailure(completed.err); code != nil {
+				result.exitCode, result.exitCodeObserved = *code, true
+			}
 			if completed.err != nil {
 				result.status = domain.RunnerTaskFailed
 				result.errMsg = completed.err.Error()
@@ -255,11 +258,12 @@ func (b *eventBatcher) taskResult(rawFallback string) string {
 
 // execResult is the outcome reported to the control plane.
 type execResult struct {
-	status   string
-	exitCode int
-	result   string
-	errMsg   string
-	outputs  *domain.RunnerTaskOutputs
+	status           string
+	exitCode         int
+	exitCodeObserved bool
+	result           string
+	errMsg           string
+	outputs          *domain.RunnerTaskOutputs
 }
 
 // executeProcess spawns the Agent CLI in its own process group so a cancel

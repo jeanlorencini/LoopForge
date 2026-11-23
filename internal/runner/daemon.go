@@ -604,6 +604,7 @@ func (d *Daemon) executeTask(ctx context.Context, task domain.RunnerTask) {
 	if result.status == domain.RunnerTaskFailed || result.status == domain.RunnerTaskSuccess {
 		exit := result.exitCode
 		req.ExitCode = &exit
+		req.ExitCodeObserved = result.exitCodeObserved
 	}
 	if err := d.client.Complete(completeCtx, task.ID, req); err != nil {
 		log.Printf("task %s complete report: %v", task.ID, err)

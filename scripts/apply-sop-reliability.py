@@ -31,8 +31,8 @@ INSTALLED_SCRIPTS = {
     "git-branch": SOURCE_SCRIPTS["git-branch"],
     "validate-spec": "8d16833106b454a0f68c12ca64e18316fca1e1a21c95b4505a16083d719b3b95",
     "validate-tests": "fe0ccaa869227e09ff5ad2a9de75ff530f77b620ffd8119f52a6b4447a6842bf",
-    "git-commit": "7963992ce0b7f9695485a49d782c9b0bcf52bc90da24d664051d0e90c736f26b",
-    "git-merge": "e915f5b211afe075e0c884c85bd45f9f0599946d86217eade4521f75e2caed81",
+    "git-commit": "810f802267ee1e06947ff07babf17f9f5177fd14d319c551bdadc982f4d1403e",
+    "git-merge": "47e661d1270ef5b5946a0f8edb875951db5a8adf5ba00a894c21e76f6a00efce",
 }
 
 INSTRUCTIONS = {
@@ -392,7 +392,19 @@ OID = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
 def repository():
     if (ROOT / ".git").exists():
         return ROOT
-    matches = [path for path in ROOT.iterdir() if path.is_dir() and not path.is_symlink() and (path / ".git").is_dir()]
+    matches = []
+    for path in ROOT.iterdir():
+        if not path.is_dir() or path.is_symlink():
+            continue
+        marker = path / ".git"
+        if marker.is_file():
+            try:
+                git(path, "rev-parse", "--resolve-git-dir", ".git")
+            except subprocess.CalledProcessError:
+                continue
+        elif not marker.is_dir():
+            continue
+        matches.append(path)
     if len(matches) != 1:
         raise PrerequisiteError("A SOP precisa de um checkout Git identificável.")
     return matches[0]
@@ -509,7 +521,7 @@ def delivery_gate(action):
 
 VERIFY = r'''def suite(shell, name, output):
     result = subprocess.run([shell, name], cwd=ROOT, stdin=subprocess.DEVNULL, stdout=output,
-                            stderr=subprocess.STDOUT).returncode
+                            stderr=subprocess.STDOUT, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}).returncode
     if result in (2, 78, 126, 127) or result < 0 or result >= 128:
         raise PrerequisiteError(f"A suíte {name} informou falha de execução ({result}). Confira os pré-requisitos.")
     if result != 0:

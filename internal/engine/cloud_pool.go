@@ -166,8 +166,8 @@ func isPoolRun(run domain.Run) bool {
 func (e *Engine) bindPoolRunner(ctx context.Context, run domain.Run, nodeID string) (domain.Run, error) {
 	if run.ExecutionContext.ExecutionPinned {
 		if id := run.ExecutionContext.ExecutionRunnerID; id != "" {
-			if r, ok := e.repo.Runner(id); !ok || r.Status != domain.RunnerStatusOnline {
-				return run, fmt.Errorf("会话绑定的执行机器暂不可用，请等待原机器恢复")
+			if _, err := e.requireAvailableRunner(id); err != nil {
+				return run, err
 			}
 		}
 		return run, nil

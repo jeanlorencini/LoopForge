@@ -123,6 +123,36 @@ test ! -f .sop/assertion
     def test_validation_freeze_and_verification(self):
         self.exercise_workflow(self.synthetic_scripts())
 
+    def test_verification_imports_sealed_python_without_changing_inputs(self):
+        visible = self.write("tests/fixture_visible.py", "VALUE = 42\n")
+        self.write("tests-reservados/fixture_reserved.py", "VALUE = 73\n")
+        for script, directory, module, value in (
+            ("verify.sh", "tests", "fixture_visible", 42),
+            ("verify-reservado.sh", "tests-reservados", "fixture_reserved", 73),
+        ):
+            self.write(script, f'''"$SOP_FIXTURE_PYTHON" -c 'import sys; sys.path.insert(0, "{directory}"); import {module}; assert {module}.VALUE == {value}'\n''')
+        scripts = self.synthetic_scripts()
+        self.stage(scripts["validate-tests"], 0)
+        self.stage(scripts["reserve"], 0)
+        environment = dict(SOP_FIXTURE_PYTHON=sys.executable, PYTHONDONTWRITEBYTECODE="", PYTHONPYCACHEPREFIX="")
+        self.stage(scripts["verify"], 0, environment=environment)
+        self.assertFalse((self.root / "tests/__pycache__").exists())
+        visible.write_text("VALUE = 99\n", encoding="utf-8")
+        self.stage(scripts["verify"], 78, "divergiram da aprovação", environment=environment)
+
+    def test_verification_recognizes_a_unique_nested_git_worktree(self):
+        self.repo = self.repo.rename(self.temp / "main checkout")
+        worktree = self.root / "nested checkout"
+        self.git("worktree", "add", "-q", "--detach", str(worktree), "HEAD")
+        self.assertTrue((worktree / ".git").is_file())
+        self.write("not a checkout/.git", "invalid marker\n")
+        scripts = self.synthetic_scripts()
+        self.stage(scripts["validate-tests"], 0)
+        self.stage(scripts["reserve"], 0)
+        self.stage(scripts["verify"], 0)
+        self.git("worktree", "add", "-q", "--detach", str(self.root / "second checkout"), "HEAD")
+        self.stage(scripts["verify"], 78, "checkout Git identificável")
+
     @unittest.skipIf(os.name == "nt", "Windows process termination is covered by exposure recovery")
     def test_posix_termination_cleans_reserved_exposure(self):
         self.write("verify-reservado.sh", "touch .sop/started\nsleep 30\n")

@@ -9,6 +9,10 @@ import (
 	"gorm.io/gorm"
 )
 
+type mysqlLockingTestDialector struct{ gorm.Dialector }
+
+func (mysqlLockingTestDialector) Name() string { return "mysql" }
+
 func TestRunnerQueuedUnavailabilityKeepsHealthyAndClaimedWork(t *testing.T) {
 	store := newTestRunner(t)
 	now := time.Date(2026, 11, 20, 13, 0, 0, 0, time.UTC)
@@ -66,13 +70,17 @@ func TestRunnerQueuedUnavailabilityKeepsHealthyAndClaimedWork(t *testing.T) {
 
 func TestDeregisterRunnerRecordsCauseAndKeepsConcurrentOutcomes(t *testing.T) {
 	store := newTestRunner(t)
+	// Exercise the MySQL locking branch with SQLite executing the repository calls.
+	db := store.DB.Session(&gorm.Session{})
+	db.Dialector = mysqlLockingTestDialector{db.Dialector}
+	runners := &RunnersRepo{deps: &deps{DB: db}}
 	now := time.Now().UTC()
 	const runnerID = "removed-runner"
 	if err := store.PutRunner(domain.Runner{ID: runnerID, Status: domain.RunnerStatusOnline}); err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"queued", "claimed", "completed"} {
-		task := domain.RunnerTask{ID: id, RunnerID: runnerID, Provider: id, Invocation: &domain.RunnerInvocation{GitHTTPUserID: 42}}
+	for _, id := range []string{"queued", "claimed", "completed", "requeued"} {
+		task := domain.RunnerTask{ID: id, RunnerID: runnerID, Provider: id, MaxAttempts: 2, Invocation: &domain.RunnerInvocation{GitHTTPUserID: 42}}
 		if err := store.PutRunnerTask(task); err != nil {
 			t.Fatal(err)
 		}
@@ -86,8 +94,13 @@ func TestDeregisterRunnerRecordsCauseAndKeepsConcurrentOutcomes(t *testing.T) {
 			return
 		}
 		interleaved = true
+		if _, locked := tx.Statement.Clauses["FOR"]; locked {
+			t.Error("runner removal takes a locking read of the queued-task index")
+		}
 		// Use the same SQLite connection to advance the rows after removal has read its queue snapshot.
-		active := &RunnersRepo{deps: &deps{DB: tx.Session(&gorm.Session{NewDB: true})}}
+		activeDB := tx.Session(&gorm.Session{NewDB: true})
+		activeDB.Dialector = store.DB.Dialector
+		active := &RunnersRepo{deps: &deps{DB: activeDB}}
 		for _, id := range []string{"claimed", "completed"} {
 			if task, ok, err := active.ClaimRunnerTask(runnerID, []string{id}, now, time.Minute); err != nil || !ok || task.ID != id {
 				t.Errorf("interleaved claim of %s: id = %q, claimed = %v, error = %v", id, task.ID, ok, err)
@@ -97,10 +110,16 @@ func TestDeregisterRunnerRecordsCauseAndKeepsConcurrentOutcomes(t *testing.T) {
 		if changed, err := active.CompleteRunnerTaskAttempt("completed", runnerID, report, now); err != nil || !changed {
 			t.Errorf("interleaved completion: changed = %v, error = %v", changed, err)
 		}
+		if _, ok, err := active.ClaimRunnerTask(runnerID, []string{"requeued"}, now, time.Second); err != nil || !ok {
+			t.Errorf("interleaved claim before expiration: ok = %v, error = %v", ok, err)
+		}
+		if tasks, err := active.ExpireRunnerTasks(now.Add(2 * time.Second)); err != nil || len(tasks) != 1 || tasks[0].ID != "requeued" {
+			t.Errorf("interleaved expiration: tasks = %+v, error = %v", tasks, err)
+		}
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeregisterRunner(runnerID, now); err != nil {
+	if err := runners.DeregisterRunner(runnerID, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.DB.Callback().Query().Remove(callback); err != nil {
@@ -119,6 +138,10 @@ func TestDeregisterRunnerRecordsCauseAndKeepsConcurrentOutcomes(t *testing.T) {
 	}
 	if changed, err := store.CompleteRunnerTaskAttempt("completed", runnerID, report, now); err != nil || changed {
 		t.Errorf("stored completion receipt was not preserved: changed = %v, error = %v", changed, err)
+	}
+	requeued, _ := store.RunnerTask("requeued")
+	if requeued.Status != domain.RunnerTaskQueued || requeued.Attempt != 1 {
+		t.Errorf("deregister overwrote a newer attempt: %+v", requeued)
 	}
 	queued, _ := store.RunnerTask("queued")
 	if queued.Status != domain.RunnerTaskCanceled || queued.CompletedAt == nil || queued.Invocation.GitHTTPUserID != 0 ||

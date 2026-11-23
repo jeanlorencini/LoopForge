@@ -361,7 +361,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 		if ctx.Err() != nil {
 			return
 		}
-		if runtime.IsSandboxInterrupt(withoutRunnerDetail(err)) {
+		if runtime.IsSandboxInterrupt(withoutScriptExitDetail(err)) {
 			e.requeueInterruptedNode(runID, node.ID, executionAttempt, executionGeneration)
 			return
 		}
@@ -670,7 +670,13 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				})
 				// Exec can fail during sandbox preparation, before the script process starts.
 				var processErr *exec.ExitError
+				cleanupCode, cleanupFailed := runtime.SandboxExitBeforeCleanupFailure(execErr)
 				switch {
+				case cleanupFailed:
+					exitCode = cleanupCode
+					if cleanupCode != nil {
+						execErr = scriptExitError{code: *cleanupCode, detail: execErr.Error()}
+					}
 				case observedExit && code == 0:
 					exitCode = &code
 				case observedExit && errors.As(execErr, &processErr) && processErr.ExitCode() == code:
@@ -1032,7 +1038,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				}
 			}
 		}
-		if err == nil || iteration == maxIterations || ctx.Err() != nil {
+		if err == nil || iteration == maxIterations || ctx.Err() != nil || isRunnerUnavailableBeforeClaim(err) {
 			break
 		}
 		if failedAction != "loop" {
@@ -1045,7 +1051,11 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 	e.attachLoopRetro(runID, node.ID, retroWorkspace, lastIteration, err, failedAction)
 	if err != nil {
 		e.freezeAvailableArtifacts(runID, effectiveNode, sb.Workspace(), reported, output)
-		if ctx.Err() != nil || runtime.IsSandboxInterrupt(withoutRunnerDetail(err)) {
+		if isRunnerUnavailableBeforeClaim(err) {
+			failNode(err, false)
+			return
+		}
+		if ctx.Err() != nil || runtime.IsSandboxInterrupt(withoutScriptExitDetail(err)) {
 			if ctx.Err() == nil {
 				e.requeueInterruptedNode(runID, node.ID, executionAttempt, executionGeneration)
 			}
