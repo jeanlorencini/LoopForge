@@ -177,7 +177,7 @@ function failedNodeRecoveryCalloutHTML(runId,node,nr){
     ? `<button type="button" class="button primary" data-resume-run="${escapeHTML(runId)}">重试</button><button type="button" class="button ghost" data-pass-node="${escapeHTML(runId)}" data-node="${escapeHTML(node?.id||'')}">手动通过，继续下游</button>`
     : `<button type="button" class="button primary" data-resume-run="${escapeHTML(runId)}">补充信息，重跑当前节点</button>${canManuallyPassFailedNode(cachedRun(runId))?`<button type="button" class="button ghost" data-pass-node="${escapeHTML(runId)}" data-node="${escapeHTML(node?.id||'')}">手动通过，继续下游</button>`:''}`;
 
-  return `<div class="approval-callout failed" data-human-context-root><div class="callout-head"><div class="callout-title-row"><span class="callout-badge failed">执行异常</span><b class="callout-title">节点已失败</b><span class="callout-node-name">步骤：<b>${nodeTitle}</b></span></div></div><div class="callout-content">${sections.join('')}</div>${field}<div class="ap-buttons">${buttons}</div></div>`;
+  return `<div class="approval-callout failed" data-human-context-root${nodeDecisionExpectationAttr(nr)}><div class="callout-head"><div class="callout-title-row"><span class="callout-badge failed">执行异常</span><b class="callout-title">节点已失败</b><span class="callout-node-name">步骤：<b>${nodeTitle}</b></span></div></div><div class="callout-content">${sections.join('')}</div>${field}<div class="ap-buttons">${buttons}</div></div>`;
 }
 async function passFailedNode(runId,nodeId,fromEl){
   if(!runId||!nodeId)return toast('没有可通过的失败节点','err');
@@ -192,15 +192,16 @@ async function passFailedNode(runId,nodeId,fromEl){
   const run=cachedRun(runId);
   const node=run?.workflowSnapshot?.nodes?.find(n=>n.id===nodeId);
   if(!isScriptWorkflowNode(node))return toast('只有失败的脚本节点可以手动通过，AI 节点请补充信息后重试','err');
+  const payload=decisionPayload(nodeId,fromEl);
   if(!await afConfirm({title:'手动通过确认',message:`确定将「${node?.name||nodeId}」视为通过并继续下游？该节点不会重新执行。`,confirmText:'确认通过'}))return;
   try{
-    await api(`/api/runs/${encodeURIComponent(runId)}/pass`,{method:'POST',body:JSON.stringify(withHumanContext({nodeId,context:readHumanContext(fromEl)}))});
+    await api(`/api/runs/${encodeURIComponent(runId)}/pass`,{method:'POST',body:JSON.stringify(payload)});
     toast('已手动通过，流程继续','ok');
     startLiveRun(runId);
     Promise.all([refreshIssues(),refreshRuns(true)]).catch(()=>{});
     renderApprovals(true);
     if(state.drawerOpen&&state.issueDetailData?.issue)openIssueDetail(state.issueDetailData.issue.id,'sop');
-  }catch(e){toast(e.message,'err')}
+  }catch(e){await showDecisionError(e,runId)}
 }
 function restoredSOPResumeNode(run){
   if(!run?.pauseRequested||run.workflowSnapshot?.collaborationMode==='group')return null;
@@ -251,7 +252,7 @@ function pausedRunPanelHTML(run){
     : agentPaused
     ? `Agent 将优先接续原有 CLI 对话；若暂停前尚未建立会话，则在原工作区重新启动${scriptPaused?'；脚本会保留工作区并从头重新执行':''}。补充信息只会提供给 Agent。`
     : '脚本会保留当前工作区并从头重新执行；不会恢复已终止的进程，也不需要补充信息。如果脚本卡在重跑也解决不了的问题上，也可以手动通过并继续下游。';
-  const passButton=pausedScriptNode&&!restored?`<button class="button ghost" data-pass-node="${escapeHTML(run.id)}" data-node="${escapeHTML(pausedScriptNode.id)}" title="将该脚本节点视为通过并继续下游，不重新执行">手动通过，跳过该脚本</button>`:'';
+  const passButton=pausedScriptNode&&!restored?`<button class="button ghost" data-pass-node="${escapeHTML(run.id)}" data-node="${escapeHTML(pausedScriptNode.id)}"${nodeDecisionExpectationAttr(run.nodes?.[pausedScriptNode.id])} title="将该脚本节点视为通过并继续下游，不重新执行">手动通过，跳过该脚本</button>`:'';
   const resumeLabel='直接继续';
   return `<div class="approval-callout paused-run-callout" data-human-context-root><div class="callout-head"><div class="callout-title-row"><span class="callout-badge human">运行已暂停</span><b class="callout-title">流程已暂停执行</b></div></div><div class="callout-content"><p class="callout-text">${detail}</p></div>${agentPaused?humanContextFieldHTML():''}<div class="ap-buttons"><button class="button primary" data-resume-paused="${escapeHTML(run.id)}">${resumeLabel}</button>${passButton}${refreshRunSOPButtonHTML(run)}</div></div>`;
 }

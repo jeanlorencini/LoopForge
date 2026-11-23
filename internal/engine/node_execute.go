@@ -146,16 +146,24 @@ func (e *Engine) execute(ctx context.Context, runID string) {
 				return
 			}
 			if hasWaiting(wf, r) {
-				if alignOnlyRun(r) {
-					e.updateRun(runID, func(current *domain.Run) {
-						if autoSucceedAlignApprovals(current, time.Now().UTC()) {
-							e.event(current, "", "gate.auto_approved", "基线对齐无需人工确认，已自动通过")
-						}
-					})
-					continue
+				waiting := false
+				updated, err := e.updateRunReplayable(runID, func(current *domain.Run) bool {
+					if current.Generation != generation || !e.ownsRun(*current) || current.Status != "running" ||
+						current.CancelRequested || current.PauseRequested || !hasWaiting(wf, *current) || len(readyNodes(wf, *current)) > 0 {
+						return false
+					}
+					waiting = !alignOnlyRun(*current)
+					if waiting {
+						current.Status = "waiting"
+					} else if autoSucceedAlignApprovals(current, time.Now().UTC()) {
+						e.event(current, "", "gate.auto_approved", "基线对齐无需人工确认，已自动通过")
+					}
+					return true
+				})
+				if err != nil || updated && waiting {
+					return
 				}
-				e.updateRun(runID, func(current *domain.Run) { current.Status = "waiting" })
-				return
+				continue
 			}
 			if hasFailed(wf, r) {
 				e.finishAt(runID, generation, "failed", pipelineFailedMessage)
@@ -384,30 +392,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 		return
 	}
 	if node.Type == "approval" {
-		auto := false
-		e.updateRun(runID, func(r *domain.Run) {
-			if r.SandboxID != "" {
-				r.Nodes[node.ID].SandboxID = r.SandboxID
-			}
-			if !alignOnlyRun(*r) {
-				return
-			}
-			nr := r.Nodes[node.ID]
-			nr.Status = "succeeded"
-			nr.FinishedAt = time.Now().UTC()
-			e.event(r, node.ID, "gate.auto_approved", "基线对齐无需人工确认，已自动通过")
-			auto = true
-		})
-		if auto {
-			return
-		}
-		reason := "等待人工批准"
-		if r, ok := e.repo.RunState(runID); ok {
-			if why := domain.ApprovalWaitReason(r, node.ID); why != "" {
-				reason += "：" + why
-			}
-		}
-		e.waitApproval(runID, node, reason)
+		e.waitApproval(runID, node, executionGeneration, executionAttempt)
 		return
 	}
 	current, _ := e.repo.RunState(runID)
@@ -1105,22 +1090,14 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			return
 		}
 		if requiresSubmit && isMaxTurnsErr(err) {
-			e.updateRun(runID, func(r *domain.Run) {
-				nr := r.Nodes[node.ID]
-				if !shouldCommitNodeOutcome(*r, nr, executionGeneration, executionAttempt, false) {
-					return
-				}
+			e.updateNodeOutcome(runID, node.ID, executionGeneration, executionAttempt, false, func(r *domain.Run, nr *domain.NodeRun) {
 				nr.Output, nr.Error, nr.Status, nr.Activity, nr.FinishedAt = output, err.Error(), "waiting_approval", "对话轮次用尽，等待确认是否重试", time.Now().UTC()
 				e.event(r, node.ID, "agent.turns.exhausted", "对话轮次已用尽，请确认是否重试本节点")
 			})
 			return
 		}
 		if failedAction == "human" {
-			e.updateRun(runID, func(r *domain.Run) {
-				nr := r.Nodes[node.ID]
-				if !shouldCommitNodeOutcome(*r, nr, executionGeneration, executionAttempt, false) {
-					return
-				}
+			e.updateNodeOutcome(runID, node.ID, executionGeneration, executionAttempt, false, func(r *domain.Run, nr *domain.NodeRun) {
 				nr.Output, nr.Error, nr.Status, nr.Activity, nr.FinishedAt = output, err.Error(), "waiting_approval", "等待人工确认", time.Now().UTC()
 				message := "Agent 请求人工确认"
 				if nr.GateResult != nil && strings.TrimSpace(nr.GateResult.ActionRequired) != "" {
@@ -1133,11 +1110,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			return
 		}
 		if maxIterations > 1 && loopOnExhausted == "human" {
-			e.updateRun(runID, func(r *domain.Run) {
-				nr := r.Nodes[node.ID]
-				if !shouldCommitNodeOutcome(*r, nr, executionGeneration, executionAttempt, false) {
-					return
-				}
+			e.updateNodeOutcome(runID, node.ID, executionGeneration, executionAttempt, false, func(r *domain.Run, nr *domain.NodeRun) {
 				nr.Output, nr.Error, nr.Status, nr.FinishedAt = output, err.Error(), "waiting_approval", time.Now().UTC()
 				e.event(r, node.ID, "agent.loop.exhausted", "Agent 自修正次数已耗尽，转人工判断："+err.Error())
 			})
@@ -1165,11 +1138,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 	if !shouldCommitNodeOutcome(current, current.Nodes[node.ID], executionGeneration, executionAttempt, true) {
 		return
 	}
-	e.updateRun(runID, func(r *domain.Run) {
-		nr := r.Nodes[node.ID]
-		if !shouldCommitNodeOutcome(*r, nr, executionGeneration, executionAttempt, true) {
-			return
-		}
+	updated, _ = e.updateNodeOutcome(runID, node.ID, executionGeneration, executionAttempt, true, func(r *domain.Run, nr *domain.NodeRun) {
 		r.Artifacts = append(r.Artifacts, artifacts...)
 		nr.Output = output
 		nr.Error = ""
@@ -1183,6 +1152,9 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			e.event(r, node.ID, "node.succeeded", node.Name+" 已完成")
 		}
 	})
+	if !updated {
+		return
+	}
 	for _, artifact := range artifacts {
 		e.observe(runID, node.ID, domain.TelemetryEvent{Category: "artifact", Name: "artifact.published", Phase: "finish", Message: artifact.Name, Attributes: map[string]any{"artifactId": artifact.ID, "path": artifact.Path, "mediaType": artifact.MediaType, "size": artifact.Size, "sha256": artifact.SHA256}})
 	}
@@ -1217,9 +1189,6 @@ func (e *Engine) completeSkippedPreviewBuild(runID string, node domain.WorkflowN
 	if extra := strings.TrimSpace(evidence); extra != "" {
 		reason = reason + "（" + extra + "）"
 	}
-	if e.preview != nil {
-		e.preview.Skip(current, reason)
-	}
 	output := "# 前端预览\n\n已跳过：工作区没有可构建的前端工程。业务交付不受影响。\n"
 	if extra := strings.TrimSpace(evidence); extra != "" {
 		output += "\n" + extra + "\n"
@@ -1227,17 +1196,16 @@ func (e *Engine) completeSkippedPreviewBuild(runID string, node domain.WorkflowN
 	e.observe(runID, node.ID, domain.TelemetryEvent{
 		Category: "preview", Name: "preview.skipped", Phase: "finish", Message: reason,
 	})
-	e.updateRun(runID, func(r *domain.Run) {
-		nr := r.Nodes[node.ID]
-		if !shouldCommitNodeOutcome(*r, nr, executionGeneration, executionAttempt, true) {
-			return
-		}
+	updated, _ := e.updateNodeOutcome(runID, node.ID, executionGeneration, executionAttempt, true, func(r *domain.Run, nr *domain.NodeRun) {
 		nr.Output = output
 		nr.Error = ""
 		nr.Status = "succeeded"
 		nr.FinishedAt = time.Now().UTC()
 		e.event(r, node.ID, "node.succeeded", node.Name+" 已跳过（非前端仓库）")
 	})
+	if updated && e.preview != nil {
+		e.preview.Skip(current, reason)
+	}
 }
 
 func scriptLanguageLabel(language string) string {

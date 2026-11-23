@@ -11,11 +11,22 @@ import (
 	"time"
 )
 
-func (e *Engine) waitApproval(runID string, node domain.WorkflowNode, msg string) {
-	e.updateRun(runID, func(r *domain.Run) {
-		nr := r.Nodes[node.ID]
-		nr.Status = "waiting_approval"
+func (e *Engine) waitApproval(runID string, node domain.WorkflowNode, generation, attempt int) {
+	e.updateNodeOutcome(runID, node.ID, generation, attempt, false, func(r *domain.Run, nr *domain.NodeRun) {
+		if r.SandboxID != "" {
+			nr.SandboxID = r.SandboxID
+		}
 		nr.FinishedAt = time.Now().UTC()
+		if alignOnlyRun(*r) {
+			nr.Status = "succeeded"
+			e.event(r, node.ID, "gate.auto_approved", "基线对齐无需人工确认，已自动通过")
+			return
+		}
+		msg := "等待人工批准"
+		if why := domain.ApprovalWaitReason(*r, node.ID); why != "" {
+			msg += "：" + why
+		}
+		nr.Status = "waiting_approval"
 		e.event(r, node.ID, "gate.waiting", msg)
 	})
 }
@@ -48,6 +59,25 @@ func shouldCommitNodeOutcome(r domain.Run, nr *domain.NodeRun, generation, attem
 	return nr.Attempt == attempt
 }
 
+func (e *Engine) updateNodeOutcome(runID, nodeID string, generation, attempt int, success bool, apply func(*domain.Run, *domain.NodeRun)) (bool, error) {
+	var selected *domain.NodeRun
+	return e.updateRunReplayable(runID, func(r *domain.Run) bool {
+		nr := r.Nodes[nodeID]
+		if !isLiveStatus(r.Status) || r.PauseRequested || r.CancelRequested ||
+			((r.OwnerInstanceID != "" || r.Generation > 0) && !e.ownsRun(*r)) ||
+			!shouldCommitNodeOutcome(*r, nr, generation, attempt, success) {
+			return false
+		}
+		if selected != nil && (nr.Attempt != selected.Attempt || nr.RunnerAttemptID != selected.RunnerAttemptID ||
+			nr.ReworkCount != selected.ReworkCount || !nr.StartedAt.Equal(selected.StartedAt)) {
+			return false
+		}
+		selected = nr
+		apply(r, nr)
+		return true
+	})
+}
+
 func (e *Engine) nodeFailedAt(runID string, node domain.WorkflowNode, attempt, generation int, err error, allowReject bool) {
 	shouldReject := false
 	configurationFailure := errors.Is(err, ErrWorkspaceControlConfiguration)
@@ -60,11 +90,7 @@ func (e *Engine) nodeFailedAt(runID string, node domain.WorkflowNode, attempt, g
 	if stopReprocessing {
 		allowReject = false
 	}
-	e.updateRun(runID, func(r *domain.Run) {
-		nr := r.Nodes[node.ID]
-		if !shouldCommitNodeOutcome(*r, nr, generation, attempt, false) {
-			return
-		}
+	updated, _ := e.updateNodeOutcome(runID, node.ID, generation, attempt, false, func(r *domain.Run, nr *domain.NodeRun) {
 		nr.Error = err.Error()
 		nr.FinishedAt = time.Now().UTC()
 		reworkBudget := node.RejectTo != "" && r.Nodes[node.RejectTo] != nil && r.Nodes[node.RejectTo].ReworkCount >= max(1, node.MaxReworks)
@@ -91,7 +117,7 @@ func (e *Engine) nodeFailedAt(runID string, node domain.WorkflowNode, attempt, g
 		}
 		shouldReject = !configurationFailure && allowReject && nr.Status == "failed" && node.RejectTo != "" && r.Nodes[node.RejectTo] != nil && r.Nodes[node.RejectTo].ReworkCount < max(1, node.MaxReworks)
 	})
-	if shouldReject {
+	if updated && shouldReject {
 		_ = e.Reject(runID, domain.RejectRequest{NodeID: node.ID, TargetID: node.RejectTo, Reason: "节点失败自动打回：" + err.Error()})
 	}
 }
@@ -262,18 +288,17 @@ func (e *Engine) finishInterruptedAt(runID string, generation int) {
 
 func (e *Engine) parkForResumeAt(runID string, generation int, message string) {
 	e.stopRunScheduler(runID)
-	parked := false
-	e.updateRun(runID, func(r *domain.Run) {
+	parked, _ := e.updateRunReplayable(runID, func(r *domain.Run) bool {
 		if r.Generation != generation || ((r.OwnerInstanceID != "" || r.Generation > 0) && !e.ownsRun(*r)) {
-			return
+			return false
 		}
 		if domain.TerminalRunStatus(r.Status) {
-			return
+			return false
 		}
 		resetInFlightNodesForResume(r, "执行实例退出，等待恢复")
 		r.Status = "running"
 		e.event(r, "", "run.parked", message)
-		parked = true
+		return true
 	})
 	if parked {
 		e.detachRunEnvironment(runID)
@@ -282,14 +307,7 @@ func (e *Engine) parkForResumeAt(runID string, generation int, message string) {
 }
 
 func (e *Engine) requeueInterruptedNode(runID, nodeID string, attempt, generation int) {
-	e.updateRun(runID, func(r *domain.Run) {
-		nr := r.Nodes[nodeID]
-		if !shouldCommitNodeOutcome(*r, nr, generation, attempt, false) {
-			return
-		}
-		if nr.Status != "running" && nr.Status != "pending_input" {
-			return
-		}
+	e.updateNodeOutcome(runID, nodeID, generation, attempt, false, func(r *domain.Run, nr *domain.NodeRun) {
 		resetNodeForResume(r, nr, "沙箱执行中断，等待恢复")
 		r.Status = "running"
 		e.event(r, nodeID, "node.interrupted", "执行中断，节点已挂起等待恢复")

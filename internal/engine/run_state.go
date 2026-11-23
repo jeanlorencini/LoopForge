@@ -34,6 +34,22 @@ func (e *Engine) updateRunAt(id string, allowExpiredLease bool, mutate func(*dom
 // rejected the write, that error. A skipped update (missing run or a lease
 // held elsewhere) is not an error.
 func (e *Engine) updateRunAtErr(id string, allowExpiredLease bool, mutate func(*domain.Run)) (bool, error) {
+	if mutate == nil {
+		return e.updateRunProgress(id, allowExpiredLease, true, nil)
+	}
+	return e.updateRunProgress(id, allowExpiredLease, false, func(r *domain.Run) bool {
+		mutate(r)
+		return true
+	})
+}
+
+// updateRunReplayable reapplies a snapshot-only mutation after a revision
+// conflict. The caller must validate its decision against each new snapshot.
+func (e *Engine) updateRunReplayable(id string, mutate func(*domain.Run) bool) (bool, error) {
+	return e.updateRunProgress(id, false, true, mutate)
+}
+
+func (e *Engine) updateRunProgress(id string, allowExpiredLease, replay bool, mutate func(*domain.Run) bool) (bool, error) {
 	e.stateMu.Lock()
 	defer e.stateMu.Unlock()
 	r, ok := e.repo.RunState(id)
@@ -46,23 +62,37 @@ func (e *Engine) updateRunAtErr(id string, allowExpiredLease bool, mutate func(*
 		return false, nil
 	}
 	pending := e.takePendingObservations(id)
-	if mutate == nil && len(pending) == 0 {
-		return true, nil
+	owner, generation := r.OwnerInstanceID, r.Generation
+	for {
+		for _, item := range pending {
+			e.applyObservation(&r, item.nodeID, item.event)
+		}
+		applied := mutate == nil || mutate(&r)
+		if (mutate == nil || !applied) && len(pending) == 0 {
+			return applied, nil
+		}
+		err := e.repo.PutRunProgress(r, allowExpiredLease)
+		if err == nil {
+			if current, ok := e.repo.RunStreamView(id); ok {
+				e.publishRun(current)
+			}
+			return applied, nil
+		}
+		if !replay || !errors.Is(err, repo.ErrRunDecisionStale) {
+			if len(pending) > 0 {
+				e.obsMu.Lock()
+				e.obsPending = append(pending, e.obsPending...)
+				e.obsMu.Unlock()
+			}
+			log.Printf("put run %s: %v", id, err)
+			return false, err
+		}
+		r, ok = e.repo.RunState(id)
+		if !ok || r.OwnerInstanceID != owner || r.Generation != generation ||
+			(owner != "" && !e.ownsRun(r) && !allowExpiredLease) {
+			return false, nil
+		}
 	}
-	for _, item := range pending {
-		e.applyObservation(&r, item.nodeID, item.event)
-	}
-	if mutate != nil {
-		mutate(&r)
-	}
-	if err := e.repo.PutRunProgress(r, allowExpiredLease); err != nil {
-		log.Printf("put run %s: %v", id, err)
-		return false, err
-	}
-	if current, ok := e.repo.RunStreamView(id); ok {
-		e.publishRun(current)
-	}
-	return true, nil
 }
 
 // Subscribe provides provider-neutral live run snapshots. Slow clients receive

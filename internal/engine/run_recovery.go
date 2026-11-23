@@ -151,11 +151,19 @@ func (e *Engine) ResumeInterruptedRuns() []string {
 				_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
 				continue
 			}
-			e.updateRun(r.ID, func(current *domain.Run) {
-				if autoSucceedAlignApprovals(current, time.Now().UTC()) {
-					e.event(current, "", "gate.auto_approved", "基线对齐无需人工确认，已自动通过")
+			updated, _ := e.updateRunReplayable(r.ID, func(current *domain.Run) bool {
+				if current.Generation != acquired.Generation || !e.ownsRun(*current) || current.Status != "waiting" ||
+					current.CancelRequested || current.PauseRequested || !alignRunWaitingApproval(*current) ||
+					!autoSucceedAlignApprovals(current, time.Now().UTC()) {
+					return false
 				}
+				e.event(current, "", "gate.auto_approved", "基线对齐无需人工确认，已自动通过")
+				return true
 			})
+			if !updated {
+				_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
+				continue
+			}
 			e.resume(r.ID)
 			resumed = append(resumed, r.ID)
 			continue
@@ -231,11 +239,20 @@ func (e *Engine) ResumeInterruptedRuns() []string {
 			_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
 			continue
 		}
-		e.updateRun(r.ID, func(current *domain.Run) {
+		updated, _ := e.updateRunReplayable(r.ID, func(current *domain.Run) bool {
+			if current.Generation != acquired.Generation || !e.ownsRun(*current) || current.Status != "running" ||
+				current.CancelRequested || current.PauseRequested {
+				return false
+			}
 			resetInFlightNodesForResume(current, "执行实例退出，等待恢复")
 			current.Status = "running"
 			e.event(current, "", "run.resumed", fmt.Sprintf("服务恢复后继续执行（generation=%d, previousOwner=%s）", acquired.Generation, previousOwner))
+			return true
 		})
+		if !updated {
+			_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
+			continue
+		}
 		e.observe(r.ID, "", domain.TelemetryEvent{Category: "orchestration", Name: "run.resumed", Phase: "start", Message: "过期执行租约已接管", Attributes: map[string]any{"generation": acquired.Generation, "previousOwner": previousOwner}})
 		e.resume(r.ID)
 		resumed = append(resumed, r.ID)

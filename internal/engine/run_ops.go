@@ -704,6 +704,9 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 	if r.Status != "waiting" || !r.PauseRequested {
 		return fmt.Errorf("run is not paused")
 	}
+	if r.CancelRequested {
+		return repo.ErrRunDecisionStale
+	}
 	if e.executes() && e.workspaceBlocked(r) {
 		return fmt.Errorf("run %s 的工作区绑定在 %s:%s，请在绑定实例上继续", runID, r.WorkspaceHost, r.WorkspaceRoot)
 	}
@@ -714,26 +717,7 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 	if len(activeRunnerTasks) > 0 {
 		return fmt.Errorf("执行机器仍在停止当前任务，请等待远端进程退出后再继续")
 	}
-	paused := make([]string, 0)
-	for id, nr := range r.Nodes {
-		if isUserPausedNode(nr) {
-			paused = append(paused, id)
-		}
-	}
-	// Returning from group mode deliberately leaves a pending SOP node, rather
-	// than an interrupted worker. Recognize that explicit checkpoint, including
-	// records created before this fix, without approving ordinary human gates.
-	if len(paused) == 0 && !r.IsWorkspace() {
-		for i := len(r.Events) - 1; i >= 0; i-- {
-			ev := r.Events[i]
-			if ev.Type == "group.sop_restored" {
-				if nr := r.Nodes[ev.NodeID]; nr != nil && nr.Status == "pending" && nr.Activity == "切回 SOP，等待继续" && replayUpstreamSucceeded(r, ev.NodeID) {
-					paused = append(paused, ev.NodeID)
-				}
-				break
-			}
-		}
-	}
+	paused := pausedResumeNodes(r)
 	if len(paused) == 0 {
 		// Pause can land after the active step has already finished: the last
 		// node succeeded and the scheduler exited, or group collaboration was
@@ -793,11 +777,27 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 		e.resumeAfterDecision(r)
 		return nil
 	}
+	releaseLease := false
 	if e.executes() {
-		var err error
 		r, err = e.acquireLease(r)
 		if err != nil {
 			return err
+		}
+		releaseLease = true
+		defer func() {
+			if releaseLease {
+				_ = e.repo.ReleaseRunLease(runID, e.instanceID, r.Generation)
+			}
+		}()
+		if err := checkNodeExpectation(r, expected); err != nil {
+			return err
+		}
+		if r.Status != "waiting" || !r.PauseRequested || r.CancelRequested {
+			return repo.ErrRunDecisionStale
+		}
+		paused = pausedResumeNodes(r)
+		if len(paused) == 0 {
+			return repo.ErrRunDecisionStale
 		}
 	}
 	sort.Strings(paused)
@@ -842,8 +842,18 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 	}
 	e.event(&r, paused[0], "run.resumed", message)
 	appendControlTelemetry(&r, paused[0], "run.resumed", message)
+	if releaseLease {
+		err = e.repo.PutLeasedRunAtRevision(r, e.instanceID)
+	} else {
+		err = e.repo.PutRunAtRevision(r, r.Revision)
+	}
+	if err != nil {
+		return err
+	}
+	releaseLease = false
 	markRunRelationsRunning(e.repo, r)
-	return e.persistControlDecision(runID, r, expected...)
+	e.resumeAfterDecision(r)
+	return nil
 }
 
 // RefreshRunSOP replaces a stopped Run's frozen graph with the latest
@@ -900,6 +910,30 @@ func (e *Engine) RefreshRunSOP(runID string) error {
 	}
 	e.publish(runID)
 	return nil
+}
+
+func pausedResumeNodes(r domain.Run) []string {
+	paused := make([]string, 0)
+	for id, nr := range r.Nodes {
+		if isUserPausedNode(nr) {
+			paused = append(paused, id)
+		}
+	}
+	// Returning from group mode deliberately leaves a pending SOP node, rather
+	// than an interrupted worker. Recognize that explicit checkpoint, including
+	// records created before this fix, without approving ordinary human gates.
+	if len(paused) == 0 && !r.IsWorkspace() {
+		for i := len(r.Events) - 1; i >= 0; i-- {
+			ev := r.Events[i]
+			if ev.Type == "group.sop_restored" {
+				if nr := r.Nodes[ev.NodeID]; nr != nil && nr.Status == "pending" && nr.Activity == "切回 SOP，等待继续" && replayUpstreamSucceeded(r, ev.NodeID) {
+					paused = append(paused, ev.NodeID)
+				}
+				break
+			}
+		}
+	}
+	return paused
 }
 
 func isUserPausedNode(nr *domain.NodeRun) bool {

@@ -208,3 +208,39 @@ test('approval list sends context and removes the approved run after refreshing'
   await app.evaluate(`window.__pauseRun`);
   assert.ok(app.router.calls.some(c => c.method === 'POST' && c.path === '/api/runs/approval-run/pause'));
 });
+
+test('manual script pass submits the displayed failed attempt and refreshes on conflict', async (t) => {
+  const app = await loadApp();
+  t.after(app.close);
+  const run = {
+    ...approvalFixture('stale-script'),
+    status: 'failed',
+    nodes: { build: { status: 'failed', attempt: 2, reworkCount: 1, error: 'exit 1' } },
+  };
+  const current = { ...run, nodes: { build: { ...run.nodes.build, attempt: 3, reworkCount: 2 } } };
+  app.router.get('/api/runs', [current]);
+  app.router.get('/api/runs/stale-script', current);
+  app.router.post('/api/runs/stale-script/pass', ({ body }) =>
+    body.expected?.attempt === 2
+      ? { status: 409, body: { code: 'run_decision_stale', error: 'conflict' } }
+      : { ok: true });
+  app.evaluate(`
+    const scriptRun = ${JSON.stringify(run)};
+    const host = document.createElement('div');
+    host.innerHTML = failedNodeRecoveryCalloutHTML(scriptRun.id, scriptRun.workflowSnapshot.nodes[0], scriptRun.nodes.build);
+    document.body.append(host);
+    const drawer = document.createElement('div');
+    drawer.id = 'script-issue-actions';
+    drawer.innerHTML = issueProgressActionsHTML({id:'script-issue'}, scriptRun);
+    document.body.append(drawer);
+    state.data.runs = [${JSON.stringify(current)}];
+    window.afConfirm = async () => true;
+  `);
+  const drawerButton = app.document.querySelector('#script-issue-actions [data-pass-node]');
+  assert.deepEqual(JSON.parse(drawerButton.dataset.decisionExpectation), { status: 'failed', attempt: 2, reworkCount: 1 });
+  await app.evaluate(`passFailedNode('stale-script', 'build', document.querySelector('[data-pass-node]'))`);
+  const call = app.router.calls.find(c => c.path === '/api/runs/stale-script/pass');
+  assert.deepEqual(call?.body.expected, { status: 'failed', attempt: 2, reworkCount: 1 });
+  assert.match(app.document.querySelector('.toast-err')?.textContent || '', /节点状态已变化|latest attempt/i);
+  assert.ok(app.router.calls.some(c => c.path === '/api/runs/stale-script' && c.method === 'GET'));
+});

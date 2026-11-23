@@ -122,13 +122,7 @@ func (e *Engine) executeSOPNode(ctx context.Context, runID string, wf domain.Wor
 		fail(err)
 		return
 	}
-	applied := false
-	err = e.updateRunErr(runID, func(r *domain.Run) {
-		nr := r.Nodes[node.ID]
-		if !shouldCommitNodeOutcome(*r, nr, generation, attempt, true) {
-			return
-		}
-		applied = true
+	applied, err := e.updateNodeOutcome(runID, node.ID, generation, attempt, true, func(r *domain.Run, nr *domain.NodeRun) {
 		nr.ChildRunID = finished.ID
 		r.Artifacts = append(r.Artifacts, imported...)
 		nr.Output = fmt.Sprintf("子 SOP %s 已完成，交接 %d 个产物", childID, len(imported))
@@ -137,13 +131,13 @@ func (e *Engine) executeSOPNode(ctx context.Context, runID string, wf domain.Wor
 		nr.FinishedAt = time.Now().UTC()
 		e.event(r, node.ID, "node.succeeded", node.Name+" 已完成")
 	})
-	if !applied {
-		return
-	}
 	if err != nil {
 		if ctx.Err() == nil {
 			e.nodeFailedAt(runID, node, attempt, generation, fmt.Errorf("%w：%w", errSOPArtifactWrite, err), false)
 		}
+		return
+	}
+	if !applied {
 		return
 	}
 	for _, artifact := range imported {

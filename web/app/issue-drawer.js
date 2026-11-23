@@ -503,7 +503,10 @@ function issueProgressActionsHTML(issue,run,{includeIssueActions=false}={}){
     const runId=escapeHTML(run.id);
     if(!gongfengIssueClosed(issue)&&!run.pauseRequested)workflowActions.push(refreshRunSOPButtonHTML(run));
     if(!issueExecutionBlocked(issue)){
-      if(canManuallyPassFailedNode(run))workflowActions.push(`<button class="button ghost small" data-pass-node="${runId}" data-node="${escapeHTML(failedNodeId(run))}">手动通过失败脚本</button>`);
+      if(canManuallyPassFailedNode(run)){
+        const nodeId=failedNodeId(run);
+        workflowActions.push(`<button class="button ghost small" data-pass-node="${runId}" data-node="${escapeHTML(nodeId)}"${nodeDecisionExpectationAttr(run.nodes?.[nodeId])}>手动通过失败脚本</button>`);
+      }
       if(run.status==='failed')workflowActions.push(triggerSOPButton(issue,{ghost:true,text:'整条 SOP 从头触发'}));
     }
     logActions.push(`<button class="button ghost small" data-open-logs="${runId}">查看运行与日志</button>`);

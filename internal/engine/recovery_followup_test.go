@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 func completedRecoveryRun(id string) domain.Run {
@@ -443,5 +445,97 @@ func drainRecoveryFixture(t *testing.T, e *Engine) {
 	defer cancel()
 	if err := e.Drain(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNodeCompletionSurvivesConcurrentSignal(t *testing.T) {
+	e, s := newRecoveryEngine(t)
+	r := completedRecoveryRun("signal-crosses-completion")
+	node := r.WorkflowSnapshot.Nodes[0]
+	r.Nodes[node.ID].Status = "running"
+	r.OwnerInstanceID, r.Generation, r.LeaseUntil = e.instanceID, 1, time.Now().Add(time.Minute)
+	if err := s.PutRun(r); err != nil {
+		t.Fatal(err)
+	}
+	api := New(s, nil)
+	api.ConfigureExecution("signal-api", "signal-host", time.Minute, false)
+	reads := 0
+	var signalErr error
+	if err := s.DB.Callback().Query().After("gorm:query").Register("fixture:signal_crosses_completion", func(tx *gorm.DB) {
+		if tx.Statement.Table != "run_artifacts" {
+			return
+		}
+		reads++
+		// The first read is observe; the second is the completion snapshot.
+		if reads == 2 {
+			signalErr = api.IngestWorkerEnvelope(r.ID, domain.WorkerEnvelope{
+				SpecVersion: domain.ObservabilitySpecVersion,
+				Type:        "observation",
+				Observation: &domain.TelemetryEvent{
+					ID: "remote-observation", NodeID: node.ID, Category: "process",
+					Name: "process.stdout", Message: "remote stdout",
+					Source: domain.TelemetrySource{Layer: "executor", Adapter: "fixture"},
+				},
+			})
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.completeSkippedPreviewBuild(r.ID, node, r.Generation, 1, r, "no frontend")
+	got, ok := s.Run(r.ID)
+	if signalErr != nil || reads < 2 || !ok {
+		t.Fatalf("fixture did not commit the competing signal: reads=%d, signal=%v, found=%t", reads, signalErr, ok)
+	}
+	if got.Nodes[node.ID].Status != "succeeded" {
+		t.Fatalf("completion was lost: status=%s", got.Nodes[node.ID].Status)
+	}
+	if len(got.Events) != 1 || got.Events[0].Type != "node.succeeded" || len(got.Telemetry) != 2 ||
+		got.Telemetry[0].ID != "remote-observation" || got.Telemetry[1].Name != "preview.skipped" {
+		t.Fatalf("expected one completion and both observations in order: events=%+v telemetry=%+v", got.Events, got.Telemetry)
+	}
+}
+
+func TestResumePausedNodeKeepsConcurrentCancel(t *testing.T) {
+	e, s := newRecoveryEngine(t)
+	r := completedRecoveryRun("paused-node-cancel")
+	r.Status, r.PauseRequested = "waiting", true
+	r.Nodes["close"].Status, r.Nodes["close"].Activity = "waiting_approval", "已由用户暂停"
+	r.ExecutionContext.TaskID = "paused-task"
+	if err := s.PutRun(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutTask(domain.Task{ID: r.ExecutionContext.TaskID, RunID: r.ID, Status: "queued"}); err != nil {
+		t.Fatal(err)
+	}
+	fired := false
+	var cancelErr error
+	if err := s.DB.Callback().Query().After("gorm:query").Register("fixture:cancel_crosses_resume", func(tx *gorm.DB) {
+		if tx.Statement.Table != "run_artifacts" || fired {
+			return
+		}
+		var owner string
+		if err := s.DB.Table("runs").Select("owner_instance_id").Where("id = ?", r.ID).Scan(&owner).Error; err != nil {
+			t.Fatal(err)
+		}
+		if owner == e.instanceID {
+			fired = true
+			_, cancelErr = s.RequestRunCancel(r.ID)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := e.ResumePaused(r.ID, "")
+	if !fired || cancelErr != nil {
+		t.Fatalf("fixture did not commit cancellation after the leased snapshot: fired=%t cancel=%v", fired, cancelErr)
+	}
+	if !errors.Is(err, repo.ErrRunDecisionStale) {
+		t.Fatalf("resume after cancellation returned %v, want a revision conflict", err)
+	}
+	got, _ := s.RunState(r.ID)
+	task, _ := s.Task(r.ExecutionContext.TaskID)
+	if !got.CancelRequested || got.Status != "waiting" || got.Nodes["close"].Status != "waiting_approval" || got.OwnerInstanceID != "" || task.Status != "queued" {
+		t.Fatalf("resume changed state: cancel=%t status=%s node=%s owner=%q task=%s", got.CancelRequested, got.Status, got.Nodes["close"].Status, got.OwnerInstanceID, task.Status)
 	}
 }

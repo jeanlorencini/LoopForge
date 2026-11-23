@@ -160,7 +160,7 @@ func TestIntegrationConflictRequeuesRepairNodeAndDescendants(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := New(st, runtime.NewManager(t.TempDir()))
-	if err := e.requeueIntegrationConflict(run.ID, "release/2026", []string{"app.go"}); err != nil {
+	if err := e.requeueIntegrationConflict(run, "release/2026", []string{"app.go"}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := st.Run(run.ID)
