@@ -143,6 +143,7 @@
 .trace-section{padding:16px 19px;border-top:1px solid var(--line)}
 .trace-section .telemetry-feed{max-height:max(340px,calc(100vh - 320px));overflow:auto;border:1px solid var(--line);border-radius:9px}
 .trace-heading-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.trace-heading-actions [data-run-trace-node]{width:auto;max-width:min(100%,22rem)}
 .trace-source-tabs{display:flex;gap:3px;padding:3px;border:1px solid var(--line);border-radius:9px;background:var(--panel-2)}
 .trace-source-tabs button{height:28px;padding:0 10px;border:0;border-radius:7px;background:transparent;color:var(--muted);cursor:pointer;font-size:11px;font-weight:650}
 .trace-source-tabs button:hover{background:var(--hover);color:var(--text)}

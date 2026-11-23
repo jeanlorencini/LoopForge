@@ -1,6 +1,73 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadApp, settle } from '../lib/load-app.mjs';
+import { chooseOption, loadApp, settle } from '../lib/load-app.mjs';
+
+test('live trace follows the whole run while the overview inspects a completed step', async (t) => {
+  const app = await loadApp();
+  t.after(app.close);
+  const run = {
+    ...app.evaluate('structuredClone(state.data.runs[0])'),
+    status: 'running',
+    workflowSnapshot: app.evaluate('structuredClone(state.data.workflows[0])'),
+    nodes: {
+      'node-1': { status: 'succeeded', attempt: 1 },
+      'node-2': { status: 'running', attempt: 1 },
+    },
+  };
+  const spec = { id: 'event-spec', sequence: 1, nodeId: 'node-1', category: 'verification', message: 'Spec finished',
+    timestamp: '2026-10-21T10:02:00Z' };
+  const current = { id: 'event-implement', sequence: 2, nodeId: 'node-2', category: 'verification', message: 'Implementation started',
+    timestamp: '2026-10-21T10:03:00Z' };
+  const events = [spec, current];
+  let delaySpec = false;
+  let finishSpecRequest;
+  app.router.get('/api/runs/run-1', run);
+  app.router.get(/^\/api\/runs\/run-1\/telemetry\?/, ({ url }) => {
+    const node = url.searchParams.get('nodeId');
+    const after = Number(url.searchParams.get('after') || 0);
+    const body = { events: events.filter(e => (!node || e.nodeId === node) && e.sequence > after) };
+    if (delaySpec && node === 'node-1') return new Promise(resolve => { finishSpecRequest = () => resolve(body); });
+    return body;
+  });
+
+  app.evaluate(`state.data.runs=[${JSON.stringify(run)}];switchView('runs');showRunDetail('run-1')`);
+  await settle(8);
+  app.document.querySelector('[data-run-node="node-1"]').click();
+  app.document.querySelector('[data-run-tab="trace"]').click();
+  await settle(6);
+  const feed = () => app.document.querySelector('.telemetry-feed').textContent;
+  assert.match(feed(), /Implementation started/);
+  assert.equal(app.evaluate('state.selectedRunNode'), 'node-1');
+
+  const selector = () => app.document.querySelector('[data-run-trace-node]');
+  assert.equal(selector().value, '');
+  chooseOption(selector(), 'node-1');
+  await settle(6);
+  assert.match(feed(), /Spec finished/);
+  assert.doesNotMatch(feed(), /Implementation started/);
+
+  chooseOption(selector(), '');
+  await settle(6);
+  assert.match(feed(), /Implementation started/);
+  const next = { ...current, id: 'event-implement-2', sequence: 3, message: 'Implementation advanced' };
+  app.evaluate(`applyRunPayload(mergeLiveRun('run-1',state.activeRun,{telemetryDelta:[${JSON.stringify(next)}]}))`);
+  assert.match(feed(), /Implementation advanced/);
+
+  events.push({ ...current, id: 'event-implement-3', sequence: 4, message: 'Implementation polled' });
+  await app.evaluate("refreshRunPagesDelta('run-1')");
+  assert.match(feed(), /Implementation polled/);
+
+  delaySpec = true;
+  chooseOption(selector(), 'node-1');
+  await settle(2);
+  assert.equal(typeof finishSpecRequest, 'function');
+  chooseOption(selector(), '');
+  await settle(4);
+  finishSpecRequest();
+  await settle(4);
+  assert.equal(selector().value, '');
+  assert.match(feed(), /Implementation polled/);
+});
 
 test('run detail loads logs, telemetry, preview, workspace, evaluation, and child runs', async (t) => {
   const app = await loadApp();
