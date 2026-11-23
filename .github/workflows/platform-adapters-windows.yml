@@ -41,19 +41,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $utf8 = New-Object Text.UTF8Encoding($false)
-          $testRoot = Join-Path $env:RUNNER_TEMP ('loopforge-platform-adapters-' + [Guid]::NewGuid().ToString('N'))
+          $testRoot = Join-Path $env:GITHUB_WORKSPACE ('.loopforge-platform-adapters-' + [Guid]::NewGuid().ToString('N'))
           $runtimeRoot = Join-Path $testRoot 'runtime'
           $httpRoot = Join-Path $testRoot 'httpapi'
           $null = New-Item -ItemType Directory -Force -Path $runtimeRoot, $httpRoot
           foreach ($name in @('identifier.go', 'managed_files.go', 'workspace_lock.go', 'workspace_lock_windows.go', 'workspace_lock_test.go', 'git_isolation.go', 'git_index_lock_windows.go', 'git_index_lock_windows_test.go')) {
             Copy-Item -LiteralPath (Join-Path 'internal/runtime' $name) -Destination (Join-Path $runtimeRoot $name)
           }
-          # These maps are caller data needed to compile git_isolation.go.
-          # Keep their actual source declarations rather than duplicating them.
-          $processSource = [IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'internal/runtime/sandbox_process.go'))
-          $maps = [regex]::Matches($processSource, '(?ms)^var projectAgent(?:Dir|File)Names = map\[string\]bool\{.*?^\}')
-          if ($maps.Count -ne 2) { throw 'Expected both project Agent path-map declarations.' }
-          $runtimeCaller = @('package runtime', '', 'type Manager struct { root string }', '', $maps[0].Value, '', $maps[1].Value) -join "`n"
+          $runtimeCaller = @('package runtime', '', 'type Manager struct { root string }') -join "`n"
           [IO.File]::WriteAllText((Join-Path $runtimeRoot 'caller_types.go'), $runtimeCaller, $utf8)
           foreach ($name in @('assistant_native_lock_windows.go', 'assistant_native_lock_test.go')) {
             Copy-Item -LiteralPath (Join-Path 'internal/httpapi' $name) -Destination (Join-Path $httpRoot $name)

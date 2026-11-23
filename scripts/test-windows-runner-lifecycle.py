@@ -296,6 +296,9 @@ class WindowsRunnerLifecycleTest(unittest.TestCase):
         cls.source_linux_gate = Path(linux_gate) if linux_gate else cls.source_gate.with_name("agentflow-gate-mcp-linux-" + cls.arch)
         if not cls.source_linux_gate.is_file() or not cls.source_linux_gate.read_bytes().startswith(b"\x7fELF"):
             raise RuntimeError("set LOOPFORGE_TEST_LINUX_GATE_BINARY to a real Linux Gate ELF binary")
+        linux_runner = os.environ.get("LOOPFORGE_TEST_LINUX_RUNNER_BINARY")
+        cls.source_linux_runner = (Path(linux_runner) if linux_runner else
+                                   cls.source_binary.with_name("agentflow-runner-linux-" + cls.arch))
         cls.node_binary = shutil.which("node.exe")
         git = shutil.which("git.exe")
         go = os.environ.get("LOOPFORGE_TEST_GO_BINARY") or shutil.which("go.exe")
@@ -660,16 +663,22 @@ console.error("EXPECTED_NATIVE_FAILURE"); process.exit(7);
         self.assertNotIn(CREDENTIAL_CANARY, output)
         return output
 
+    def installer_artifacts(self):
+        if not self.source_linux_runner.is_file():
+            raise RuntimeError("set LOOPFORGE_TEST_LINUX_RUNNER_BINARY to a compiled Linux agentflow-runner")
+        return {
+            ("windows", "agentflow-runner"): self.source_binary.read_bytes(),
+            ("windows", "agentflow-gate-mcp"): self.source_gate.read_bytes(),
+            ("linux", "agentflow-gate-mcp"): self.source_linux_gate.read_bytes(),
+            ("linux", "agentflow-runner"): self.source_linux_runner.read_bytes(),
+        }
+
     def exercise_actual_installer(self, shell):
         powershell = shutil.which(shell)
         self.assertTrue(powershell, shell + " is required for the complete Windows lifecycle")
         install = self.root / "actual installation"
         self.addCleanup(self.cleanup_installed_process, install)
-        self.server.artifacts = {
-            ("windows", "agentflow-runner"): self.source_binary.read_bytes(),
-            ("windows", "agentflow-gate-mcp"): self.source_gate.read_bytes(),
-            ("linux", "agentflow-gate-mcp"): self.source_linux_gate.read_bytes(),
-        }
+        self.server.artifacts = self.installer_artifacts()
         sentinel = self.workspace / "user-work.txt"
         sentinel.write_text("retain the user's workspace", encoding="utf-8")
         self.run_installer(powershell, install,
@@ -683,8 +692,12 @@ console.error("EXPECTED_NATIVE_FAILURE"); process.exit(7);
         original_state = (install / "state.json").read_bytes()
         self.assertEqual(json.loads(original_state)["runnerId"], RUNNER_ID)
         original_config = json.loads((install / "config.json").read_text(encoding="utf-8-sig"))
-        linux_companion = Path(original_config["GateBinary"]).with_name("agentflow-gate-mcp-linux-" + self.arch)
-        self.assertEqual(linux_companion.read_bytes(), self.server.artifacts[("linux", "agentflow-gate-mcp")])
+        linux_companions = {
+            name: Path(original_config["RunnerBinary"]).with_name(name + "-linux-" + self.arch)
+            for name in ("agentflow-gate-mcp", "agentflow-runner")
+        }
+        for name, companion in linux_companions.items():
+            self.assertEqual(companion.read_bytes(), self.server.artifacts[("linux", name)])
 
         # Exercise the installed Gate binary through a real dispatched shell
         # task. No Go toolchain or paid CLI is available in the Runner's PATH.
@@ -721,9 +734,10 @@ console.log("INSTALLED_GATE_EXECUTED");
             self.assertNotEqual(updated_config[name], original_config[name])
             artifact = ("windows", "agentflow-runner" if name == "RunnerBinary" else "agentflow-gate-mcp")
             self.assertEqual(Path(updated_config[name]).read_bytes(), self.server.artifacts[artifact])
-        updated_linux = Path(updated_config["GateBinary"]).with_name("agentflow-gate-mcp-linux-" + self.arch)
-        self.assertNotEqual(updated_linux, linux_companion)
-        self.assertEqual(updated_linux.read_bytes(), self.server.artifacts[("linux", "agentflow-gate-mcp")])
+        for name, companion in linux_companions.items():
+            updated_linux = Path(updated_config["RunnerBinary"]).with_name(companion.name)
+            self.assertNotEqual(updated_linux, companion)
+            self.assertEqual(updated_linux.read_bytes(), self.server.artifacts[("linux", name)])
         self.await_condition(lambda: self.server.count("/api/runners/heartbeat") > before_heartbeat,
                              None, "updated real Runner did not reconnect")
         self.assertEqual((install / "state.json").read_bytes(), original_state)
@@ -747,6 +761,7 @@ console.log("INSTALLED_UPDATE_RESUMED");
             self.assertFalse((install / name).exists(), "uninstall retained owned file " + name)
         self.assertFalse(list((install / "bin").rglob("*.exe")))
         self.assertFalse(list((install / "bin").rglob("agentflow-gate-mcp-linux-*")))
+        self.assertFalse(list((install / "bin").rglob("agentflow-runner-linux-*")))
         self.assertEqual(sentinel.read_text(), "retain the user's workspace")
         self.assertTrue((self.workspace / "installed-resume.txt").is_file())
         self.assertEqual(self.server.errors, [])
@@ -767,11 +782,7 @@ console.log("INSTALLED_UPDATE_RESUMED");
         self.assertTrue(powershell, shell + " is required")
         install = self.root / "rebind installation"
         self.addCleanup(self.cleanup_installed_process, install)
-        self.server.artifacts = {
-            ("windows", "agentflow-runner"): self.source_binary.read_bytes(),
-            ("windows", "agentflow-gate-mcp"): self.source_gate.read_bytes(),
-            ("linux", "agentflow-gate-mcp"): self.source_linux_gate.read_bytes(),
-        }
+        self.server.artifacts = self.installer_artifacts()
         sentinel = self.workspace / "retained-on-rebind.txt"
         sentinel.write_text("identity and workspace survive session renewal", encoding="utf-8")
         self.run_installer(
@@ -863,11 +874,7 @@ console.log("REBOUND_TASK_EXECUTED");
         powershell = shutil.which("powershell.exe")
         install = self.root / "delayed rejected installation"
         self.addCleanup(self.cleanup_installed_process, install)
-        self.server.artifacts = {
-            ("windows", "agentflow-runner"): self.source_binary.read_bytes(),
-            ("windows", "agentflow-gate-mcp"): self.source_gate.read_bytes(),
-            ("linux", "agentflow-gate-mcp"): self.source_linux_gate.read_bytes(),
-        }
+        self.server.artifacts = self.installer_artifacts()
         self.server.registration_delay = 6
         self.server.registration_status = 401
         self.server.expected_rejections = True
@@ -883,11 +890,7 @@ console.log("REBOUND_TASK_EXECUTED");
         powershell = shutil.which("powershell.exe")
         install = self.root / "rebind commit failure"
         self.addCleanup(self.cleanup_installed_process, install)
-        self.server.artifacts = {
-            ("windows", "agentflow-runner"): self.source_binary.read_bytes(),
-            ("windows", "agentflow-gate-mcp"): self.source_gate.read_bytes(),
-            ("linux", "agentflow-gate-mcp"): self.source_linux_gate.read_bytes(),
-        }
+        self.server.artifacts = self.installer_artifacts()
         self.run_installer(
             powershell, install, "-ServerUrl", "http://127.0.0.1:%d/api" % self.server.server_port,
             "-BindCode", BIND_CODE, "-CliDirectory", str(self.tools),

@@ -44,24 +44,25 @@ test('AI workbench: a saved conversation is listed, opened, searched, renamed, a
   await search.fill(title);
   await expect(dialog.locator('.search-results button').filter({ hasText: title })).toBeVisible();
   await search.fill(`不存在的会话 ${stamp()}`);
-  await expect(dialog.locator('.search-results')).toContainText('没有匹配的会话');
+  // The workbench translates visible text and keeps the Chinese ARIA labels.
+  await expect(dialog.locator('.search-results .end-label')).toHaveText(/^(?:没有匹配的会话|Nenhuma conversa correspondente)$/);
   await dialog.getByRole('button', { name: '关闭' }).click();
   await expect(dialog).toHaveCount(0);
 
   await row(title).locator('.session-link').click({ button: 'right' });
-  await app.getByRole('menuitem', { name: '重命名' }).click();
+  await app.getByRole('menuitem', { name: /^(?:重命名|Renomear)$/ }).click();
   await dialog.locator('input').fill(renamed);
-  await dialog.getByRole('button', { name: '保存', exact: true }).click();
+  await dialog.getByRole('button', { name: /^(?:保存|Salvar)$/ }).click();
   await expect.poll(async () => (await get(`/api/assistant/sessions/${id}`)).title).toBe(renamed);
   expect((await get(`/api/assistant/sessions/${id}`)).titleEdited).toBe(true);
   await expect(row(renamed)).toBeVisible();
 
   await row(renamed).locator('.session-link').click({ button: 'right' });
-  await app.getByRole('menuitem', { name: '归档' }).click();
+  await app.getByRole('menuitem', { name: /^(?:归档|Arquivar)$/ }).click();
   await expect.poll(async () => (await get(`/api/assistant/sessions/${id}`)).archived).toBe(true);
   await expect(row(renamed)).toHaveCount(0);
   await app.getByRole('button', { name: '筛选会话' }).click();
-  await app.getByRole('menuitemradio', { name: '已归档' }).click();
+  await app.getByRole('menuitemradio', { name: /^(?:已归档|Arquivada)$/ }).click();
   await expect(row(renamed)).toBeVisible();
   // Known defect: when archiving finishes within the menu's 160 ms close
   // animation, the row unmounts first and its context-menu state survives, so
@@ -74,8 +75,8 @@ test('AI workbench: a saved conversation is listed, opened, searched, renamed, a
   }
 
   await row(renamed).locator('.session-link').click({ button: 'right' });
-  await app.getByRole('menuitem', { name: '删除' }).click();
-  await dialog.getByRole('button', { name: '删除', exact: true }).click();
+  await app.getByRole('menuitem', { name: /^(?:删除|Excluir)$/ }).click();
+  await dialog.getByRole('button', { name: /^(?:删除|Excluir)$/ }).click();
   await expect.poll(async () => (await api('GET', `/api/assistant/sessions/${id}`, undefined, { expect: [200, 404], raw: true })).status).toBe(404);
   await expect(row(renamed)).toHaveCount(0);
   expect(errors).toEqual([]);
