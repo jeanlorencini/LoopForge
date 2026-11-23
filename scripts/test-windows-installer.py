@@ -49,13 +49,14 @@ class WindowsInstallerTest(unittest.TestCase):
             fixture.write_bytes(binary)
             self.artifacts[name] = hashlib.sha256(binary).hexdigest()
         for architecture, machine in (("amd64", 62), ("arm64", 183)):
-            binary = bytearray(128)
-            binary[:7] = b"\x7fELF\x02\x01\x01"
-            struct.pack_into("<HHI", binary, 16, 2, machine, 1)
-            name = "agentflow-gate-mcp-linux-" + architecture
-            binary[64:64 + len(name)] = name.encode()
-            (self.root / (name + ".fixture")).write_bytes(binary)
-            self.artifacts[name] = hashlib.sha256(binary).hexdigest()
+            for executable in ("agentflow-gate-mcp", "agentflow-runner"):
+                binary = bytearray(128)
+                binary[:7] = b"\x7fELF\x02\x01\x01"
+                struct.pack_into("<HHI", binary, 16, 2, machine, 1)
+                name = executable + "-linux-" + architecture
+                binary[64:64 + len(name)] = name.encode()
+                (self.root / (name + ".fixture")).write_bytes(binary)
+                self.artifacts[name] = hashlib.sha256(binary).hexdigest()
         self.mock = self.root / "mock.ps1"
         self.mock.write_text(r'''
 $ErrorActionPreference='Stop'
@@ -114,8 +115,8 @@ function Get-Fixture {
  if($Uri -match ('^'+[regex]::Escape($global:testServerUrl)+'/runners/(agentflow-runner|agentflow-gate-mcp)\?os=windows&arch='+$architecture+'(?:&metadata=1)?$')){
    return Join-Path $env:LOOPFORGE_TEST_ROOT ($Matches[1]+'.fixture')
  }
- if($Uri -match ('^'+[regex]::Escape($global:testServerUrl)+'/runners/agentflow-gate-mcp\?os=linux&arch='+$architecture+'(?:&metadata=1)?$')){
-   return Join-Path $env:LOOPFORGE_TEST_ROOT ('agentflow-gate-mcp-linux-'+$architecture+'.fixture')
+ if($Uri -match ('^'+[regex]::Escape($global:testServerUrl)+'/runners/(agentflow-runner|agentflow-gate-mcp)\?os=linux&arch='+$architecture+'(?:&metadata=1)?$')){
+   return Join-Path $env:LOOPFORGE_TEST_ROOT ($Matches[1]+'-linux-'+$architecture+'.fixture')
  }
  throw ('unexpected download endpoint: '+$Uri+' (expected platform '+$global:testServerUrl+')')
 }
@@ -194,8 +195,13 @@ function Start-Process {
  if(Test-Path -LiteralPath Env:AGENTFLOW_MANAGED_CLI_ROOT){throw 'managed CLI root inherited'}
  if((Get-Item -LiteralPath $env:PATH.Split([IO.Path]::PathSeparator)[0]).FullName -ine (Get-Item -LiteralPath (Join-Path $env:LOOPFORGE_TEST_ROOT 'custom cli')).FullName){throw 'custom CLI path not prepended'}
  if(-not(Test-Path -LiteralPath $env:AGENTFLOW_GATE_MCP_BINARY) -or (Split-Path -Parent $env:AGENTFLOW_GATE_MCP_BINARY) -cne (Split-Path -Parent $FilePath)){throw 'wrong Gate bundle'}
- $linuxGate=Join-Path (Split-Path -Parent $FilePath) ('agentflow-gate-mcp-linux-'+$env:PROCESSOR_ARCHITEW6432.ToLowerInvariant())
- if((Split-Path -Leaf (Split-Path -Parent $FilePath)) -match '^[a-f0-9]{16}-[a-f0-9]{16}-[a-f0-9]{16}$' -and -not(Test-Path -LiteralPath $linuxGate)){throw 'Linux Gate companion missing'}
+ $bundle=Split-Path -Parent $FilePath
+ $bundleName=Split-Path -Leaf $bundle
+ $architecture=$env:PROCESSOR_ARCHITEW6432.ToLowerInvariant()
+ $linuxGate=Join-Path $bundle ('agentflow-gate-mcp-linux-'+$architecture)
+ $linuxRunner=Join-Path $bundle ('agentflow-runner-linux-'+$architecture)
+ if($bundleName -match '^[a-f0-9]{16}(?:-[a-f0-9]{16}){2,3}$' -and -not(Test-Path -LiteralPath $linuxGate)){throw 'Linux Gate companion missing'}
+ if($bundleName -match '^[a-f0-9]{16}(?:-[a-f0-9]{16}){3}$' -and -not(Test-Path -LiteralPath $linuxRunner)){throw 'Linux Runner companion missing'}
  if($env:AGENTFLOW_SERVER_URL -ne $global:testServerUrl){throw 'incorrect server'}
  if($ArgumentList -contains 'fixture-binding-code'){throw 'binding code exposed in process arguments'}
  if($global:testCaptureArguments){
@@ -337,7 +343,7 @@ foreach($url in @('https://platform.example.test','https://192.168.1.10:8443/api
  $config=Get-Content -LiteralPath (Join-Path $initial.InstallDirectory 'config.json') -Raw|ConvertFrom-Json
  if($config.ServerUrl -cne $global:testServerUrl){throw 'accepted platform URL or API prefix changed'}
 }
-if($global:testDownloads -ne 18 -or $global:testLaunches -ne 0){throw 'accepted URL did not use all validated artifact endpoints'}
+if($global:testDownloads -ne 24 -or $global:testLaunches -ne 0){throw 'accepted URL did not use all validated artifact endpoints'}
 ''')
 
     def test_legacy_http_configuration_allows_only_offline_stop_and_local_cleanup(self):
@@ -366,7 +372,7 @@ if($global:testRunning -or $global:testStops -ne 1 -or -not(Test-Path -LiteralPa
 & $installer -InstallDirectory $install -Uninstall -LocalOnly
 if(Test-Path -LiteralPath $configPath){throw 'legacy HTTP local uninstall retained managed configuration'}
 if(-not(Test-Path -LiteralPath (Join-Path $workspace 'retained.txt'))){throw 'legacy HTTP local cleanup removed workspace'}
-if($global:testDownloads -ne 3 -or $global:testLaunches -ne 1 -or $global:testDeregisters -ne 0){throw 'legacy HTTP offline cleanup performed an online operation'}
+if($global:testDownloads -ne 4 -or $global:testLaunches -ne 1 -or $global:testDeregisters -ne 0){throw 'legacy HTTP offline cleanup performed an online operation'}
 ''')
 
     def test_explicit_legacy_http_url_only_allows_offline_cleanup_without_requests(self):
@@ -397,7 +403,7 @@ if($global:testRunning -or $global:testStops -ne 1 -or -not(Test-Path -LiteralPa
 & $installer -ServerUrl $legacyUrl -InstallDirectory $install -Uninstall -LocalOnly
 if(Test-Path -LiteralPath $configPath){throw 'explicit legacy HTTP local uninstall retained configuration'}
 if(-not(Test-Path -LiteralPath (Join-Path $workspace 'retained.txt'))){throw 'explicit legacy HTTP cleanup removed workspace'}
-if($global:testOfflineRequests -ne 0 -or $global:testDownloads -ne 3 -or $global:testLaunches -ne 1 -or $global:testDeregisters -ne 0){throw 'explicit legacy HTTP cleanup performed an online operation'}
+if($global:testOfflineRequests -ne 0 -or $global:testDownloads -ne 4 -or $global:testLaunches -ne 1 -or $global:testDeregisters -ne 0){throw 'explicit legacy HTTP cleanup performed an online operation'}
 ''')
 
     def test_standalone_installation_with_short_path_alias(self):
@@ -424,10 +430,10 @@ if($global:testOfflineRequests -ne 0 -or $global:testDownloads -ne 3 -or $global
         self.run_ps(r'''
 & $installer @initial
 Assert-RestoredEnvironment
-if($global:testLaunches -ne 1 -or $global:testDownloads -ne 3){throw 'unexpected install operations'}
+if($global:testLaunches -ne 1 -or $global:testDownloads -ne 4){throw 'unexpected install operations'}
 # 运行中重复接入不得下载、覆盖或启动第二个进程。
 & $installer @initial
-if($global:testLaunches -ne 1 -or $global:testDownloads -ne 3){throw 'running installation was changed'}
+if($global:testLaunches -ne 1 -or $global:testDownloads -ne 4){throw 'running installation was changed'}
 & $installer -ServerUrl 'https://platform.example.test/' -InstallDirectory $install -Stop
 if($global:testStops -ne 1){throw 'owned runner not stopped'}
 if(Test-Path (Join-Path $install 'process.json')){throw 'PID record retained'}
@@ -444,9 +450,12 @@ if($global:testLaunches -ne 2){throw 'saved installation did not restart'}
         for name, field in (("agentflow-runner", "RunnerBinary"), ("agentflow-gate-mcp", "GateBinary")):
             self.assertEqual(hashlib.sha256(Path(config[field]).read_bytes()).hexdigest(), self.artifacts[name])
             self.assertTrue(Path(config[field]).resolve().is_relative_to((self.install / "bin").resolve()))
-        linux_gate = Path(config["GateBinary"]).with_name("agentflow-gate-mcp-linux-amd64")
-        self.assertEqual(hashlib.sha256(linux_gate.read_bytes()).hexdigest(), self.artifacts[linux_gate.name])
-        self.assertEqual(Path(config["RunnerBinary"]).parent.name, "-".join(self.artifacts[name][:16] for name in ("agentflow-runner", "agentflow-gate-mcp", linux_gate.name)))
+        linux_names = ("agentflow-gate-mcp-linux-amd64", "agentflow-runner-linux-amd64")
+        for name in linux_names:
+            binary = Path(config["RunnerBinary"]).with_name(name)
+            self.assertEqual(hashlib.sha256(binary.read_bytes()).hexdigest(), self.artifacts[name])
+        artifact_names = ("agentflow-runner", "agentflow-gate-mcp", *linux_names)
+        self.assertEqual(Path(config["RunnerBinary"]).parent.name, "-".join(self.artifacts[name][:16] for name in artifact_names))
         self.assertEqual((self.install / "install.ps1").read_bytes(), self.installer.read_bytes())
 
     def test_bad_checksum_preserves_installed_files_and_configuration(self):
@@ -493,7 +502,7 @@ $rejected=$false
 try { & $installer -InstallDirectory $install -BindCode 'different-code' }
 catch {if($_.Exception.Message -like '*already bound*'){$rejected=$true}else{throw}}
 if(-not $rejected){throw 'saved account binding silently reused'}
-if($global:testDownloads -ne 3 -or $global:testLaunches -ne 0){throw 'conflicting setup performed operations'}
+if($global:testDownloads -ne 4 -or $global:testLaunches -ne 0){throw 'conflicting setup performed operations'}
 if([IO.File]::ReadAllText((Join-Path $install 'config.json')) -cne $before){throw 'conflicting setup changed configuration'}
 if(-not(Test-Path -LiteralPath $statePath)){throw 'state removed'}
 ''')
@@ -527,7 +536,7 @@ if($launched.bootstrap -cne 'fixture-renewed-binding-code' -or $after.bootstrapT
 foreach($key in @('ServerUrl','WorkspaceRoot','CliDirectory','Name','Concurrency','RunnerBinary','GateBinary')){if($after.$key -cne $before.$key){throw 'rebind changed saved installation options'}}
 if(($after.PathEntries -join ';') -cne ($before.PathEntries -join ';')){throw 'rebind changed tool directories'}
 if((Get-Content -LiteralPath (Join-Path $workspace 'work.txt') -Raw).Trim() -cne 'keep-work' -or (Get-Content -LiteralPath $login -Raw).Trim() -cne 'keep-login'){throw 'rebind changed work or CLI login'}
-if($global:testLaunches -ne 1 -or $global:testDownloads -ne 6 -or $global:testReadyProbes -ne 1 -or -not $global:testRunning){throw 'rebind did not validate bundle and confirm a running session'}
+if($global:testLaunches -ne 1 -or $global:testDownloads -ne 8 -or $global:testReadyProbes -ne 1 -or -not $global:testRunning){throw 'rebind did not validate bundle and confirm a running session'}
 Assert-RestoredEnvironment
 '''.replace("INSTALL_NAME", "expired" if expiry.startswith("2000") else "revoked").replace("OLD_EXPIRY", expiry))
 
@@ -552,13 +561,13 @@ foreach($arguments in @(
  $arguments.InstallDirectory=$install
  $rejected=$false
  try{& $installer @arguments}catch{$rejected=$true}
- if(-not $rejected -or $global:testDownloads -ne 3 -or $global:testLaunches -ne 0){throw 'invalid rebind performed operations'}
+ if(-not $rejected -or $global:testDownloads -ne 4 -or $global:testLaunches -ne 0){throw 'invalid rebind performed operations'}
  if([IO.File]::ReadAllText($configPath) -cne $before -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($statePath)) -cne $stateBefore){throw 'invalid rebind changed saved data'}
 }
 '{"sessionToken":"old-token"}'|Set-Content -LiteralPath $statePath
 $rejected=$false
 try{& $installer -InstallDirectory $install -Rebind -BindCode 'fixture-renewed-binding-code'}catch{$rejected=$true}
-if(-not $rejected -or $global:testDownloads -ne 3 -or $global:testLaunches -ne 0){throw 'rebind without saved identity was accepted'}
+if(-not $rejected -or $global:testDownloads -ne 4 -or $global:testLaunches -ne 0){throw 'rebind without saved identity was accepted'}
 ''')
 
     def test_rebind_rejects_running_machine_before_downloading_or_stopping(self):
@@ -570,7 +579,7 @@ $before=[IO.File]::ReadAllText($configPath)
 $stateBefore=[Convert]::ToBase64String([IO.File]::ReadAllBytes($statePath))
 $rejected=$false
 try{& $installer -InstallDirectory $install -Rebind -BindCode 'fixture-renewed-binding-code'}catch{$rejected=$true}
-if(-not $rejected -or $global:testDownloads -ne 3 -or $global:testLaunches -ne 1 -or $global:testStops -ne 0 -or -not $global:testRunning){throw 'running rebind interrupted the machine'}
+if(-not $rejected -or $global:testDownloads -ne 4 -or $global:testLaunches -ne 1 -or $global:testStops -ne 0 -or -not $global:testRunning){throw 'running rebind interrupted the machine'}
 if([IO.File]::ReadAllText($configPath) -cne $before -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($statePath)) -cne $stateBefore){throw 'running rebind changed credentials'}
 ''')
 
@@ -824,7 +833,7 @@ Set-NewArtifact
 $global:testGateDownloadFailure=$true
 $rejected=$false
 try{& $installer -InstallDirectory $install -Update}catch{if($_.Exception.Message -like '*Gate download failure*'){$rejected=$true}else{throw}}
-if(-not $rejected -or $global:testDownloads -ne 5 -or $global:testStops -ne 0 -or $global:testLaunches -ne 1 -or -not $global:testRunning){throw 'Gate failure interrupted previous runner'}
+if(-not $rejected -or $global:testDownloads -ne 6 -or $global:testStops -ne 0 -or $global:testLaunches -ne 1 -or -not $global:testRunning){throw 'Gate failure interrupted previous runner'}
 if([IO.File]::ReadAllText($configPath) -cne $before -or -not(Test-Path -LiteralPath $old.RunnerBinary) -or -not(Test-Path -LiteralPath $old.GateBinary)){throw 'Gate failure altered installed bundle'}
 if(@(Get-ChildItem -LiteralPath $install -Filter '.download-*').Count){throw 'Gate failure retained staged download'}
 ''')
@@ -879,7 +888,7 @@ if(-not(Test-Path -LiteralPath $oldLinux)){throw 'Linux-only rollback lost origi
 $after=Get-Content -LiteralPath $configPath -Raw|ConvertFrom-Json
 $oldVersion=(Split-Path -Leaf (Split-Path -Parent $old.RunnerBinary)).Split('-')
 $newVersion=(Split-Path -Leaf (Split-Path -Parent $after.RunnerBinary)).Split('-')
-if($oldVersion[0] -cne $newVersion[0] -or $oldVersion[1] -cne $newVersion[1] -or $oldVersion[2] -ceq $newVersion[2]){throw 'Linux helper digest not represented in bundle identity'}
+if($oldVersion[0] -cne $newVersion[0] -or $oldVersion[1] -cne $newVersion[1] -or $oldVersion[2] -ceq $newVersion[2] -or $oldVersion[3] -cne $newVersion[3]){throw 'Linux helper digest not represented in bundle identity'}
 if($global:testLaunches -ne 4 -or $global:testStops -ne 2 -or -not $global:testRunning){throw 'Linux-only update process lifecycle incorrect'}
 if([IO.File]::ReadAllText((Join-Path $install 'state.json')) -cne $stateBefore){throw 'Linux-only update reset identity'}
 if(-not(Test-Path -LiteralPath $old.RunnerBinary) -or -not(Test-Path -LiteralPath $old.GateBinary) -or -not(Test-Path -LiteralPath $oldLinux)){throw 'Linux-only update removed old bundle'}
@@ -898,8 +907,10 @@ Assert-RestoredEnvironment
 & $installer @initial
 $config=Get-Content -LiteralPath (Join-Path $install 'config.json') -Raw|ConvertFrom-Json
 $bundle=Split-Path -Parent $config.RunnerBinary
-if(-not(Test-Path -LiteralPath (Join-Path $bundle 'agentflow-gate-mcp-linux-arm64')) -or (Test-Path -LiteralPath (Join-Path $bundle 'agentflow-gate-mcp-linux-amd64'))){throw 'incorrect Linux companion architecture installed'}
-if($global:testDownloads -ne 3 -or $global:testLaunches -ne 1){throw 'ARM64 bundle did not install'}
+foreach($prefix in @('agentflow-gate-mcp-linux-','agentflow-runner-linux-')){
+ if(-not(Test-Path -LiteralPath (Join-Path $bundle ($prefix+'arm64'))) -or (Test-Path -LiteralPath (Join-Path $bundle ($prefix+'amd64')))){throw 'incorrect Linux companion architecture installed'}
+}
+if($global:testDownloads -ne 4 -or $global:testLaunches -ne 1){throw 'ARM64 bundle did not install'}
 ''')
 
     def test_upgrade_and_uninstall_recognize_previous_two_digest_bundles(self):
@@ -920,7 +931,7 @@ $config.GateBinary=$oldGate
 $config|ConvertTo-Json|Set-Content -LiteralPath $configPath
 & $installer -InstallDirectory $install -Update
 $after=Get-Content -LiteralPath $configPath -Raw|ConvertFrom-Json
-if((Split-Path -Leaf (Split-Path -Parent $after.RunnerBinary)) -notmatch '^[a-f0-9]{16}-[a-f0-9]{16}-[a-f0-9]{16}$'){throw 'legacy installation did not gain complete bundle'}
+if((Split-Path -Leaf (Split-Path -Parent $after.RunnerBinary)) -notmatch '^[a-f0-9]{16}(?:-[a-f0-9]{16}){3}$'){throw 'legacy installation did not gain complete bundle'}
 if($global:testLaunches -ne 0){throw 'legacy stopped update started runner'}
 & $installer -InstallDirectory $install -Uninstall
 if((Test-Path -LiteralPath $oldRunner) -or (Test-Path -LiteralPath $oldGate) -or -not(Test-Path -LiteralPath (Join-Path $oldDirectory 'user-file.txt'))){throw 'legacy bundle cleanup removed wrong files'}
@@ -981,7 +992,8 @@ New-Item -ItemType Directory -Path $workspace|Out-Null
 foreach($name in @('stdout.log','stderr.log')){'log'|Set-Content -LiteralPath (Join-Path $install $name)}
 & $installer -InstallDirectory $install -Uninstall
 if($global:testDeregisters -ne 1 -or $global:testStops -ne 1 -or $global:testWaits -ne 1){throw 'uninstall ordering incorrect'}
-foreach($path in @($before.RunnerBinary,$before.GateBinary,(Join-Path (Split-Path -Parent $before.GateBinary) 'agentflow-gate-mcp-linux-amd64'),$configPath,(Join-Path $install 'state.json'),(Join-Path $install 'process.json'),(Join-Path $install 'install.ps1'),(Join-Path $install 'stdout.log'),(Join-Path $install 'stderr.log'))){if(Test-Path -LiteralPath $path){throw 'managed file retained'}}
+$bundle=Split-Path -Parent $before.RunnerBinary
+foreach($path in @($before.RunnerBinary,$before.GateBinary,(Join-Path $bundle 'agentflow-gate-mcp-linux-amd64'),(Join-Path $bundle 'agentflow-runner-linux-amd64'),$configPath,(Join-Path $install 'state.json'),(Join-Path $install 'process.json'),(Join-Path $install 'install.ps1'),(Join-Path $install 'stdout.log'),(Join-Path $install 'stderr.log'))){if(Test-Path -LiteralPath $path){throw 'managed file retained'}}
 foreach($path in @((Join-Path $workspace 'work.txt'),(Join-Path $install 'unrelated.txt'),(Join-Path (Split-Path -Parent $before.RunnerBinary) 'user-file.txt'))){if(-not(Test-Path -LiteralPath $path)){throw 'user file removed'}}
 & $installer -InstallDirectory $install -Uninstall
 if($global:testDeregisters -ne 1 -or $global:testStops -ne 1){throw 'repeated uninstall performed operations'}

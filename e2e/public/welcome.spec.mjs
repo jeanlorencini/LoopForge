@@ -58,12 +58,12 @@ test('home starters prepare a question or open quick access without calling a mo
   await signInUnconfigured(page);
   const input=await openHome(page);
   const frame=chat(page);
-  await frame.locator('.home-starter').filter({hasText:'选用 SOP 与角色'}).click();
+  await frame.locator('.home-starter').filter({hasText:/选用 SOP 与角色|Escolher SOP e papéis/}).click();
   await expect(input).toHaveValue(/SOP/);
   await expect(input).toBeFocused();
   await input.fill('');
-  await frame.locator('.home-starter').filter({hasText:'快速接入'}).click();
-  const wizard=frame.getByRole('dialog',{name:'快速接入'});
+  await frame.locator('.home-starter').filter({hasText:/快速接入|Início rápido/}).click();
+  const wizard=frame.getByRole('dialog',{name:/^(?:快速接入|Início rápido)$/});
   await expect(wizard).toBeVisible();
   await page.keyboard.press('Escape');
   await expect(wizard).toBeHidden();
@@ -79,7 +79,7 @@ test('sending without a model key is refused before any request, with a way to c
   const text='No key yet: this must be refused before any model runs.';
   await input.fill(text);
   await frame.locator('.send-button').click();
-  const configure=frame.getByRole('button',{name:'去配置 CodeBuddy API Key'});
+  const configure=frame.getByRole('button',{name:/^(?:去配置|Configurar) CodeBuddy API Key$/});
   await expect(configure).toBeVisible();
   await expect(input).toHaveValue(text);
   expect(writes).toBe(0);

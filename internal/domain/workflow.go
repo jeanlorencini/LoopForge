@@ -173,6 +173,9 @@ type WorkflowDefinition struct {
 	SOPLane      string                `json:"sopLane,omitempty"`
 	Generic      bool                  `json:"generic,omitempty"`
 	Requirements []WorkflowRequirement `json:"requirements,omitempty"`
+	// SingleRepository requires one checkout for workflows whose scripts work
+	// in a single repository.
+	SingleRepository bool `json:"singleRepository,omitempty"`
 	// SandboxSnapshot is populated only on Run.WorkflowSnapshot. It freezes
 	// the resolved profile plus Dockerfile/environment payload so retries can
 	// reconstruct the original environment after catalog definitions change.
@@ -184,6 +187,13 @@ type WorkflowDefinition struct {
 	Edges     []WorkflowEdge   `json:"edges"`
 	CreatedAt time.Time        `json:"createdAt"`
 	UpdatedAt time.Time        `json:"updatedAt"`
+}
+
+func (w WorkflowDefinition) ValidateRepositoryCount(count int) error {
+	if w.SingleRepository && count != 1 {
+		return fmt.Errorf("SOP %q requires exactly one repository (selected %d)", w.Name, count)
+	}
+	return nil
 }
 
 // UnmarshalJSON migrates the pre-workflow-sandbox shape while the legacy node

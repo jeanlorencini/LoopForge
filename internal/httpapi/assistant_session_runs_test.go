@@ -27,7 +27,7 @@ func TestRunSessionDisplayTitleSaysWhatTheRunDoes(t *testing.T) {
 		{"multi-line requirement title", backend, repo.SidebarIssue{Number: 1, Title: "【显式分支验收】test-branch\r\n只在 agent-test 仓库"}, "#1 【显式分支验收】test-branch"},
 		{"task text", withInput, repo.SidebarIssue{}, "在 agent-test 仓库根目录的 README.md 末尾追加一行"},
 		{"long task text", repo.SidebarRunMeta{Input: strings.Repeat("改", 70)}, repo.SidebarIssue{}, strings.Repeat("改", runHeadlineRunes) + "…"},
-		{"nothing but the SOP", backend, repo.SidebarIssue{}, "通用后端交付 · 10月22日 17:36"},
+		{"nothing but the SOP", backend, repo.SidebarIssue{}, "通用后端交付 · 10月22日 06:36"},
 		{"no start time", repo.SidebarRunMeta{WorkflowName: "MCP测试"}, repo.SidebarIssue{}, "MCP测试"},
 		{"no name at all", repo.SidebarRunMeta{}, repo.SidebarIssue{}, "SOP 运行"},
 	}
@@ -68,8 +68,8 @@ func TestRunSessionTitlesStayDistinct(t *testing.T) {
 	}
 	want := []string{
 		"#24 登录改版 · 通用产品交付",
-		"#24 登录改版 · 通用后端交付 · 11月3日 11:05",
-		"#24 登录改版 · 通用后端交付 · 11月3日 12:05",
+		"#24 登录改版 · 通用后端交付 · 11月3日 00:05",
+		"#24 登录改版 · 通用后端交付 · 11月3日 01:05",
 		"#25 导出报表",
 		"",
 	}
@@ -94,7 +94,7 @@ func TestRunSessionTitlesStayDistinct(t *testing.T) {
 	for _, v := range views {
 		got = append(got, v.DisplayTitle)
 	}
-	want = []string{"AI 门禁测试 · 10月13日 10:15:07", "AI 门禁测试 · 10月13日 10:15:38", "AI 门禁测试 · 10月13日 11:15"}
+	want = []string{"AI 门禁测试 · 10月12日 23:15:07", "AI 门禁测试 · 10月12日 23:15:38", "AI 门禁测试 · 10月13日 00:15"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("same-minute titles:\n got %q\nwant %q", got, want)
 	}
@@ -240,7 +240,7 @@ func TestAssistantSessionListDecoratesRunSessions(t *testing.T) {
 		t.Fatalf("discussed run decoration: %+v", discussed)
 	}
 
-	if got := byID[repo.RunAssistantSessionID(bare.ID)].title; got != "模拟90s流程 · 10月14日 15:11" {
+	if got := byID[repo.RunAssistantSessionID(bare.ID)].title; got != "模拟90s流程 · 10月14日 04:11" {
 		t.Fatalf("SOP-only run title=%q", got)
 	}
 

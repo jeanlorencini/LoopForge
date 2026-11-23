@@ -18,7 +18,7 @@ test('a user without model credentials can draft, configure credentials and retu
     const notice=chat(page).locator('.credential-notice');
     await expect(notice).toBeVisible();
     await expect(notice).toContainText('CodeBuddy API Key');
-    await notice.getByRole('button',{name:'去配置'}).click();
+    await notice.getByRole('button',{name:/^(?:去配置|Configurar)$/}).click();
     await expect(page).toHaveURL(/#\/settings/);
     const wizard=page.locator('#credentialWizard');
     const pane=wizard.locator('.credential-pane:not(.is-leaving)');

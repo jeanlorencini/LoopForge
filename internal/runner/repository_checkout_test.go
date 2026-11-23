@@ -240,6 +240,17 @@ func TestPreparationRefreshKeepsCheckoutWhenCloneFails(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(workspace, "README.md")); err != nil {
 		t.Fatal(err)
 	}
+	runGitT(t, remote, "update-ref", "-d", "refs/heads/master")
+	inv.Repositories[0].CloneURL = remote
+	if err := checkoutInvocationRepositories(context.Background(), workspace, inv, true); err == nil {
+		t.Fatal("refresh unexpectedly initialized a remote emptied after checkout")
+	}
+	if got := runGitT(t, workspace, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("refresh changed the original checkout to %q", got)
+	}
+	if refs := runGitT(t, remote, "for-each-ref", "--format=%(refname)"); refs != "" {
+		t.Fatalf("refresh created remote refs: %q", refs)
+	}
 }
 
 func TestCanceledCloneStopsGitChildren(t *testing.T) {
@@ -253,7 +264,7 @@ func TestCanceledCloneStopsGitChildren(t *testing.T) {
 	t.Setenv("CHECKOUT_CHILD_MARKER", marker)
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
-	if err := cloneRepository(ctx, t.TempDir(), &domain.RunnerRepository{CloneURL: "test-remote", Ref: "master"}); err == nil {
+	if err := cloneRepository(ctx, t.TempDir(), &domain.RunnerRepository{CloneURL: "test-remote", Ref: "master"}, true); err == nil {
 		t.Fatal("canceled clone succeeded")
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -278,7 +289,7 @@ func TestCheckoutRepositoryRejectsCommandRunningCloneURLs(t *testing.T) {
 func TestCloneFailureNeverEchoesCloneURLCredentials(t *testing.T) {
 	// Port 1 on loopback refuses at once; git echoes the URL in its error.
 	cloneURL := "http://user:s3cret-token@127.0.0.1:1/acme/app.git"
-	err := cloneRepository(context.Background(), t.TempDir(), &domain.RunnerRepository{CloneURL: cloneURL, Ref: "master"})
+	err := cloneRepository(context.Background(), t.TempDir(), &domain.RunnerRepository{CloneURL: cloneURL, Ref: "master"}, true)
 	if err == nil {
 		t.Fatal("clone of an unreachable remote succeeded")
 	}

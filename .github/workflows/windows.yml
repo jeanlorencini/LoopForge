@@ -34,6 +34,7 @@ jobs:
           "LOOPFORGE_TEST_RUNNER_BINARY=$(Join-Path $binaryRoot 'agentflow-runner.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "LOOPFORGE_TEST_GATE_BINARY=$(Join-Path $binaryRoot 'agentflow-gate-mcp.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "LOOPFORGE_TEST_LINUX_GATE_BINARY=$(Join-Path $binaryRoot 'agentflow-gate-mcp-linux-amd64')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LOOPFORGE_TEST_LINUX_RUNNER_BINARY=$(Join-Path $binaryRoot 'agentflow-runner-linux-amd64')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Expose the native Git for Windows shell to integration tests
         shell: pwsh
         run: |
@@ -56,7 +57,7 @@ jobs:
           npm --prefix chatbot run build
       - name: Verify Runner domain and CLI contracts
         run: go test ./internal/domain ./cmd/agentflow-runner -count=1
-      - name: Build the native Windows Runner and Gate helper
+      - name: Build the Windows binaries and their Linux companions
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force (Split-Path $env:LOOPFORGE_TEST_RUNNER_BINARY) | Out-Null
@@ -67,6 +68,8 @@ jobs:
           $env:GOOS = 'linux'
           try {
             go build -o $env:LOOPFORGE_TEST_LINUX_GATE_BINARY ./cmd/agentflow-gate-mcp
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            go build -o $env:LOOPFORGE_TEST_LINUX_RUNNER_BINARY ./cmd/agentflow-runner
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } finally { Remove-Item Env:GOOS }
       - name: Verify Windows execution, process trees, filesystem boundaries and downloads

@@ -1,8 +1,11 @@
+import fs from 'node:fs';
 import {test,expect} from '@playwright/test';
 import {signInUnconfigured, switchProject, chat, openHome, fitsFrame} from './helpers.mjs';
 
 // Real reference APIs, no model calls. Keep credentials out of trace artifacts.
 test.use({trace:'off',screenshot:'off'});
+
+const pt = JSON.parse(fs.readFileSync(new URL('../../chatbot/src/i18n-pt-dict.json',import.meta.url),'utf8'));
 
 for(const variant of [
   {name:'desktop',width:1600,height:1000,lang:'zh',theme:'light'},
@@ -25,26 +28,29 @@ for(const variant of [
     await expect(picker).toBeVisible();
     await expect.poll(()=>fitsFrame(picker)).toBe(true);
     await expect(options).toHaveCount(6);
-    await expect(options.filter({hasText:'技能'})).toHaveCount(1);
+    await expect(options.locator('strong').filter({hasText:/^(?:技能|Skill)$/})).toHaveCount(1);
     await page.screenshot({path:info.outputPath(`references-${variant.name}.png`)});
     const loading=page.waitForResponse(r=>{const u=new URL(r.url());return u.pathname==='/api/assistant/references'&&u.searchParams.get('type')==='sop'&&!u.searchParams.get('q')});
     await options.filter({hasText:'SOP'}).first().click();
     const loaded=await loading;expect(loaded.ok()).toBe(true);
     const data=await loaded.json(),items=Array.isArray(data)?data:data.items;
     expect(items.length).toBeGreaterThan(0);
-    await expect(options.first().locator('strong')).toHaveText(items[0].name||items[0].id);
+    const name=items[0].name||items[0].id;
+    const escapeName=value=>value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+    const displayNames=[name,pt[name]].filter(Boolean).map(escapeName).join('|');
+    const displayName=new RegExp(`^(?:${displayNames})$`);
+    await expect(options.first().locator('strong')).toHaveText(displayName);
     await expect.poll(()=>fitsFrame(picker)).toBe(true);
     // Search a real SOP and select it; the test does not run the referenced SOP.
-    const name=items[0].name||items[0].id;
     const searched=page.waitForResponse(r=>{const u=new URL(r.url());return u.pathname==='/api/assistant/references'&&u.searchParams.get('q')===name});
     await picker.locator('input[aria-label="搜索引用对象"]').fill(name);
     expect((await searched).ok()).toBe(true);
-    await expect(options.first()).toContainText(name);
+    await expect(options.first().locator('strong')).toHaveText(displayName);
     await expect.poll(()=>fitsFrame(picker)).toBe(true);
     await options.first().click();
     await expect(picker).toBeHidden();
-    await expect(input).toHaveValue(new RegExp('@'+name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+' '));
-    await expect(frame.locator('.composer-attachments')).toContainText('@'+name);
+    await expect(input).toHaveValue(new RegExp('@'+escapeName(name)+' '));
+    await expect(frame.locator('.composer-attachments')).toContainText(new RegExp(`@(?:${displayNames})`));
     // A resize while the picker is open keeps it inside the frame.
     await input.fill(await input.inputValue()+'@');
     await expect(picker).toBeVisible();

@@ -116,8 +116,9 @@ func (h *runsHandlers) runs(c *gin.Context) {
 			}
 		}
 		workflowProject := ""
-		if workflow, ok := h.repo.Workflow(strings.TrimSpace(req.WorkflowID)); ok && !workflow.Shared && !workflow.Generic {
-			workflowProject = workflow.ProjectID
+		wf, workflowFound := h.repo.Workflow(strings.TrimSpace(req.WorkflowID))
+		if workflowFound && !wf.Shared && !wf.Generic {
+			workflowProject = wf.ProjectID
 		}
 		if !h.requireProjectWriter(c, req.ProjectID, workflowProject) {
 			return
@@ -133,7 +134,7 @@ func (h *runsHandlers) runs(c *gin.Context) {
 			return
 		}
 		var repositories []domain.RepositoryContext
-		if wf, ok := h.repo.Workflow(req.WorkflowID); ok && wf.Generic && strings.TrimSpace(project.DefaultRepositoryID) != "" {
+		if workflowFound && (wf.Generic || wf.SingleRepository) && strings.TrimSpace(project.DefaultRepositoryID) != "" {
 			repositoryID := strings.TrimSpace(project.DefaultRepositoryID)
 			repoDef, found := h.repo.Repository(repositoryID)
 			if !found || repoDef.ProjectID != req.ProjectID {
@@ -141,6 +142,12 @@ func (h *runsHandlers) runs(c *gin.Context) {
 				return
 			}
 			repositories = []domain.RepositoryContext{repositoryRunContext(repoDef)}
+		}
+		if workflowFound {
+			if err := wf.ValidateRepositoryCount(len(repositories)); err != nil {
+				c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
 		}
 		v, err := h.engine.StartWithRepositoriesContext(req.WorkflowID, req.Input, repositories, domain.TelemetryContext{ProjectID: req.ProjectID, ResponsibleUserID: responsibleUserID})
 		if err != nil {

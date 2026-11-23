@@ -840,6 +840,9 @@ func (e *Engine) RefreshRunSOP(runID string) error {
 	if previousVersion == latest.Version && previousRevision == latest.Revision {
 		return nil
 	}
+	if err := latest.ValidateRepositoryCount(len(r.RepositoryContexts())); err != nil {
+		return err
+	}
 	// A graph/role update must not silently replace the environment underneath
 	// an existing workspace. A new Run will pick up the latest sandbox asset.
 	latest.SandboxProfileID = r.WorkflowSnapshot.SandboxProfileID

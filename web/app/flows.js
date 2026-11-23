@@ -125,6 +125,7 @@ function renderFlowHeader(){
     if(label)label.textContent=sb?.name||wf?.sandboxProfileId||'未设置沙箱';
   }
   const ro=flowReadOnly(wf),pending=!!(wf&&state.workflowDirty&&!ro);
+  $('#workflowSingleRepository').disabled=!wf||ro;
   const save=$('#saveWorkflow');
   if(save){
     save.disabled=!pending;save.classList.toggle('dirty',pending);
@@ -142,6 +143,7 @@ function renderFlowHeader(){
 function renderWorkflowMeta(){
   const workflows=catalogWorkflows();
   const wf=state.workflow;
+  $('#workflowSingleRepository').checked=!!wf?.singleRepository;
   // Generic templates and an unsaved AI draft are not in the project SOP list.
   // Keep the open workflow selected while it is being previewed.
   const options=wf&&!workflows.some(w=>w.id===wf.id)?[wf,...workflows]:workflows;

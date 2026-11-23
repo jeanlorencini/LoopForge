@@ -40,6 +40,7 @@ func TestRunnerCLITestUsesOwnerLoginAndCleansUp(t *testing.T) {
 	}()
 	var started bool
 	var discarded bool
+	var input strings.Builder
 	for !discarded {
 		select {
 		case msg := <-conn.send:
@@ -54,13 +55,17 @@ func TestRunnerCLITestUsesOwnerLoginAndCleansUp(t *testing.T) {
 				if req.Command == nil || !req.Command.RunnerLogin || req.Command.Credentials.ClaudeCode.APIKey != "" {
 					t.Fatal("probe failed to select runner login without a personal key")
 				}
-				if !strings.Contains(strings.Join(req.Command.Argv, " "), "Respond with OK.") {
-					t.Fatal("probe did not launch a model request")
+				if !req.Command.Interactive || strings.Contains(strings.Join(req.Command.Argv, " "), "Respond with OK.") {
+					t.Fatal("probe prompt must travel on stdin")
 				}
 				started = true
+			case "write":
+				input.WriteString(req.Data)
 			case "poll":
-				result.Events = []domain.TelemetryEvent{{Name: "process.stdout", Message: `{"type":"result","result":"OK"}`}}
-				result.Sequence, result.Done = 1, true
+				if strings.Contains(input.String(), "Respond with OK.") {
+					result.Events = []domain.TelemetryEvent{{Name: "process.stdout", Message: `{"type":"result","result":"OK"}`}}
+					result.Sequence, result.Done = 1, true
+				}
 			case "stop":
 				result.Done = true
 			case "discard":

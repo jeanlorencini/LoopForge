@@ -13,7 +13,7 @@ import (
 	"agentflow/internal/runtime"
 )
 
-func checkoutRepositoryForPreparation(ctx context.Context, workspace string, repository *domain.RunnerRepository, refresh bool) error {
+func checkoutRepositoryForPreparation(ctx context.Context, workspace string, repository *domain.RunnerRepository, refresh, allowBootstrap bool) error {
 	if repository.RequireExistingWorkBranch && strings.TrimSpace(repository.WorkBranch) == "" {
 		return fmt.Errorf("继续已有分支时必须指定工作分支")
 	}
@@ -22,7 +22,7 @@ func checkoutRepositoryForPreparation(ctx context.Context, workspace string, rep
 	}
 	info, err := os.Lstat(filepath.Join(workspace, ".git"))
 	if os.IsNotExist(err) {
-		return cloneRepository(ctx, workspace, repository)
+		return cloneRepository(ctx, workspace, repository, allowBootstrap)
 	}
 	if err != nil {
 		return err
@@ -39,7 +39,7 @@ func checkoutRepositoryForPreparation(ctx context.Context, workspace string, rep
 		if err := removeIncompleteClone(ctx, workspace); err != nil {
 			return err
 		}
-		return cloneRepository(ctx, workspace, repository)
+		return cloneRepository(ctx, workspace, repository, allowBootstrap)
 	}
 	if repository.RequireExistingWorkBranch {
 		return checkoutExistingRepositoryBranch(ctx, workspace, repository)
@@ -139,7 +139,7 @@ func refreshCleanRepository(ctx context.Context, workspace string, repository *d
 		return err
 	}
 	defer os.RemoveAll(replacement)
-	if err := cloneRepository(ctx, replacement, repository); err != nil {
+	if err := cloneRepository(ctx, replacement, repository, false); err != nil {
 		return err // The original checkout is still intact.
 	}
 	if clean, err = repositoryCanRefresh(ctx, workspace, repository); err != nil || !clean {

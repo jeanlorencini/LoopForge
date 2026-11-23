@@ -588,8 +588,8 @@ type RunnerRepository struct {
 	// to merge the work branch into that existing shared branch and push it
 	// directly (no Gongfeng MR). It is empty for ordinary pushes.
 	SharedPushTarget string `json:"sharedPushTarget,omitempty"`
-	// DefaultBranch is set only on align_baseline: the branch merged into
-	// IntegrateBranch.
+	// DefaultBranch is published when initializing an empty repository and
+	// is the branch merged into IntegrateBranch on align_baseline.
 	DefaultBranch string `json:"defaultBranch,omitempty"`
 }
 

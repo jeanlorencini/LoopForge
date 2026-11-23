@@ -83,10 +83,10 @@ func TestBindRunnerRepositoriesUsesConfiguredMainBranchWhenBaseIsEmpty(t *testin
 	} {
 		invocation := &domain.RunnerInvocation{}
 		bindRunnerRepositories(invocation, run, "", "")
-		if len(invocation.Repositories) != 1 || invocation.Repositories[0].Ref != repository.DefaultBranch {
+		if len(invocation.Repositories) != 1 || invocation.Repositories[0].Ref != repository.DefaultBranch || invocation.Repositories[0].DefaultBranch != repository.DefaultBranch {
 			t.Fatalf("runner must receive the configured main branch: %+v", invocation)
 		}
-		if invocation.Repository != nil && invocation.Repository.Ref != repository.DefaultBranch {
+		if invocation.Repository != nil && (invocation.Repository.Ref != repository.DefaultBranch || invocation.Repository.DefaultBranch != repository.DefaultBranch) {
 			t.Fatalf("legacy runner binding lost the configured main branch: %+v", invocation.Repository)
 		}
 		if !invocation.Repositories[0].RequireExistingWorkBranch || (invocation.Repository != nil && !invocation.Repository.RequireExistingWorkBranch) {

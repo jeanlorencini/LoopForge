@@ -190,22 +190,26 @@ func prepareRepository(ctx context.Context, workspace string, repository domain.
 			return clearErr
 		}
 		if retryErr := clone(baseBranch, false); retryErr != nil {
-			if gitwork.UsesSSH(ctx) {
-				return retryErr // An SSH checkout never initializes a remote branch.
+			if gitwork.UsesSSH(ctx) || repository.RequireExistingWorkBranch || procwatch.Stopped(retryErr) || ctx.Err() != nil {
+				return retryErr
 			}
-			if seeded, seedErr := seedEmptyRepository(ctx, workspace, cloneRemoteForGit(ctx, remote), repository.DefaultBranch, baseBranch, reset); seeded {
-				if seedErr != nil {
-					return seedErr
+			seed := strings.TrimSpace(repository.DefaultBranch)
+			if seed == "" {
+				seed = "master"
+			}
+			seeded, seedErr := gitwork.SeedEmptyRemote(ctx, workspace, cloneRemoteForGit(ctx, remote), seed, baseBranch)
+			if seedErr != nil {
+				return seedErr
+			}
+			if seeded {
+				if err := clone(baseBranch, false); err != nil {
+					return err
 				}
 			} else if !shouldSeedIntegrateBranch(repository, baseBranch) {
 				return err
 			} else {
 				if mk := reset(workspace); mk != nil {
 					return mk
-				}
-				seed := strings.TrimSpace(repository.DefaultBranch)
-				if seed == "" {
-					seed = "master"
 				}
 				if seedErr := clone(seed, false); seedErr != nil {
 					return err
@@ -290,53 +294,6 @@ func prepareLocalSnapshotRepository(ctx context.Context, workspace, localPath st
 		return err
 	}
 	return recordRepositoryBaseline(workspace, "")
-}
-
-// seedEmptyRepository handles a freshly created Gongfeng repository with no
-// commits: clone has no branch to check out, so neither an assistant
-// workspace nor an SOP run could write the first file (the owner had to make an
-// initial commit by hand). It publishes the base branch
-// (and the default branch first, when the base is an integration branch) with
-// one empty commit and leaves workspace on it. seeded is false when the
-// remote is unreachable or has branches; the clone error then stands.
-func seedEmptyRepository(ctx context.Context, workspace, remote, defaultBranch, baseBranch string, reset func(string) error) (seeded bool, err error) {
-	heads, lsErr := runGit(ctx, workspace, "ls-remote", "--heads", "--", remote)
-	if lsErr != nil || strings.TrimSpace(heads) != "" {
-		return false, nil
-	}
-	if err := reset(workspace); err != nil {
-		return true, err
-	}
-	first := strings.TrimSpace(defaultBranch)
-	if first == "" {
-		first = "master"
-	}
-	for _, args := range [][]string{
-		{"init", "-q", "."},
-		{"symbolic-ref", "HEAD", "refs/heads/" + first},
-		{"remote", "add", "--", "origin", remote},
-	} {
-		if _, err := runGit(ctx, workspace, args...); err != nil {
-			return true, fmt.Errorf("initialize empty repository: %w", err)
-		}
-	}
-	ensureGitIdentity(ctx, workspace)
-	if _, err := gitC(ctx, workspace, "commit", "-q", "--allow-empty", "-m", "Initialize repository"); err != nil {
-		return true, fmt.Errorf("initialize empty repository: %w", err)
-	}
-	branches := []string{first}
-	if baseBranch != first {
-		if _, err := gitC(ctx, workspace, "branch", baseBranch); err != nil {
-			return true, fmt.Errorf("initialize empty repository: %w", err)
-		}
-		branches = append(branches, baseBranch)
-	}
-	for _, branch := range branches {
-		if _, err := gitC(ctx, workspace, "push", "-u", "origin", branch); err != nil {
-			return true, fmt.Errorf("publish %s to the empty repository: %w", branch, err)
-		}
-	}
-	return true, nil
 }
 
 func liveDockerSandbox(workspace string) bool {

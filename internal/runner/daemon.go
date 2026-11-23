@@ -1208,7 +1208,7 @@ func checkoutInvocationRepositories(ctx context.Context, workspace string, inv *
 			}
 		}
 		refresh := len(refreshClean) > 0 && refreshClean[0]
-		if err := checkoutRepositoryForPreparation(ctx, target, &repo, refresh); err != nil {
+		if err := checkoutRepositoryForPreparation(ctx, target, &repo, refresh, true); err != nil {
 			return err
 		}
 		if err := gitwork.RecordBaseline(target, repo.Ref); err != nil {
@@ -1262,10 +1262,10 @@ func safeRunnerRepoDir(dir string) string {
 // (once per workspace; later invocations and gates reuse the checkout). The
 // token, when present, authenticates private HTTPS remotes.
 func checkoutRepository(ctx context.Context, workspace string, repo *domain.RunnerRepository) error {
-	return checkoutRepositoryForPreparation(ctx, workspace, repo, false)
+	return checkoutRepositoryForPreparation(ctx, workspace, repo, false, false)
 }
 
-func cloneRepository(ctx context.Context, workspace string, repo *domain.RunnerRepository) error {
+func cloneRepository(ctx context.Context, workspace string, repo *domain.RunnerRepository, allowBootstrap bool) error {
 	if repo.RequireExistingWorkBranch && strings.TrimSpace(repo.WorkBranch) == "" {
 		return fmt.Errorf("继续已有分支时必须指定工作分支")
 	}
@@ -1280,16 +1280,46 @@ func cloneRepository(ctx context.Context, workspace string, repo *domain.RunnerR
 	// the token never lands in .git/config. --progress: without a terminal git
 	// prints nothing until it finishes, so a slow clone looked hung.
 	args := []string{"clone", "--progress"}
-	if ref := strings.TrimSpace(repo.Ref); ref != "" {
+	ref := strings.TrimSpace(repo.Ref)
+	if ref != "" {
 		args = append(args, "--branch", ref)
 	}
 	args = append(args, "--", url, ".")
 	watch := runnerCloneWatch(repo)
 	// The platform cannot see this host's output yet; the operator can.
 	ctx = procwatch.WithObserver(ctx, func(event procwatch.Event) { log.Printf("runner checkout: %s", event.Message) })
-	tail, err := gitwork.Watch(repositoryGitContext(ctx, *repo), workspace, watch, args...)
-	if err != nil {
-		return fmt.Errorf("git clone %s: %w (%s)", domain.StripURLCredentials(repo.CloneURL), err, cloneOutput([]byte(tail), repo.GitToken))
+	gitCtx := repositoryGitContext(ctx, *repo)
+	clone := func() error {
+		tail, err := gitwork.Watch(gitCtx, workspace, watch, args...)
+		if err != nil {
+			return fmt.Errorf("git clone %s: %w (%s)", domain.StripURLCredentials(repo.CloneURL), err, cloneOutput([]byte(tail), repo.GitToken))
+		}
+		return nil
+	}
+	if err := clone(); err != nil {
+		if !allowBootstrap || ref == "" || repo.RequireExistingWorkBranch || repo.UseSSH || procwatch.Stopped(err) || ctx.Err() != nil {
+			return err
+		}
+		entries, readErr := os.ReadDir(workspace)
+		if readErr != nil || len(entries) != 0 {
+			return err
+		}
+		seedCtx := gitCtx
+		if watch.Timeout > 0 {
+			var cancel context.CancelFunc
+			seedCtx, cancel = context.WithTimeout(gitCtx, watch.Timeout)
+			defer cancel()
+		}
+		seeded, seedErr := gitwork.SeedEmptyRemote(seedCtx, workspace, url, repo.DefaultBranch, ref)
+		if seedErr != nil {
+			return seedErr
+		}
+		if !seeded {
+			return err
+		}
+		if err := clone(); err != nil {
+			return err
+		}
 	}
 	// The branch steps below keep the bound they always had.
 	cloneCtx := ctx
