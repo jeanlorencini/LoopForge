@@ -142,13 +142,12 @@ func (e *Engine) ResumeInterruptedRuns() []string {
 			if err != nil {
 				continue
 			}
-			if r.CancelRequested || acquired.CancelRequested {
-				_ = e.cancelRunnerTasksForRun(r.ID)
-				e.settleOrphan(r.ID, "运行已被手动终止")
+			if acquired.CancelRequested {
+				e.finishAt(r.ID, acquired.Generation, "cancelled", "运行已被手动终止")
 				_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
 				continue
 			}
-			if acquired.Status != "waiting" || !alignRunWaitingApproval(acquired) {
+			if acquired.Status != "waiting" || acquired.PauseRequested || !alignRunWaitingApproval(acquired) {
 				_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
 				continue
 			}
@@ -164,12 +163,19 @@ func (e *Engine) ResumeInterruptedRuns() []string {
 		if r.Status != "running" {
 			continue
 		}
+		if r.OwnerInstanceID != "" && r.LeaseUntil.After(time.Now().UTC()) {
+			continue
+		}
 		status, msg, done := settleStatusForCompletedGraph(workflowForRun(e.repo, r), r)
 		// A scheduled run still has to push into the integration branch after
 		// the last node succeeds. Settling here deletes that checkout mid-push.
-		if done && !(status == "succeeded" && scheduledIntegratePending(r)) {
+		if done && !r.CancelRequested && !r.PauseRequested && !(status == "succeeded" && scheduledIntegratePending(r)) {
 			e.finishAt(r.ID, r.Generation, status, msg)
-			continue
+			current, ok := e.repo.RunState(r.ID)
+			if !ok || current.Status != "running" || (!current.CancelRequested && !current.PauseRequested) {
+				continue
+			}
+			r = current
 		}
 		if r.OwnerInstanceID != "" && r.LeaseUntil.After(time.Now().UTC()) {
 			continue
@@ -195,19 +201,17 @@ func (e *Engine) ResumeInterruptedRuns() []string {
 		if err != nil {
 			continue
 		}
-		if r.CancelRequested || acquired.CancelRequested {
-			_ = e.cancelRunnerTasksForRun(r.ID)
-			e.settleOrphan(r.ID, "运行已被手动终止")
+		if acquired.CancelRequested {
+			e.finishAt(r.ID, acquired.Generation, "cancelled", "运行已被手动终止")
 			_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
 			continue
 		}
-		if r.PauseRequested || acquired.PauseRequested {
-			_ = e.cancelRunnerTasksForRun(r.ID)
+		if acquired.PauseRequested {
 			e.pauseAt(r.ID, acquired.Generation, "运行已由用户暂停")
 			_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
 			continue
 		}
-		if blocked {
+		if blocked || acquired.Status != "running" {
 			// The control request was withdrawn between the check above and the
 			// lease. Hand the run back instead of resuming another host's bind.
 			_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)

@@ -12,6 +12,10 @@ import (
 )
 
 func (e *Engine) persistControlDecision(runID string, r domain.Run, expected ...NodeExpectation) error {
+	return e.persistRunDecision(runID, r, len(expected) > 0)
+}
+
+func (e *Engine) persistRunDecision(runID string, r domain.Run, checkRevision bool) error {
 	if r.Status == "running" {
 		r.CancelRequested = false
 		r.PauseRequested = false
@@ -19,13 +23,13 @@ func (e *Engine) persistControlDecision(runID string, r domain.Run, expected ...
 	// pause_requested is not part of the run snapshot write. Clear it whenever
 	// the decision itself released the pause, including a group that stays
 	// waiting because nothing was in flight.
-	if len(expected) == 0 && !r.PauseRequested && !r.CancelRequested {
+	if !checkRevision && !r.PauseRequested && !r.CancelRequested {
 		if err := e.repo.ClearRunControl(runID); err != nil {
 			return err
 		}
 	}
 	var err error
-	if len(expected) > 0 {
+	if checkRevision {
 		err = e.repo.PutRunAtRevision(r, r.Revision)
 	} else {
 		err = e.repo.PutRun(r)
@@ -98,7 +102,7 @@ func (e *Engine) Cancel(runID string) error {
 	if err != nil {
 		return nil
 	}
-	e.settleOrphan(runID, "运行已被手动终止（调度协程不存在，可能由服务重启导致）")
+	e.finishAt(runID, r.Generation, "cancelled", "运行已被手动终止（调度协程不存在，可能由服务重启导致）")
 	_ = e.repo.ReleaseRunLease(runID, e.instanceID, r.Generation)
 	return nil
 }
@@ -324,10 +328,10 @@ func (e *Engine) Reject(runID string, req domain.RejectRequest, expected ...Node
 				// attempt is abandoned, and the rerun must count as a new attempt
 				// rather than continue the interrupted one.
 				interrupted[id] = true
-				nr.Activity = ""
 			}
 			nr.Status = "pending"
 			nr.Error = ""
+			nr.Activity = ""
 			nr.Output = ""
 			nr.ChildRunID = ""
 			nr.FinishedAt = time.Time{}
@@ -586,6 +590,7 @@ func (e *Engine) retryContext(ctx context.Context, runID, nodeID, reason, humanC
 			}
 			nr.Status = "pending"
 			nr.Error = ""
+			nr.Activity = ""
 			nr.Output = ""
 			nr.ChildRunID = ""
 			if id == nodeID {
@@ -742,10 +747,29 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 		if !resumed {
 			return fmt.Errorf("paused node not found")
 		}
+		releaseLease := false
 		if e.executes() && r.Status == "running" {
 			r, err = e.acquireLease(r)
 			if err != nil {
 				return err
+			}
+			releaseLease = true
+			defer func() {
+				if releaseLease {
+					_ = e.repo.ReleaseRunLease(runID, e.instanceID, r.Generation)
+				}
+			}()
+			if err := checkNodeExpectation(r, expected); err != nil {
+				return err
+			}
+			if r.Status != "waiting" || !r.PauseRequested || r.CancelRequested {
+				return repo.ErrRunDecisionStale
+			}
+			if resumed, err := resumeUnpausedGraph(&r); err != nil || !resumed {
+				if err != nil {
+					return err
+				}
+				return repo.ErrRunDecisionStale
 			}
 		}
 		message := "人工确认直接继续运行"
@@ -757,7 +781,11 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 		if r.Status == "running" {
 			markRunRelationsRunning(e.repo, r)
 		}
-		return e.persistControlDecision(runID, r, expected...)
+		if err := e.persistRunDecision(runID, r, true); err != nil {
+			return err
+		}
+		releaseLease = false
+		return nil
 	}
 	if e.executes() {
 		var err error

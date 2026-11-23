@@ -94,6 +94,9 @@ func scheduledIntegratePending(r domain.Run) bool {
 }
 
 func canSettleUnowned(r domain.Run, status string) bool {
+	if r.CancelRequested || r.PauseRequested || (r.OwnerInstanceID != "" && r.LeaseUntil.After(time.Now().UTC())) {
+		return false
+	}
 	if status == "succeeded" && scheduledIntegratePending(r) {
 		return false
 	}

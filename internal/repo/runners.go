@@ -33,6 +33,7 @@ type runnerTaskPayload struct {
 	CompletedAt       *runnerTaskTime                  `json:"completedAt,omitempty"`
 	RunID             string                           `json:"runId,omitempty"`
 	NodeID            string                           `json:"nodeId,omitempty"`
+	WorkflowOperation string                           `json:"workflowOperation,omitempty"`
 	Invocation        *domain.RunnerInvocation         `json:"invocation,omitempty"`
 	Sandbox           *domain.RunnerSandboxSpec        `json:"sandbox,omitempty"`
 	Command           string                           `json:"command,omitempty"`
@@ -124,6 +125,7 @@ func runnerTaskFromRow(row runnerTaskRow) domain.RunnerTask {
 		t.CompletedAt = p.CompletedAt.toTime()
 		t.RunID = p.RunID
 		t.NodeID = p.NodeID
+		t.WorkflowOperation = p.WorkflowOperation
 		t.Invocation = p.Invocation
 		t.Sandbox = p.Sandbox
 		t.Command = p.Command
@@ -151,7 +153,7 @@ func runnerTaskPayloadFor(v domain.RunnerTask) runnerTaskPayload {
 	return runnerTaskPayload{
 		Prompt: v.Prompt, Workspace: v.Workspace, Args: v.Args, ExitCode: v.ExitCode, ExitCodeObserved: v.ExitCodeObserved,
 		Result: v.Result, Error: v.Error, StartedAt: newRunnerTaskTime(v.StartedAt),
-		CompletedAt: newRunnerTaskTime(v.CompletedAt), RunID: v.RunID, NodeID: v.NodeID,
+		CompletedAt: newRunnerTaskTime(v.CompletedAt), RunID: v.RunID, NodeID: v.NodeID, WorkflowOperation: v.WorkflowOperation,
 		Invocation: v.Invocation, Sandbox: v.Sandbox, Command: v.Command, Action: v.Action,
 		PreviewArchive: v.PreviewArchive, WorkBranchMessage: v.WorkBranchMessage, Artifacts: v.Artifacts,
 		Outputs: v.Outputs, IntegrationLabel: v.IntegrationLabel,

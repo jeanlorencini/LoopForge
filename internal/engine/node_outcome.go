@@ -56,7 +56,7 @@ func (e *Engine) nodeFailedAt(runID string, node domain.WorkflowNode, attempt, g
 	if configuredExit {
 		err = fmt.Errorf("%w. Check the script logs for the cause of this exit code, then retry manually", err)
 	}
-	stopReprocessing := configuredExit || isRunnerUnavailableBeforeClaim(err)
+	stopReprocessing := configuredExit || isRunnerUnavailableBeforeClaim(err) || isRunnerTaskRecoveryError(err)
 	if stopReprocessing {
 		allowReject = false
 	}
@@ -242,12 +242,12 @@ func (e *Engine) nodeCancelled(runID string, node domain.WorkflowNode) {
 
 func (e *Engine) finishInterruptedAt(runID string, generation int) {
 	current, ok := e.repo.RunState(runID)
-	if ok && current.PauseRequested {
-		e.pauseAt(runID, generation, "运行已由用户暂停")
-		return
-	}
 	if ok && current.CancelRequested {
 		e.finishAt(runID, generation, "cancelled", "流水线已取消")
+		return
+	}
+	if ok && current.PauseRequested {
+		e.pauseAt(runID, generation, "运行已由用户暂停")
 		return
 	}
 	if ok {
@@ -297,33 +297,29 @@ func (e *Engine) requeueInterruptedNode(runID, nodeID string, attempt, generatio
 }
 
 func (e *Engine) pauseAt(runID string, generation int, message string) {
-	e.stopRunScheduler(runID)
-	e.updateRun(runID, func(r *domain.Run) {
-		if r.Generation != generation || ((r.OwnerInstanceID != "" || r.Generation > 0) && !e.ownsRun(*r)) {
-			return
+	e.finishAt(runID, generation, "waiting", message)
+}
+
+func (e *Engine) applyRunPause(r *domain.Run, message string) {
+	now := time.Now().UTC()
+	for nodeID, nr := range r.Nodes {
+		if nr == nil || (nr.Status != "running" && nr.Status != "pending_input") {
+			continue
 		}
-		now := time.Now().UTC()
-		for nodeID, nr := range r.Nodes {
-			if nr == nil || (nr.Status != "running" && nr.Status != "pending_input") {
-				continue
+		nr.Status = "waiting_approval"
+		nr.Error = ""
+		nr.Activity = "已由用户暂停，等待补充信息"
+		for _, node := range r.WorkflowSnapshot.Nodes {
+			if node.ID == nodeID && isScriptNode(node) {
+				nr.Activity = "已由用户暂停，继续后脚本将从头执行"
+				break
 			}
-			nr.Status = "waiting_approval"
-			nr.Error = ""
-			nr.Activity = "已由用户暂停，等待补充信息"
-			for _, node := range r.WorkflowSnapshot.Nodes {
-				if node.ID == nodeID && isScriptNode(node) {
-					nr.Activity = "已由用户暂停，继续后脚本将从头执行"
-					break
-				}
-			}
-			nr.FinishedAt = now
-			e.event(r, nodeID, "node.paused", "执行已暂停，等待人工补充信息")
 		}
-		r.Status = "waiting"
-		r.CancelRequested = false
-		r.PauseRequested = true
-		e.event(r, "", "run.paused", message)
-	})
+		nr.FinishedAt = now
+		e.event(r, nodeID, "node.paused", "执行已暂停，等待人工补充信息")
+	}
+	r.Status = "waiting"
+	e.event(r, "", "run.paused", message)
 }
 
 func (e *Engine) finish(id, status, msg string) {
@@ -347,7 +343,7 @@ func (e *Engine) stalePipelineFailure(id, status, msg string) bool {
 	if !ok {
 		return false
 	}
-	return !hasFailed(workflowForRun(e.repo, current), current)
+	return !current.CancelRequested && !current.PauseRequested && !hasFailed(workflowForRun(e.repo, current), current)
 }
 
 func (e *Engine) finishAt(id string, generation int, status, msg string) {
@@ -355,16 +351,43 @@ func (e *Engine) finishAt(id string, generation int, status, msg string) {
 		return
 	}
 	e.stopRunScheduler(id)
+	for {
+		if err := e.settleRunAt(id, generation, status, msg); !errors.Is(err, repo.ErrRunDecisionStale) {
+			return
+		}
+	}
+}
+
+func (e *Engine) settleRunAt(id string, generation int, status, msg string) error {
 	ignored := false
+	controlled := false
 	var delivered *domain.Run
 	var deliveredAt time.Time
-	if !e.updateRunSettling(id, func(r *domain.Run) {
+	updated, err := e.updateRunAtErr(id, true, func(r *domain.Run) {
 		unowned := (r.OwnerInstanceID != "" || r.Generation > 0) && !e.ownsRun(*r)
-		if (r.Generation != generation || unowned) && !canSettleUnowned(*r, status) {
+		if r.Generation != generation || (unowned && !canSettleUnowned(*r, status)) {
 			ignored = true
 			return
 		}
 		if domain.TerminalRunStatus(r.Status) {
+			ignored = true
+			return
+		}
+		switch {
+		case r.CancelRequested:
+			controlled = true
+			if status != "cancelled" {
+				status, msg = "cancelled", "流水线已取消"
+			}
+		case r.PauseRequested:
+			controlled = true
+			if status != "waiting" {
+				msg = "运行已由用户暂停"
+			}
+			status = "waiting"
+			e.applyRunPause(r, msg)
+			return
+		case status == "waiting":
 			ignored = true
 			return
 		}
@@ -381,6 +404,13 @@ func (e *Engine) finishAt(id string, generation int, status, msg string) {
 		if status == "cancelled" || status == "failed" {
 			e.cancelRunningNodes(r)
 		}
+		if status == "cancelled" {
+			for _, nr := range r.Nodes {
+				if nr != nil && (nr.Status == "pending_input" || nr.Status == "waiting_approval") {
+					nr.Status, nr.Error, nr.Activity, nr.FinishedAt = "cancelled", "", "已由用户取消", time.Now().UTC()
+				}
+			}
+		}
 		r.Status = status
 		e.event(r, "", "run."+status, msg)
 		// A child SOP shares the parent's issue; only the top-level run delivers it.
@@ -388,8 +418,12 @@ func (e *Engine) finishAt(id string, generation int, status, msg string) {
 			snapshot := *r
 			delivered, deliveredAt = &snapshot, time.Now().UTC()
 		}
-	}) || ignored {
-		return
+	})
+	if !updated || ignored {
+		return err
+	}
+	if controlled {
+		_ = e.cancelRunnerTasksForRun(id)
 	}
 	// Resolving MRs calls Gongfeng, so it runs outside the run state lock.
 	if delivered != nil {
@@ -402,11 +436,12 @@ func (e *Engine) finishAt(id string, generation int, status, msg string) {
 		e.observe(id, "", domain.TelemetryEvent{Category: "sandbox", Name: "sandbox.closed", Phase: "finish", Message: "run sandbox released"})
 		if status == "succeeded" && e.preview != nil {
 			if current, ok := e.repo.RunState(id); ok && e.preview.BeginFinalization(current) {
-				return
+				return nil
 			}
 		}
 		e.cleanupRunWorkspace(id)
 	}
+	return nil
 }
 
 // hasActiveNode reports whether any node is still executing or waiting on a

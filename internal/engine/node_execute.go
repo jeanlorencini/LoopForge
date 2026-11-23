@@ -6,6 +6,7 @@ import (
 	"agentflow/internal/repo"
 	"agentflow/internal/runtime"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -23,7 +24,7 @@ func (e *Engine) execute(ctx context.Context, runID string) {
 	}
 	if !e.ownsRun(r) {
 		status, msg, done := settleStatusForCompletedGraph(workflowForRun(e.repo, r), r)
-		if done && !(status == "succeeded" && scheduledIntegratePending(r)) {
+		if done && canSettleUnowned(r, status) {
 			e.finishAt(runID, r.Generation, status, msg)
 		}
 		e.clearRunning(runID)
@@ -129,8 +130,12 @@ func (e *Engine) execute(ctx context.Context, runID string) {
 		}
 		if len(ready) == 0 {
 			if allSucceeded(wf, r) {
-				rework, err := e.integrateScheduledRun(runID)
+				rework, err := e.integrateScheduledRun(ctx, runID)
 				if err != nil {
+					if ctx.Err() != nil {
+						e.finishInterruptedAt(runID, generation)
+						return
+					}
 					e.finishAt(runID, generation, "failed", "合入 integration 失败："+err.Error())
 					return
 				}
@@ -326,10 +331,12 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 	defer unlock()
 	executionGeneration := currentLease.Generation
 	executionAttempt := 0
+	var attemptNode domain.NodeRun
+	continued := false
 	started := false
-	e.updateRun(runID, func(r *domain.Run) {
+	updated := e.updateRunAt(runID, false, func(r *domain.Run) {
 		nr := r.Nodes[node.ID]
-		if nr.Status != "pending" {
+		if nr == nil || nr.Status != "pending" || r.Generation != executionGeneration || r.CancelRequested || r.PauseRequested {
 			return
 		}
 		if nr.Error != "" && runtime.IsCwdMountFailure(errors.New(nr.Error)) {
@@ -340,15 +347,20 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 		started = true
 		r.Status = "running"
 		nr.Status = "running"
-		if !continuingInterruptedAttempt(nr) {
+		continued = continuingInterruptedAttempt(nr)
+		if !continued {
 			nr.Attempt++
+			nr.RunnerAttemptID = rand.Text()
+			nr.StartedAt = time.Now().UTC()
 		}
 		executionAttempt = nr.Attempt
-		nr.StartedAt = time.Now().UTC()
+		attemptNode = *nr
+		attemptNode.NodeID = node.ID
+		nr.Activity = ""
 		nr.GateResult = nil
 		e.event(r, node.ID, "node.started", node.Name+" 开始执行")
 	})
-	if !started {
+	if !updated || !started {
 		return
 	}
 	ctx, cancelNode := context.WithCancel(ctx)
@@ -399,10 +411,27 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 		return
 	}
 	current, _ := e.repo.RunState(runID)
-	current, err := e.bindPoolRunner(ctx, current, node.ID)
-	if err != nil {
-		failNode(err, false)
-		return
+	runnerAttempt := newWorkflowRunnerAttempt(runID, attemptNode, executionGeneration)
+	if continued {
+		if err := runnerAttempt.load(e.repo); err != nil {
+			failNode(err, false)
+			return
+		}
+	}
+	ctx = context.WithValue(ctx, workflowRunnerAttemptContext{}, runnerAttempt)
+	recoveringRunnerTask := len(runnerAttempt.previous) > 0
+	if recoveringRunnerTask {
+		if runnerID := e.defaultExecutionRunner(current); runnerID == "" || runnerID != runnerAttempt.previous[0].RunnerID {
+			failNode(runnerAttempt.diagnostic("the persisted task belongs to a different runner"), false)
+			return
+		}
+	} else {
+		var err error
+		current, err = e.bindPoolRunner(ctx, current, node.ID)
+		if err != nil {
+			failNode(err, false)
+			return
+		}
 	}
 	profile := domain.SandboxProfile{}
 	if current.WorkflowSnapshot.SandboxSnapshot != nil {
@@ -462,7 +491,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 	// the control-plane sandbox; when the Agent is bound to a CLI Runner
 	// (执行器) it is dispatched to that machine so gates run next to the CLI
 	// output in the runner-side task workspace.
-	gateExec := func(command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
+	gateExec := func(_ string, command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
 		spec, err := runtime.CommandSpecWithCredentialEnv(runtime.CommandSpec{Argv: []string{"sh", "-lc", bindExecutionTarget(command, target)}, Provider: "verification", CredentialBindings: []runtime.CredentialBinding{runtime.BindGit, runtime.BindMCP}}, node.CredentialEnv, sb.credentialSnapshot())
 		if err != nil {
 			return "", err
@@ -512,7 +541,13 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 	}
 	var reported *reportedOutputs
 	artifactContext := ""
-	if runner, ok := e.repo.Runner(e.defaultExecutionRunner(current)); ok && runner.SupportsReportedOutputs() {
+	runner, _ := e.repo.Runner(e.defaultExecutionRunner(current))
+	supportsReportedOutputs := runner.SupportsReportedOutputs()
+	if recoveringRunnerTask {
+		invocation := runnerAttempt.previous[0].Invocation
+		supportsReportedOutputs = invocation != nil && invocation.ReportOutputs
+	}
+	if supportsReportedOutputs {
 		var inputs []domain.RunnerInputFile
 		artifactContext, inputs = runnerArtifactInputs(wf, node, current)
 		reported = sb.beginReportedOutputs(node.ID, inputs)
@@ -553,7 +588,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			return
 		}
 	}
-	if domain.IsPreviewBuildNode(node.ID) {
+	if domain.IsPreviewBuildNode(node.ID) && !recoveringRunnerTask {
 		found, evidence := false, ""
 		if facts, ok := e.RunWorkspaceFacts(runID); reported != nil && ok {
 			found, evidence = facts.Frontend, facts.FrontendEvidence
@@ -568,7 +603,9 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			return
 		}
 	}
-	if repositoryFallback == "" {
+	// Workspace preparation happened before the durable dispatch and can be
+	// fenced by the task still running on the same workspace.
+	if repositoryFallback == "" && !recoveringRunnerTask {
 		_, preparationErr := e.PrepareNodeWorkspace(ctx, current, sb)
 		if preparationErr != nil {
 			// A remote execution machine prepares its own checkout. Let its
@@ -687,8 +724,8 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			})
 			if execMachine := e.defaultExecutionRunner(current); execMachine != "" {
 				workspace := runnerWorkspaceRel(current, node.ID)
-				gateExec = func(command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
-					return e.dispatchRunnerCommand(ctx, execMachine, runID, node.ID, workspace, bindExecutionTarget(command, target), gateSink)
+				gateExec = func(gateKey, command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
+					return e.dispatchRunnerCommand(ctx, execMachine, runID, node.ID, workspace, bindExecutionTarget(command, target), gateSink, gateKey)
 				}
 			}
 			if runErr == nil && node.RunOnWorkspaceRebuild {
@@ -819,8 +856,8 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				workspace := runnerWorkspaceRel(current, node.ID)
 				result, dispatchErr := e.dispatchRunnerTask(ctx, execMachine, current, effectiveNode, sb, workspace, ex, agent, assets, prompt, invocationID, options, sink)
 				if dispatchErr == nil {
-					gateExec = func(command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
-						return e.dispatchRunnerCommand(ctx, execMachine, runID, node.ID, workspace, bindExecutionTarget(command, target), gateSink)
+					gateExec = func(gateKey, command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
+						return e.dispatchRunnerCommand(ctx, execMachine, runID, node.ID, workspace, bindExecutionTarget(command, target), gateSink, gateKey)
 					}
 				}
 				return result, dispatchErr
@@ -962,16 +999,17 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			}
 		}
 		if err == nil {
-			for _, candidate := range gates {
+			for gateIndex, candidate := range gates {
 				gate := candidate.gate
 				if strings.EqualFold(gate.Mode, "manual") || strings.EqualFold(gate.Mode, "submit") {
 					continue
 				}
+				gateKey := fmt.Sprintf("%d/%d/%s", iteration, gateIndex, gate.ID)
 				if strings.EqualFold(gate.Mode, domain.VerificationModeMR) {
 					live, _ := e.repo.RunState(runID)
 					mrErr := e.verifyRunMRs(live, gitTok, func(rc domain.RepositoryContext) (pushedWork, error) {
 						target := executionTarget{Scope: domain.ExecutionScopeRepositories, Repository: &rc}
-						out, execErr := gateExec(mrPendingCommand, target, executionTargetSink(func(event domain.TelemetryEvent) {
+						out, execErr := gateExec(gateKey, mrPendingCommand, target, executionTargetSink(func(event domain.TelemetryEvent) {
 							event.Category = "verification"
 							sink(event)
 						}, target))
@@ -1019,7 +1057,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 					sink(event)
 				}
 				verifyOutput, verifyErr := executeForTargets(current, gate.ExecutionScope, func(target executionTarget) (string, error) {
-					return gateExec(gateCmd, target, executionTargetSink(gateSink, target))
+					return gateExec(gateKey, gateCmd, target, executionTargetSink(gateSink, target))
 				})
 				if verifyErr != nil {
 					detail := strings.TrimSpace(verifyOutput)
@@ -1038,7 +1076,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				}
 			}
 		}
-		if err == nil || iteration == maxIterations || ctx.Err() != nil || isRunnerUnavailableBeforeClaim(err) {
+		if err == nil || iteration == maxIterations || ctx.Err() != nil || isRunnerUnavailableBeforeClaim(err) || runnerAttempt.err != nil {
 			break
 		}
 		if failedAction != "loop" {
@@ -1048,10 +1086,15 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 		loopFeedback = err.Error()
 		e.observe(runID, node.ID, domain.TelemetryEvent{Category: "orchestration", Name: "agent.loop", Phase: "progress", Message: fmt.Sprintf("第 %d 轮未通过，进入自修正", iteration), Attributes: map[string]any{"iteration": iteration, "maxIterations": maxIterations, "feedback": loopFeedback}})
 	}
+	if runnerAttempt.err != nil {
+		err = runnerAttempt.err
+	} else if runnerAttempt.next < len(runnerAttempt.previous) {
+		err = runnerAttempt.diagnostic("the workflow did not reach its remaining durable operations")
+	}
 	e.attachLoopRetro(runID, node.ID, retroWorkspace, lastIteration, err, failedAction)
 	if err != nil {
 		e.freezeAvailableArtifacts(runID, effectiveNode, sb.Workspace(), reported, output)
-		if isRunnerUnavailableBeforeClaim(err) {
+		if isRunnerUnavailableBeforeClaim(err) || isRunnerTaskRecoveryError(err) {
 			failNode(err, false)
 			return
 		}

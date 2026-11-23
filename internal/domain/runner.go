@@ -378,6 +378,8 @@ type RunnerTask struct {
 	RunID      string            `json:"runId,omitempty"`
 	NodeID     string            `json:"nodeId,omitempty"`
 	Invocation *RunnerInvocation `json:"invocation,omitempty"`
+	// WorkflowOperation is control-plane correlation metadata, excluded from the runner wire format.
+	WorkflowOperation string `json:"-"`
 	// Sandbox is the workflow sandbox definition resolved by the control
 	// plane. The runner creates it locally so Docker/seatbelt/bwrap isolation
 	// lives on the same machine that executes the Agent CLI.
