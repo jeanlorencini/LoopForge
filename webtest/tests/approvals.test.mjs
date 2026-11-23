@@ -2,6 +2,73 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadApp, settle } from '../lib/load-app.mjs';
 
+function approvalFixture(id) {
+  return {
+    id, status: 'waiting', workflowId: 'fixture-flow', projectId: 'project-1',
+    createdAt: '2026-10-20T10:00:00Z', executionContext: { responsibleUserId: 7, projectId: 'project-1' },
+    workflowSnapshot: { id: 'fixture-flow', name: id, nodes: [
+      { id: 'build', name: 'Build', type: 'script' }, { id: 'gate', name: 'Gate', type: 'approval', rejectTo: 'build' },
+    ] },
+    nodes: { gate: { status: 'waiting_approval', attempt: 2, reworkCount: 1 } },
+  };
+}
+
+test('approval submits the displayed attempt and refreshes after a conflict', async (t) => {
+  const app = await loadApp();
+  t.after(app.close);
+  let current = approvalFixture('stale-card');
+  app.router.get('/api/runs', () => [current]);
+  app.router.get('/api/runs/stale-card', () => current);
+  app.router.post('/api/runs/stale-card/approve', ({ body }) => {
+    if (body.expected?.attempt === 2) return { status: 409, body: { code: 'run_decision_stale', error: 'conflict' } };
+    current = { ...current, status: 'running' };
+    return { ok: true };
+  });
+  app.evaluate(`state.currentUser={id:7,loginName:'reviewer'}`);
+  await app.evaluate('renderApprovals()');
+  const button = app.document.querySelector('#approvalList [data-approve]');
+  assert.ok(button);
+  current = { ...current, nodes: { gate: { ...current.nodes.gate, attempt: 3, reworkCount: 2 } } };
+  app.evaluate(`state.data.runs=[${JSON.stringify(current)}]`);
+  button.click();
+  await settle(6);
+  const call = app.router.calls.find(c => c.path === '/api/runs/stale-card/approve');
+  assert.deepEqual(call.body.expected, { status: 'waiting_approval', attempt: 2, reworkCount: 1 });
+  assert.equal(current.status, 'waiting');
+  assert.match(app.document.querySelector('.toast-err')?.textContent || '', /节点状态已变化|latest attempt/i);
+  assert.ok(app.router.calls.some(c => c.path === '/api/runs/stale-card' && c.method === 'GET'));
+});
+
+test('batch approve and reject freeze the selected attempts before prompting', async (t) => {
+  for (const action of ['approve', 'reject']) {
+    await t.test(action, async (subtest) => {
+      const app = await loadApp();
+      subtest.after(app.close);
+      const runs = [approvalFixture('batch-one'), approvalFixture('batch-two')];
+      app.router.get('/api/runs', runs);
+      app.evaluate(`
+        state.currentUser={id:7,loginName:'reviewer'};
+        window.afConfirm=window.afPrompt=()=>new Promise(resolve=>{window.finishPrompt=resolve});
+      `);
+      await app.evaluate('renderApprovals()');
+      const selectAll = app.document.querySelector('[data-ap-select-all]');
+      assert.ok(selectAll);
+      selectAll.click();
+      const button = app.document.querySelector(`[data-ap-batch-${action}]`);
+      assert.equal(button.disabled, false);
+      button.click();
+      app.evaluate(`state.approvalItems[0].nodes.gate.attempt=3; window.finishPrompt('accept')`);
+      await settle(6);
+      const calls = app.router.calls.filter(c => c.method === 'POST' && c.path.endsWith(`/${action}`));
+      assert.equal(calls.length, 2);
+      for (const call of calls) {
+        assert.deepEqual(call.body.expected, { status: 'waiting_approval', attempt: 2, reworkCount: 1 });
+        if (action === 'reject') assert.equal(call.body.targetId, 'build');
+      }
+    });
+  }
+});
+
 test('cancelling or declining retry refreshes the cached approval card', async (t) => {
   const app = await loadApp();
   t.after(app.close);

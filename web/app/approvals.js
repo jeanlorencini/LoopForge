@@ -14,6 +14,28 @@ function withHumanContext(payload){
   const reason=String(payload.reason||'').trim();
   return {...payload, context, reason:reason?`${reason}\n\n人工补充上下文：\n${context}`:context};
 }
+function nodeDecisionExpectation(nr){
+  return nr?.status?{status:nr.status,attempt:nr.attempt||0,reworkCount:nr.reworkCount||0}:undefined;
+}
+function nodeDecisionExpectationAttr(nr){
+  const expected=nodeDecisionExpectation(nr);
+  return expected?` data-decision-expectation="${escapeHTML(JSON.stringify(expected))}"`:'';
+}
+function readDecisionExpectation(fromEl){
+  const value=fromEl?.closest?.('[data-decision-expectation]')?.dataset.decisionExpectation;
+  return value?JSON.parse(value):undefined;
+}
+function decisionPayload(nodeId,fromEl,fields={}){
+  return withHumanContext({nodeId,expected:readDecisionExpectation(fromEl),context:readHumanContext(fromEl),...fields});
+}
+function decisionErrorMessage(error){
+  return error.code==='run_decision_stale'?lfT('节点状态已变化，请查看最新尝试后重试','The step changed. Review the latest attempt and try again.'):error.message;
+}
+async function showDecisionError(error,runId){
+  toast(decisionErrorMessage(error),'err');
+  if(error.code!=='run_decision_stale')return;
+  try{await syncRunControlState(runId);await renderApprovals(true)}catch(refreshError){toast(refreshError.message,'err')}
+}
 function reworkTarget(node,nodes){
   const id=String(node?.rejectTo||'').trim();
   if(!id)return null;
@@ -82,7 +104,7 @@ function humanGateSectionsHTML(nr,run,node){
 function humanDecisionPanelHTML(runId,nodeId,nr,node,nodes){
   if(cachedRun(runId)?.status==='queued')return '';
   const field=isScriptWorkflowNode(node)?'':humanContextFieldHTML();
-  return `<div class="human-decision" data-human-context-root><div class="human-gate-brief">${humanGateSectionsHTML(nr,cachedRun(runId),node)}</div>${field}<div class="ap-buttons">${waitingActionButtons(runId,nodeId,nr,node,nodes)}</div></div>`;
+  return `<div class="human-decision" data-human-context-root${nodeDecisionExpectationAttr(nr)}><div class="human-gate-brief">${humanGateSectionsHTML(nr,cachedRun(runId),node)}</div>${field}<div class="ap-buttons">${waitingActionButtons(runId,nodeId,nr,node,nodes)}</div></div>`;
 }
 function failedNodeId(run){
   const nodes=run?.workflowSnapshot?.nodes||[];
@@ -244,7 +266,7 @@ function approvalCalloutHTML(node,nr,nodes){
     ? `<button class="button primary" data-retry-node="${node.id}">重试本节点</button><button class="button ghost" data-decline-retry="${node.id}">不重试</button>`
     : `<button class="button primary" data-approve="${node.id}">确认通过，继续下游</button><button class="button ghost" data-retry-node="${node.id}">补充信息，重跑当前节点</button>${rework}`;
   const title=turnsExhausted(nr)?'对话轮次已用尽':(gate?.decision==='human'?'等待人工确认':'需要人工判断');
-  return `<div class="approval-callout human" data-human-context-root><div class="callout-head"><div class="callout-title-row"><span class="callout-badge human">待确认</span><b class="callout-title">${title}</b><span class="callout-node-name">步骤：<b>${nodeTitle}</b></span></div></div><div class="callout-content">${humanGateSectionsHTML(nr,typeof state!=='undefined'?state.activeRun:null,node)}</div>${field}<div class="ap-buttons">${buttons}</div></div>`;
+  return `<div class="approval-callout human" data-human-context-root${nodeDecisionExpectationAttr(nr)}><div class="callout-head"><div class="callout-title-row"><span class="callout-badge human">待确认</span><b class="callout-title">${title}</b><span class="callout-node-name">步骤：<b>${nodeTitle}</b></span></div></div><div class="callout-content">${humanGateSectionsHTML(nr,typeof state!=='undefined'?state.activeRun:null,node)}</div>${field}<div class="ap-buttons">${buttons}</div></div>`;
 }
 async function retryWaitingNode(runId,nodeId,fromEl){
   if(queuedRunActionBlocked(runId))return;
@@ -252,10 +274,9 @@ async function retryWaitingNode(runId,nodeId,fromEl){
   const blocked=issueExecutionBlocked(issue);if(blocked)return toast(blocked,'err');
   const nr=(state.data.runs||[]).find(r=>r.id===runId)?.nodes?.[nodeId]||state.issueDetailData?.run?.nodes?.[nodeId];
   const reason=turnsExhausted(nr)?'对话轮次用尽后人工确认重试':'人工确认重试本节点';
-  const context=readHumanContext(fromEl);
-  try{await requestRunActivation(runId,'retry',withHumanContext({nodeId,reason,context}));const run=await syncRunControlState(runId);toast(runControlToast(run,'已确认重试本节点'),'ok');renderApprovals(true);if(state.drawerOpen&&state.issueDetailData?.issue)openIssueDetail(state.issueDetailData.issue.id,'sop')}catch(e){toast(e.message,'err')}
+  try{await requestRunActivation(runId,'retry',decisionPayload(nodeId,fromEl,{reason}));const run=await syncRunControlState(runId);toast(runControlToast(run,'已确认重试本节点'),'ok');renderApprovals(true);if(state.drawerOpen&&state.issueDetailData?.issue)openIssueDetail(state.issueDetailData.issue.id,'sop')}catch(e){await showDecisionError(e,runId)}
 }
-async function declineRetry(runId,nodeId){if(queuedRunActionBlocked(runId))return;if(!await afConfirm({title:'放弃重试确认',message:'确定不重试？本节点将失败，整条 SOP 停止。',confirmText:'确认不重试',isDanger:true}))return;try{await api(`/api/runs/${encodeURIComponent(runId)}/decline-retry`,{method:'POST',body:JSON.stringify({nodeId})});await syncRunControlState(runId);toast('已选择不重试，节点失败','ok');await renderApprovals(true);if(state.drawerOpen&&state.issueDetailData?.issue)openIssueDetail(state.issueDetailData.issue.id,'sop')}catch(e){toast(e.message,'err')}}
+async function declineRetry(runId,nodeId,fromEl){if(queuedRunActionBlocked(runId))return;if(!await afConfirm({title:'放弃重试确认',message:'确定不重试？本节点将失败，整条 SOP 停止。',confirmText:'确认不重试',isDanger:true}))return;try{await api(`/api/runs/${encodeURIComponent(runId)}/decline-retry`,{method:'POST',body:JSON.stringify({nodeId,expected:readDecisionExpectation(fromEl)})});await syncRunControlState(runId);toast('已选择不重试，节点失败','ok');await renderApprovals(true);if(state.drawerOpen&&state.issueDetailData?.issue)openIssueDetail(state.issueDetailData.issue.id,'sop')}catch(e){await showDecisionError(e,runId)}}
 async function pauseRun(runId){
   if(queuedRunActionBlocked(runId))return;
   if(!await afConfirm({title:'暂停运行确认',message:'确定暂停当前运行？正在执行的节点会安全中断，工作区会保留，稍后可补充信息后继续。',confirmText:'确认暂停'}))return;
@@ -326,7 +347,7 @@ function bindWaitingActions(root){
   root.querySelectorAll('[data-reject]').forEach(b=>b.onclick=()=>rejectRun(b.dataset.reject,b.dataset.node,b));
   root.querySelectorAll('[data-retry-node]').forEach(b=>b.onclick=()=>retryWaitingNode(b.dataset.retryNode,b.dataset.node,b));
   root.querySelectorAll('[data-pass-node]').forEach(b=>b.onclick=()=>passFailedNode(b.dataset.passNode,b.dataset.node,b));
-  root.querySelectorAll('[data-decline-retry]').forEach(b=>b.onclick=()=>declineRetry(b.dataset.declineRetry,b.dataset.node));
+  root.querySelectorAll('[data-decline-retry]').forEach(b=>b.onclick=()=>declineRetry(b.dataset.declineRetry,b.dataset.node,b));
   bindPausedResumeActions(root);
   root.querySelectorAll('[data-refresh-run-sop]').forEach(b=>b.onclick=()=>refreshRunSOP(b.dataset.refreshRunSop));
 }
@@ -350,8 +371,8 @@ async function cancelRunFlow(runId){
   if(!await afConfirm({title:'取消流程确认',message:'确定取消该流程？取消后将不再出现在待我确认列表，对应需求可重新派发。',confirmText:'确认取消',isDanger:true}))return;
   try{await api(`/api/runs/${encodeURIComponent(runId)}/cancel`,{method:'POST'});await syncRunControlState(runId);toast('流程已取消','ok');await renderApprovals(true)}catch(e){toast(e.message,'err')}
 }
-async function approveRun(runId,nodeId,fromEl){if(queuedRunActionBlocked(runId))return;try{await api(`/api/runs/${runId}/approve`,{method:'POST',body:JSON.stringify(withHumanContext({nodeId,context:readHumanContext(fromEl)}))});toast('已批准，流程继续','ok');await renderApprovals();if(state.drawerOpen&&state.issueDetailData?.issue)openIssueDetail(state.issueDetailData.issue.id,'sop')}catch(e){toast(e.message,'err')}}
-async function rejectRun(runId,nodeId,fromEl){if(queuedRunActionBlocked(runId))return;const target=String(fromEl?.dataset?.target||'').trim(),targetName=String(fromEl?.dataset?.targetName||target).trim();if(!target)return toast('当前节点没有配置上游返工目标','err');const reason=await afPrompt({title:`退回上游「${targetName}」重做`,message:`将重置「${targetName}」及其全部下游节点。请输入返工原因：`,defaultValue:'验证未通过，请上游修复后重新提交'});if(reason===null||reason===undefined)return;try{await api(`/api/runs/${runId}/reject`,{method:'POST',body:JSON.stringify(withHumanContext({nodeId,targetId:target,reason,context:readHumanContext(fromEl)}))});toast(`已退回「${targetName}」，开始重跑后续流程`,'ok');renderApprovals(true);if(state.drawerOpen&&state.issueDetailData?.issue)openIssueDetail(state.issueDetailData.issue.id,'sop')}catch(e){toast(e.message,'err')}}
+async function approveRun(runId,nodeId,fromEl){if(queuedRunActionBlocked(runId))return;try{await api(`/api/runs/${runId}/approve`,{method:'POST',body:JSON.stringify(decisionPayload(nodeId,fromEl))});toast('已批准，流程继续','ok');await renderApprovals();if(state.drawerOpen&&state.issueDetailData?.issue)openIssueDetail(state.issueDetailData.issue.id,'sop')}catch(e){await showDecisionError(e,runId)}}
+async function rejectRun(runId,nodeId,fromEl){if(queuedRunActionBlocked(runId))return;const target=String(fromEl?.dataset?.target||'').trim(),targetName=String(fromEl?.dataset?.targetName||target).trim();if(!target)return toast('当前节点没有配置上游返工目标','err');const reason=await afPrompt({title:`退回上游「${targetName}」重做`,message:`将重置「${targetName}」及其全部下游节点。请输入返工原因：`,defaultValue:'验证未通过，请上游修复后重新提交'});if(reason===null||reason===undefined)return;try{await api(`/api/runs/${runId}/reject`,{method:'POST',body:JSON.stringify(decisionPayload(nodeId,fromEl,{targetId:target,reason}))});toast(`已退回「${targetName}」，开始重跑后续流程`,'ok');renderApprovals(true);if(state.drawerOpen&&state.issueDetailData?.issue)openIssueDetail(state.issueDetailData.issue.id,'sop')}catch(e){await showDecisionError(e,runId)}}
 function approvalStatusBadgeHTML(paused){
   const [tone,icon,label]=paused?['neutral','pause','已暂停']:['warn','pending-review','待确认'];
   return `<span class="hui-badge" data-tone="${tone}" data-stage-icon="${icon}">${huiIcon(icon)}<span class="hui-badge-label">${label}</span></span>`;
@@ -359,7 +380,8 @@ function approvalStatusBadgeHTML(paused){
 // ---------- 批量处理 ----------
 // 审批动作仍然是「每次运行 × 节点」一次判定；批量只是在页面上把同一组
 // /approve、/reject 接口串行调用一遍，逐条收集结果，不合并、不跳过校验。
-function approvalKey(runId,nodeId){return `${runId}::${nodeId||''}`}
+function approvalKey(runId,nodeId,nr){return JSON.stringify([runId,nodeId,nr?.attempt||0,nr?.reworkCount||0])}
+function approvalRunKey(run){const nodeId=waitingNodeId(run);return approvalKey(run.id,nodeId,run.nodes?.[nodeId])}
 function approvalSelection(){
   if(!(state.approvalSelection instanceof Set))state.approvalSelection=new Set();
   return state.approvalSelection;
@@ -376,10 +398,10 @@ function approvalSelectable(r){
 }
 function approvalSelectedRuns(items){
   const selection=approvalSelection();
-  return (items||[]).filter(r=>approvalSelectable(r)&&selection.has(approvalKey(r.id,waitingNodeId(r))));
+  return (items||[]).filter(r=>approvalSelectable(r)&&selection.has(approvalRunKey(r)));
 }
 function pruneApprovalSelection(items){
-  const selection=approvalSelection(),valid=new Set((items||[]).filter(approvalSelectable).map(r=>approvalKey(r.id,waitingNodeId(r))));
+  const selection=approvalSelection(),valid=new Set((items||[]).filter(approvalSelectable).map(approvalRunKey));
   for(const key of [...selection])if(!valid.has(key))selection.delete(key);
   if(valid.size<2)selection.clear();
   return selection;
@@ -387,8 +409,8 @@ function pruneApprovalSelection(items){
 function approvalBatchEnabled(){return (state.approvalItems||[]).filter(approvalSelectable).length>=2}
 function approvalSelectBoxHTML(r){
   if(!approvalSelectable(r)||!approvalBatchEnabled())return '';
-  const key=approvalKey(r.id,waitingNodeId(r)),checked=approvalSelection().has(key)?' checked':'';
-  return `<label class="ap-batch-check" title="选中后可批量处理"><input type="checkbox" data-ap-select="${escapeHTML(r.id)}" data-ap-node="${escapeHTML(waitingNodeId(r))}"${checked} aria-label="选中这条待确认"></label>`;
+  const key=approvalRunKey(r),checked=approvalSelection().has(key)?' checked':'';
+  return `<label class="ap-batch-check" title="选中后可批量处理"><input type="checkbox" data-ap-select="${escapeHTML(r.id)}" data-ap-key="${escapeHTML(key)}"${checked} aria-label="选中这条待确认"></label>`;
 }
 function approvalBatchBarHTML(items){
   const selectable=(items||[]).filter(approvalSelectable);
@@ -399,7 +421,7 @@ function approvalBatchBarHTML(items){
 function refreshApprovalBatchUI(){
   const items=state.approvalItems||[],chosen=approvalSelectedRuns(items),selectable=items.filter(approvalSelectable);
   document.querySelectorAll('#approvalList [data-ap-select]').forEach(box=>{
-    const on=approvalSelection().has(approvalKey(box.dataset.apSelect,box.dataset.apNode));
+    const on=approvalSelection().has(box.dataset.apKey);
     box.checked=on;box.closest('.ap-card')?.classList.toggle('is-selected',on);
   });
   const all=document.querySelector('#approvalBatch [data-ap-select-all]');
@@ -408,15 +430,20 @@ function refreshApprovalBatchUI(){
   if(count)count.textContent=`已选 ${chosen.length} 条`;
   document.querySelectorAll('#approvalBatch [data-ap-batch-approve],#approvalBatch [data-ap-batch-reject]').forEach(b=>{b.disabled=!chosen.length});
 }
+function selectedApprovalDecisions(){
+  return approvalSelectedRuns(state.approvalItems||[]).map(run=>{
+    const nodeId=waitingNodeId(run);
+    return {run,nodeId,key:approvalRunKey(run),expected:nodeDecisionExpectation(run.nodes[nodeId])};
+  });
+}
 async function batchApproveApprovals(){
-  const items=approvalSelectedRuns(state.approvalItems||[]);
+  const items=selectedApprovalDecisions();
   if(!items.length)return toast('请先勾选要批量通过的条目','err');
   if(!await afConfirm({title:`批量通过 ${items.length} 条`,message:`将逐条批准这 ${items.length} 条运行当前的人工确认节点，批准后各自继续下游。批量通过不会携带卡片里填写的补充上下文。`,confirmText:`确认通过 ${items.length} 条`}))return;
   const passed=[],failed=[];
-  for(const r of items){
-    const nodeId=waitingNodeId(r);
-    try{await api(`/api/runs/${encodeURIComponent(r.id)}/approve`,{method:'POST',body:JSON.stringify({nodeId})});passed.push(approvalKey(r.id,nodeId))}
-    catch(e){failed.push(`${r.workflowSnapshot?.name||r.id}：${e.message}`)}
+  for(const {run,nodeId,key,expected} of items){
+    try{await api(`/api/runs/${encodeURIComponent(run.id)}/approve`,{method:'POST',body:JSON.stringify({nodeId,expected})});passed.push(key)}
+    catch(e){failed.push(`${run.workflowSnapshot?.name||run.id}：${decisionErrorMessage(e)}`)}
   }
   passed.forEach(key=>approvalSelection().delete(key));
   await renderApprovals(false);
@@ -425,18 +452,16 @@ async function batchApproveApprovals(){
   toast(`已通过 ${passed.length} 条，${failed.length} 条失败：${failed.slice(0,3).join('；')}${failed.length>3?'…':''}`,'err');
 }
 async function batchRejectApprovals(){
-  const items=approvalSelectedRuns(state.approvalItems||[]);
+  const items=selectedApprovalDecisions();
   if(!items.length)return toast('请先勾选要批量退回的条目','err');
-  const nodesOf=r=>r.workflowSnapshot?.nodes||[];
-  const withTarget=items.map(r=>({run:r,target:reworkTarget(approvalNodeDef(r),nodesOf(r))})).filter(x=>x.target);
+  const withTarget=items.map(item=>({...item,target:reworkTarget(approvalNodeDef(item.run),item.run.workflowSnapshot?.nodes)})).filter(x=>x.target);
   if(!withTarget.length)return toast('选中的运行都没有配置上游返工目标，只能逐条处理','err');
   const reason=await afPrompt({title:`批量退回 ${withTarget.length} 条`,message:`将把这些运行分别退回到各自配置的上游节点重做，并重置其下游；未配置返工目标的 ${items.length-withTarget.length} 条会跳过。请输入统一的返工原因：`,defaultValue:'验证未通过，请上游修复后重新提交',multiline:true,confirmText:'批量退回'});
   if(reason===null||reason===undefined||!String(reason).trim())return;
   const rejected=[],failed=[];
-  for(const {run,target} of withTarget){
-    const nodeId=waitingNodeId(run);
-    try{await api(`/api/runs/${encodeURIComponent(run.id)}/reject`,{method:'POST',body:JSON.stringify({nodeId,targetId:target.id,reason:String(reason).trim()})});rejected.push(approvalKey(run.id,nodeId))}
-    catch(e){failed.push(`${run.workflowSnapshot?.name||run.id}：${e.message}`)}
+  for(const {run,target,nodeId,key,expected} of withTarget){
+    try{await api(`/api/runs/${encodeURIComponent(run.id)}/reject`,{method:'POST',body:JSON.stringify({nodeId,expected,targetId:target.id,reason:String(reason).trim()})});rejected.push(key)}
+    catch(e){failed.push(`${run.workflowSnapshot?.name||run.id}：${decisionErrorMessage(e)}`)}
   }
   rejected.forEach(key=>approvalSelection().delete(key));
   await renderApprovals(false);
@@ -450,7 +475,7 @@ function bindApprovalBatch(){
   if(selectAll)selectAll.onchange=()=>{
     const selection=approvalSelection();
     (state.approvalItems||[]).filter(approvalSelectable).forEach(r=>{
-      const key=approvalKey(r.id,waitingNodeId(r));
+      const key=approvalRunKey(r);
       if(selectAll.checked)selection.add(key);else selection.delete(key);
     });
     refreshApprovalBatchUI();
@@ -533,6 +558,6 @@ async function renderApprovals(background=false){
   host.querySelectorAll('[data-open-logs]').forEach(b=>b.onclick=()=>openRunFromId(b.dataset.openLogs,{forceRuns:true}));
   host.querySelectorAll('[data-cancel-run]').forEach(b=>b.onclick=()=>{closeApprovalMoreMenus();cancelRunFlow(b.dataset.cancelRun)});
   bindApprovalMoreMenus(host);
-  host.querySelectorAll('[data-ap-select]').forEach(box=>{box.onchange=()=>{const key=approvalKey(box.dataset.apSelect,box.dataset.apNode);if(box.checked)approvalSelection().add(key);else approvalSelection().delete(key);refreshApprovalBatchUI()}});
+  host.querySelectorAll('[data-ap-select]').forEach(box=>{box.onchange=()=>{const key=box.dataset.apKey;if(box.checked)approvalSelection().add(key);else approvalSelection().delete(key);refreshApprovalBatchUI()}});
   bindWaitingActions(host);
 }

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"agentflow/internal/engine"
 	"agentflow/internal/gitwork"
 	"agentflow/internal/observability"
+	"agentflow/internal/repo"
 	"agentflow/internal/runtime"
 
 	"github.com/gin-gonic/gin"
@@ -268,7 +270,7 @@ func (h *runsHandlers) run(c *gin.Context) {
 			if rejectBlockedIssueRun(h.deps, c, id) {
 				return
 			}
-			respond(c, h.engine.Approve(id, req.NodeID, req.Context, decisionExpectation(req.NodeID, req.Expected)...))
+			respondRunDecision(c, h.engine.Approve(id, req.NodeID, req.Context, decisionExpectation(req.NodeID, req.Expected)...))
 		}
 	case "/api/runs/:id/reject":
 		var req domain.RejectRequest
@@ -276,7 +278,7 @@ func (h *runsHandlers) run(c *gin.Context) {
 			if rejectBlockedIssueRun(h.deps, c, id) {
 				return
 			}
-			respond(c, h.engine.Reject(id, req, decisionExpectation(req.NodeID, req.Expected)...))
+			respondRunDecision(c, h.engine.Reject(id, req, decisionExpectation(req.NodeID, req.Expected)...))
 		}
 	case "/api/runs/:id/retry":
 		var req domain.HumanDecision
@@ -287,14 +289,12 @@ func (h *runsHandlers) run(c *gin.Context) {
 			if h.prepareRunActivationWorkspace(c, id) {
 				return
 			}
-			respond(c, h.engine.RetryContext(c.Request.Context(), id, req.NodeID, req.Reason, req.Context, decisionExpectation(req.NodeID, req.Expected)...))
+			respondRunDecision(c, h.engine.RetryContext(c.Request.Context(), id, req.NodeID, req.Reason, req.Context, decisionExpectation(req.NodeID, req.Expected)...))
 		}
 	case "/api/runs/:id/decline-retry":
-		var req struct {
-			NodeID string `json:"nodeId"`
-		}
+		var req domain.HumanDecision
 		if decode(c, &req) {
-			respond(c, h.engine.DeclineRetry(id, req.NodeID))
+			respondRunDecision(c, h.engine.DeclineRetry(id, req.NodeID, decisionExpectation(req.NodeID, req.Expected)...))
 		}
 	case "/api/runs/:id/cancel":
 		respond(c, h.engine.Cancel(id))
@@ -514,4 +514,12 @@ func decisionExpectation(nodeID string, expected *domain.NodeDecisionExpectation
 		return nil
 	}
 	return []engine.NodeExpectation{{NodeID: nodeID, Status: expected.Status, Attempt: expected.Attempt, ReworkCount: expected.ReworkCount}}
+}
+
+func respondRunDecision(c *gin.Context, err error) {
+	if errors.Is(err, engine.ErrNodeDecisionStale) || errors.Is(err, repo.ErrRunDecisionStale) {
+		c.JSON(http.StatusConflict, map[string]string{"error": err.Error(), "code": "run_decision_stale"})
+		return
+	}
+	respond(c, err)
 }

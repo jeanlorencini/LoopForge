@@ -13,6 +13,7 @@ import (
 	"agentflow/internal/domain"
 	"agentflow/internal/observability"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -959,6 +960,35 @@ func (r *RunsRepo) PutRun(v domain.Run) error {
 	return r.writeRun(v)
 }
 
+type runWriteGuard struct {
+	revision          int
+	progress          bool
+	allowExpiredLease bool
+}
+
+type runHistoryCursors struct {
+	Logs, Telemetry, Events int64
+}
+
+func readRunHistoryCursors(tx *gorm.DB, runID string) (runHistoryCursors, error) {
+	var cursors runHistoryCursors
+	err := tx.Raw(`SELECT
+		COALESCE((SELECT MAX(seq) FROM run_logs WHERE run_id=?), 0) AS logs,
+		COALESCE((SELECT MAX(seq) FROM run_telemetry WHERE run_id=?), 0) AS telemetry,
+		COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id=?), -1) + 1 AS events`,
+		runID, runID, runID).Scan(&cursors).Error
+	return cursors, err
+}
+
+// PutRunProgress stores a progress snapshot only while its revision and lease
+// still match. Operator controls are owned by the control write paths.
+func (r *RunsRepo) PutRunProgress(v domain.Run, allowExpiredLease bool) error {
+	guard := runWriteGuard{revision: v.Revision, progress: true, allowExpiredLease: allowExpiredLease}
+	v.UpdatedAt = time.Now().UTC()
+	v.Revision++
+	return r.writeRun(v, guard)
+}
+
 // writeRun persists the run header plus whatever telemetry/logs/events arrived
 // since the last write. A run is the one entity written on a hot path, so the
 // header and its append-only children go in a single transaction.
@@ -967,20 +997,30 @@ func (r *RunsRepo) PutRun(v domain.Run) error {
 // turns out to claim one (new running run, restart of a succeeded/unstarted
 // run) is rolled back and retried with its bucket locked first, so a bucket
 // lock is never awaited while a run row is held.
-func (r *RunsRepo) writeRun(run domain.Run, expectedRevision ...int) error {
+func (r *RunsRepo) writeRun(run domain.Run, guards ...runWriteGuard) error {
+	var guard *runWriteGuard
+	if len(guards) > 0 {
+		guard = &guards[0]
+	}
 	lockKey := ""
 	for attempt := 0; ; attempt++ {
-		err := r.writeRunOnce(run, lockKey, expectedRevision...)
+		err := r.writeRunOnce(run, lockKey, guard)
 		var need *admissionLockRequired
 		if errors.As(err, &need) && attempt < 3 {
 			lockKey = need.key
+			continue
+		}
+		// InnoDB rolls back the deadlock victim. Retry the same snapshot under
+		// its guard without calling the engine's mutation again.
+		var mysqlErr *mysqldriver.MySQLError
+		if guard != nil && guard.progress && errors.As(err, &mysqlErr) && mysqlErr.Number == 1213 && attempt < 3 {
 			continue
 		}
 		return err
 	}
 }
 
-func (r *RunsRepo) writeRunOnce(run domain.Run, lockKey string, expectedRevision ...int) error {
+func (r *RunsRepo) writeRunOnce(run domain.Run, lockKey string, guard *runWriteGuard) error {
 	var opts []*sql.TxOptions
 	if lockKey != "" {
 		opts = r.admissionTxOptions()
@@ -993,16 +1033,18 @@ func (r *RunsRepo) writeRunOnce(run domain.Run, lockKey string, expectedRevision
 		}
 		current, err := r.takeRunForUpdate(tx, run.ID)
 		if err == nil {
-			if len(expectedRevision) > 0 && current.Revision != expectedRevision[0] {
+			if guard != nil && current.Revision != guard.revision {
 				return ErrRunDecisionStale
 			}
-			if run.Generation != current.Generation {
+			progress := guard != nil && guard.progress
+			if run.Generation != current.Generation || progress && run.OwnerInstanceID != current.OwnerInstanceID {
 				return ErrRunLeaseLost
 			}
 			leaseExpired := current.OwnerInstanceID != "" && (current.LeaseUntil == nil || !current.LeaseUntil.After(time.Now().UTC()))
-			if leaseExpired && !domain.TerminalRunStatus(run.Status) {
+			if leaseExpired && (!domain.TerminalRunStatus(run.Status) || progress && !guard.allowExpiredLease && !domain.TerminalRunStatus(current.Status)) {
 				return ErrRunLeaseLost
 			}
+			run.Revision = max(run.Revision, current.Revision+1)
 			if run.WorkspaceCleanedAt.IsZero() && current.WorkspaceCleaned != nil {
 				run.WorkspaceCleanedAt = *current.WorkspaceCleaned
 			}
@@ -1015,11 +1057,11 @@ func (r *RunsRepo) writeRunOnce(run domain.Run, lockKey string, expectedRevision
 		} else if err != gorm.ErrRecordNotFound {
 			return err
 		}
-		if len(expectedRevision) > 0 {
+		if guard != nil {
 			if err != nil {
 				return ErrRunDecisionStale
 			}
-			if run.Status == "running" || (!run.PauseRequested && !run.CancelRequested) {
+			if !guard.progress && (run.Status == "running" || (!run.PauseRequested && !run.CancelRequested)) {
 				if err := tx.Model(&runRow{}).Where("id = ?", run.ID).Updates(map[string]any{"cancel_requested": false, "pause_requested": false}).Error; err != nil {
 					return err
 				}
@@ -1033,18 +1075,12 @@ func (r *RunsRepo) writeRunOnce(run domain.Run, lockKey string, expectedRevision
 				return err
 			}
 		}
-		var cur struct {
-			logs      int64
-			telemetry int64
-			events    int64
-		}
-		if err := tx.Raw(`SELECT
-			COALESCE((SELECT MAX(seq) FROM run_logs WHERE run_id=?), 0) AS logs,
-			COALESCE((SELECT MAX(seq) FROM run_telemetry WHERE run_id=?), 0) AS telemetry,
-			COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id=?), -1) + 1 AS events`,
-			run.ID, run.ID, run.ID).Scan(&cur).Error; err != nil {
+		cur, err := readRunHistoryCursors(tx, run.ID)
+		if err != nil {
 			return err
 		}
+		run.LogSequence = max(run.LogSequence, current.LogSequence, cur.Logs)
+		run.TelemetrySequence = max(run.TelemetrySequence, current.TelemetrySequence, cur.Telemetry)
 		// On conflict only the run header is refreshed. Lease fields
 		// (owner_instance_id, lease_until, execution_generation) and workspace
 		// bindings are owned by the lease operations and must survive PutRun.
@@ -1064,15 +1100,13 @@ func (r *RunsRepo) writeRunOnce(run domain.Run, lockKey string, expectedRevision
 			if node == nil {
 				continue
 			}
-			if err := upsert(tx, "run_nodes", map[string]any{
-				"run_id": run.ID, "node_id": id, "status": node.Status, "attempt": node.Attempt, "payload": mustJSON(node),
-			}); err != nil {
+			if err := putRunNode(tx, run.ID, id, node); err != nil {
 				return err
 			}
 		}
 		// Events: append-only by index.
-		if int64(len(run.Events)) > cur.events {
-			for i := cur.events; i < int64(len(run.Events)); i++ {
+		if int64(len(run.Events)) > cur.Events {
+			for i := cur.Events; i < int64(len(run.Events)); i++ {
 				ev := run.Events[i]
 				if err := r.notifications.enqueueRunNotifications(tx, run, ev, i); err != nil {
 					return err
@@ -1085,25 +1119,8 @@ func (r *RunsRepo) writeRunOnce(run domain.Run, lockKey string, expectedRevision
 				}
 			}
 		}
-		for _, ev := range run.Telemetry {
-			if ev.Sequence == 0 || ev.Sequence <= cur.telemetry {
-				continue
-			}
-			if err := upsert(tx, "run_telemetry", map[string]any{
-				"run_id": run.ID, "seq": ev.Sequence, "payload": mustJSON(ev),
-			}); err != nil {
-				return err
-			}
-		}
-		for _, rec := range run.Logs {
-			if rec.Sequence == 0 || rec.Sequence <= cur.logs {
-				continue
-			}
-			if err := upsert(tx, "run_logs", map[string]any{
-				"run_id": run.ID, "seq": rec.Sequence, "payload": mustJSON(rec),
-			}); err != nil {
-				return err
-			}
+		if err := putRunSignals(tx, run, cur); err != nil {
+			return err
 		}
 		for _, art := range run.Artifacts {
 			id := art.ID
@@ -1121,6 +1138,82 @@ func (r *RunsRepo) writeRunOnce(run domain.Run, lockKey string, expectedRevision
 		}
 		return nil
 	}, opts...)
+}
+
+func putRunNode(tx *gorm.DB, runID, nodeID string, node *domain.NodeRun) error {
+	return upsert(tx, "run_nodes", map[string]any{
+		"run_id": runID, "node_id": nodeID, "status": node.Status, "attempt": node.Attempt, "payload": mustJSON(node),
+	})
+}
+
+func putRunSignals(tx *gorm.DB, run domain.Run, cursors runHistoryCursors) error {
+	for _, event := range run.Telemetry {
+		if event.Sequence <= cursors.Telemetry {
+			continue
+		}
+		if err := upsert(tx, "run_telemetry", map[string]any{
+			"run_id": run.ID, "seq": event.Sequence, "payload": mustJSON(event),
+		}); err != nil {
+			return err
+		}
+	}
+	for _, record := range run.Logs {
+		if record.Sequence <= cursors.Logs {
+			continue
+		}
+		if err := upsert(tx, "run_logs", map[string]any{
+			"run_id": run.ID, "seq": record.Sequence, "payload": mustJSON(record),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AppendRunSignals commits new log and observation records from an ingress
+// instance. Observation-derived metrics and node fields use the same revision
+// guard as the snapshot they were calculated from.
+func (r *RunsRepo) AppendRunSignals(run domain.Run, nodeID string) error {
+	return r.DB.Transaction(func(tx *gorm.DB) error {
+		current, err := r.takeRunForUpdate(tx, run.ID)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrRunNotFound
+		}
+		if err != nil {
+			return err
+		}
+		observation := len(run.Telemetry) > 0
+		if observation && (current.Revision != run.Revision || current.Generation != run.Generation || current.OwnerInstanceID != run.OwnerInstanceID) {
+			return ErrRunDecisionStale
+		}
+		cur, err := readRunHistoryCursors(tx, run.ID)
+		if err != nil {
+			return err
+		}
+		logs, telemetry := max(current.LogSequence, cur.Logs), max(current.TelemetrySequence, cur.Telemetry)
+		for i := range run.Logs {
+			logs++
+			run.Logs[i].Sequence = logs
+		}
+		for i := range run.Telemetry {
+			telemetry++
+			run.Telemetry[i].Sequence = telemetry
+		}
+		if err := putRunSignals(tx, run, cur); err != nil {
+			return err
+		}
+		updates := map[string]any{
+			"revision": current.Revision + 1, "updated_at": time.Now().UTC(),
+			"log_sequence": logs, "telemetry_sequence": telemetry,
+		}
+		if node := run.Nodes[nodeID]; observation && node != nil {
+			if err := putRunNode(tx, run.ID, nodeID, node); err != nil {
+				return err
+			}
+			updates["usage_json"], updates["tool_calls"] = jsonBytes(run.Usage), run.ToolCalls
+		}
+		return tx.Model(&runRow{}).Where("id = ?", run.ID).Updates(updates).Error
+	})
 }
 
 // DeleteRun removes a settled run together with all of its children (nodes,
@@ -1992,5 +2085,5 @@ func sortSliceStable[T any](values []T, less func(a, b T) bool) {
 func (r *RunsRepo) PutRunAtRevision(v domain.Run, revision int) error {
 	v.UpdatedAt = time.Now().UTC()
 	v.Revision++
-	return r.writeRun(v, revision)
+	return r.writeRun(v, runWriteGuard{revision: revision})
 }

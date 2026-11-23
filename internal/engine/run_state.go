@@ -55,7 +55,7 @@ func (e *Engine) updateRunAtErr(id string, allowExpiredLease bool, mutate func(*
 	if mutate != nil {
 		mutate(&r)
 	}
-	if err := e.repo.PutRun(r); err != nil {
+	if err := e.repo.PutRunProgress(r, allowExpiredLease); err != nil {
 		log.Printf("put run %s: %v", id, err)
 		return false, err
 	}

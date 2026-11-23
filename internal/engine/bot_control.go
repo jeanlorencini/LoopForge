@@ -2,8 +2,10 @@ package engine
 
 import (
 	"agentflow/internal/domain"
-	"fmt"
+	"errors"
 )
+
+var ErrNodeDecisionStale = errors.New("O estado do nó deste aviso mudou. Veja a mensagem mais recente")
 
 // NodeExpectation binds chat-card actions to the exact attempt displayed. The
 // existing engine state lock and persistence conflict checks still apply.
@@ -19,7 +21,7 @@ func checkNodeExpectation(run domain.Run, expected []NodeExpectation) error {
 	want := expected[0]
 	node := run.Nodes[want.NodeID]
 	if node == nil || node.Status != want.Status || node.Attempt != want.Attempt || node.ReworkCount != want.ReworkCount {
-		return fmt.Errorf("O estado do nó deste aviso mudou. Veja a mensagem mais recente")
+		return ErrNodeDecisionStale
 	}
 	return nil
 }
