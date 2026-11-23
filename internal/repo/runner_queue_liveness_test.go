@@ -1,10 +1,12 @@
 package repo
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"agentflow/internal/domain"
+	"gorm.io/gorm"
 )
 
 func TestRunnerQueuedUnavailabilityKeepsHealthyAndClaimedWork(t *testing.T) {
@@ -59,5 +61,68 @@ func TestRunnerQueuedUnavailabilityKeepsHealthyAndClaimedWork(t *testing.T) {
 	}
 	if _, claimed, err := store.ClaimRunnerTask(runner.ID, providers, now, time.Minute); err != nil || claimed {
 		t.Fatalf("claim after unavailable queue settled = %v, err = %v", claimed, err)
+	}
+}
+
+func TestDeregisterRunnerRecordsCauseAndKeepsConcurrentOutcomes(t *testing.T) {
+	store := newTestRunner(t)
+	now := time.Now().UTC()
+	const runnerID = "removed-runner"
+	if err := store.PutRunner(domain.Runner{ID: runnerID, Status: domain.RunnerStatusOnline}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"queued", "claimed", "completed"} {
+		task := domain.RunnerTask{ID: id, RunnerID: runnerID, Provider: id, Invocation: &domain.RunnerInvocation{GitHTTPUserID: 42}}
+		if err := store.PutRunnerTask(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	report := domain.RunnerTaskCompletion{Attempt: 1, Status: domain.RunnerTaskSuccess, Result: "verified"}
+	interleaved := false
+	callback := "test:deregister_claim"
+	if err := store.DB.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if interleaved || tx.Statement.Table != "runner_tasks" {
+			return
+		}
+		interleaved = true
+		// Use the same SQLite connection to advance the rows after removal has read its queue snapshot.
+		active := &RunnersRepo{deps: &deps{DB: tx.Session(&gorm.Session{NewDB: true})}}
+		for _, id := range []string{"claimed", "completed"} {
+			if task, ok, err := active.ClaimRunnerTask(runnerID, []string{id}, now, time.Minute); err != nil || !ok || task.ID != id {
+				t.Errorf("interleaved claim of %s: id = %q, claimed = %v, error = %v", id, task.ID, ok, err)
+				return
+			}
+		}
+		if changed, err := active.CompleteRunnerTaskAttempt("completed", runnerID, report, now); err != nil || !changed {
+			t.Errorf("interleaved completion: changed = %v, error = %v", changed, err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeregisterRunner(runnerID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB.Callback().Query().Remove(callback); err != nil {
+		t.Fatal(err)
+	}
+	if !interleaved {
+		t.Fatal("claim interleaving was not exercised")
+	}
+	claimed, _ := store.RunnerTask("claimed")
+	if claimed.Status != domain.RunnerTaskLeased || claimed.LeaseOwner != runnerID || claimed.Attempt != 1 {
+		t.Errorf("deregister overwrote a concurrent claim: %+v", claimed)
+	}
+	completed, _ := store.RunnerTask("completed")
+	if completed.Status != domain.RunnerTaskSuccess || completed.Result != "verified" || completed.Attempt != 1 {
+		t.Errorf("deregister overwrote a concurrent result: %+v", completed)
+	}
+	if changed, err := store.CompleteRunnerTaskAttempt("completed", runnerID, report, now); err != nil || changed {
+		t.Errorf("stored completion receipt was not preserved: changed = %v, error = %v", changed, err)
+	}
+	queued, _ := store.RunnerTask("queued")
+	if queued.Status != domain.RunnerTaskCanceled || queued.CompletedAt == nil || queued.Invocation.GitHTTPUserID != 0 ||
+		!strings.Contains(queued.Error, runnerID) || !strings.Contains(queued.Error, "removed") {
+		t.Errorf("queued task did not retain the cause of removal: %+v", queued)
 	}
 }

@@ -321,7 +321,7 @@ func (e *Engine) dispatchRunnerTask(ctx context.Context, runnerID string, run do
 		}
 		return "", explainGitAuthFailure(errors.New(msg), strings.TrimSpace(sb.credentialSnapshot().GitHTTPCredentials["github.com"].Token) != "")
 	case domain.RunnerTaskCanceled:
-		return "", errors.New("runner task canceled")
+		return "", runnerTaskCanceledError(final, "runner task canceled")
 	default:
 		return "", fmt.Errorf("runner task ended in unexpected state %q", final.Status)
 	}
@@ -401,12 +401,12 @@ func shellSingleQuote(value string) string {
 // execution machine. Repository metadata is included so a script can also be
 // the first node; subsequent shared-layout nodes reuse the same checkout and
 // its workspace-local Git index flags.
-func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run domain.Run, nodeID, workspace, language, script, artifactDirectory string, artifacts []domain.ArtifactContract, sb *runEnvironment, gitToken, gitUserName, gitUserEmail string, assets domain.AgentAssetBundle, sink runtime.EventSink) (string, error) {
+func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run domain.Run, nodeID, workspace, language, script, artifactDirectory string, artifacts []domain.ArtifactContract, sb *runEnvironment, gitToken, gitUserName, gitUserEmail string, assets domain.AgentAssetBundle, sink runtime.EventSink) (string, *int, error) {
 	if err := e.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts()); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := e.requireRunnerProvider(runnerID, "terminal"); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	command := script
 	if strings.EqualFold(strings.TrimSpace(language), "python") {
@@ -444,13 +444,13 @@ func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run 
 	var err error
 	task.Sandbox, err = e.runnerSandboxSpec(run)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := validateSOPHandoffRunnerPayload(run, task); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := e.repo.PutRunnerTask(task); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	e.notifyRunnerDispatch("terminal")
 	if sink != nil {
@@ -462,7 +462,7 @@ func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run 
 	}
 	final, err := e.awaitRunnerTask(ctx, task.ID, sink)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if reported != nil {
 		reported.absorb(final.Outputs)
@@ -470,23 +470,28 @@ func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run 
 	}
 	switch final.Status {
 	case domain.RunnerTaskSuccess:
+		exitCode := final.ExitCode
+		if exitCode != nil && *exitCode < 0 {
+			exitCode = nil
+		}
 		if reported == nil {
 			if err := restoreRunnerArtifacts(filepath.Join(sb.Workspace(), filepath.FromSlash(artifactDirectory)), artifacts, final.Artifacts); err != nil {
-				return final.Result, fmt.Errorf("restore runner script artifacts: %w", err)
+				return final.Result, exitCode, fmt.Errorf("restore runner script artifacts: %w", err)
 			}
 		}
-		return final.Result, nil
+		return final.Result, exitCode, nil
 	case domain.RunnerTaskCanceled:
-		return final.Result, errors.New("runner script canceled")
+		return final.Result, nil, runnerTaskCanceledError(final, "runner script canceled")
 	default:
+		message := clipHumanGateDetail(final.Error)
+		// Older runners use zero for failures that occur before a command starts.
 		if final.ExitCode != nil && *final.ExitCode > 0 {
-			return final.Result, scriptExitError(*final.ExitCode)
+			return final.Result, final.ExitCode, scriptExitError{code: *final.ExitCode, runnerDetail: message}
 		}
-		message := strings.TrimSpace(final.Error)
 		if message == "" {
 			message = "script failed on runner"
 		}
-		return final.Result, errors.New(message)
+		return final.Result, nil, errors.New(message)
 	}
 }
 
@@ -660,7 +665,7 @@ func (e *Engine) dispatchRunnerCommand(ctx context.Context, runnerID, runID, nod
 		}
 		return final.Result, nil
 	case domain.RunnerTaskCanceled:
-		return "", errors.New("runner task canceled")
+		return "", runnerTaskCanceledError(final, "runner task canceled")
 	default:
 		msg := strings.TrimSpace(final.Error)
 		if msg == "" {
@@ -671,6 +676,13 @@ func (e *Engine) dispatchRunnerCommand(ctx context.Context, runnerID, runID, nod
 		}
 		return final.Result, errors.New(msg)
 	}
+}
+
+func runnerTaskCanceledError(task domain.RunnerTask, fallback string) error {
+	if detail := clipHumanGateDetail(task.Error); detail != "" {
+		return fmt.Errorf("%s: %s", fallback, detail)
+	}
+	return errors.New(fallback)
 }
 
 // gateCommandInvocation is the payload a verification command needs on the

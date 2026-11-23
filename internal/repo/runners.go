@@ -925,10 +925,8 @@ func (r *RunnersRepo) RunnerTaskEventsAfter(taskID string, after int64) []domain
 	return out
 }
 
-// DeregisterRunner removes a runner and everything that points at it: the
-// machine record, default-execution-machine selections that target it, and
-// its queued tasks (running tasks recover through lease expiry). Called when
-// the daemon uninstalls or stops gracefully.
+// DeregisterRunner removes a machine, clears its default selections and
+// cancels its unclaimed tasks. Leased tasks recover through lease expiry.
 func (r *RunnersRepo) DeregisterRunner(id string, now time.Time) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -936,19 +934,20 @@ func (r *RunnersRepo) DeregisterRunner(id string, now time.Time) error {
 	}
 	return r.DB.Transaction(func(tx *gorm.DB) error {
 		var rows []runnerTaskRow
-		if err := tx.Where("runner_id = ? AND status = ?", id, domain.RunnerTaskQueued).Find(&rows).Error; err != nil {
+		if err := r.locking(tx).Where("runner_id = ? AND status = ?", id, domain.RunnerTaskQueued).Find(&rows).Error; err != nil {
 			return err
 		}
 		for _, row := range rows {
 			task := runnerTaskFromRow(row)
 			task.Status = domain.RunnerTaskCanceled
-			task.LeaseOwner = ""
-			task.LeaseUntil = nil
+			task.Error = fmt.Sprintf("runner %q was removed before claiming task %s", id, task.ID)
+			task.LeaseOwner, task.DesiredState = "", ""
+			task.LeaseUntil, task.ExitCode = nil, nil
 			scrubRunnerTaskCredentials(&task)
-			completed := now
-			task.CompletedAt = &completed
-			task.UpdatedAt = now
-			if err := tx.Model(&runnerTaskRow{}).Where("id = ?", task.ID).Updates(runnerTaskRowValues(task)).Error; err != nil {
+			task.CompletedAt, task.UpdatedAt = &now, now
+			if err := tx.Model(&runnerTaskRow{}).
+				Where("id = ? AND runner_id = ? AND status = ? AND attempt = ?", task.ID, id, domain.RunnerTaskQueued, row.Attempt).
+				Updates(runnerTaskRowValues(task)).Error; err != nil {
 				return err
 			}
 		}

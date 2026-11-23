@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 func (e *Engine) execute(ctx context.Context, runID string) {
@@ -360,7 +361,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 		if ctx.Err() != nil {
 			return
 		}
-		if runtime.IsSandboxInterrupt(err) {
+		if runtime.IsSandboxInterrupt(withoutRunnerDetail(err)) {
 			e.requeueInterruptedNode(runID, node.ID, executionAttempt, executionGeneration)
 			return
 		}
@@ -639,13 +640,17 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			if language == "python" {
 				command = "python3 -c " + shellSingleQuote(script)
 			}
+			var exitCode *int
 			rawOutput, runErr := executeForTargets(current, node.ExecutionScope, func(target executionTarget) (string, error) {
+				exitCode = nil
 				bound := bindExecutionTarget(command, target)
 				targetSink := executionTargetSink(sink, target)
 				scriptAssets := e.resolveScriptMCPAssets(current.ExecutionContext.ProjectID, current.ExecutionContext.ResponsibleUserID)
 				if execMachine := e.defaultExecutionRunner(current); execMachine != "" {
 					workspace := runnerWorkspaceRel(current, node.ID)
-					return e.dispatchRunnerScript(ctx, execMachine, current, node.ID, workspace, "shell", bound, target.directory(), effectiveNode.ArtifactOutputs, sb, sb.credentialSnapshot().GitHTTPCredentials["github.com"].Token, sb.credentialSnapshot().GitUserName, sb.credentialSnapshot().GitUserEmail, scriptAssets, targetSink)
+					output, code, err := e.dispatchRunnerScript(ctx, execMachine, current, node.ID, workspace, "shell", bound, target.directory(), effectiveNode.ArtifactOutputs, sb, sb.credentialSnapshot().GitHTTPCredentials["github.com"].Token, sb.credentialSnapshot().GitUserName, sb.credentialSnapshot().GitUserEmail, scriptAssets, targetSink)
+					exitCode = code
+					return output, err
 				}
 				if err := runtime.ProvisionMCPAssets(ctx, sb, sb.Workspace(), scriptAssets, targetSink); err != nil {
 					return "", err
@@ -654,17 +659,23 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				if err != nil {
 					return "", err
 				}
-				var exitCode int
+				var code int
+				var observedExit bool
 				output, execErr := sb.Exec(ctx, scriptSpec, func(event domain.TelemetryEvent) {
 					if event.Name == "process.finished" {
-						exitCode, _ = event.Attributes["exitCode"].(int)
+						code, observedExit = event.Attributes["exitCode"].(int)
+						observedExit = observedExit && code >= 0 && (code != 0 || event.Level != "error")
 					}
 					targetSink(event)
 				})
 				// Exec can fail during sandbox preparation, before the script process starts.
 				var processErr *exec.ExitError
-				if exitCode > 0 && errors.As(execErr, &processErr) && processErr.ExitCode() == exitCode {
-					execErr = fmt.Errorf("%w: %w", scriptExitError(exitCode), execErr)
+				switch {
+				case observedExit && code == 0:
+					exitCode = &code
+				case observedExit && errors.As(execErr, &processErr) && processErr.ExitCode() == code:
+					exitCode = &code
+					execErr = fmt.Errorf("%w: %w", scriptExitError{code: code}, execErr)
 				}
 				return output, execErr
 			})
@@ -685,9 +696,8 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				status, level = "失败", "error"
 			}
 			attributes := map[string]any{"language": language, "status": status, "durationMs": duration.Milliseconds(), "outputBytes": len(rawOutput)}
-			var exit scriptExitError
-			if errors.As(runErr, &exit) {
-				attributes["exitCode"] = int(exit)
+			if exitCode != nil {
+				attributes["exitCode"] = *exitCode
 			}
 			sink(domain.TelemetryEvent{
 				Category: "script", Name: "script.completed", Phase: "finish", Level: level,
@@ -1035,7 +1045,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 	e.attachLoopRetro(runID, node.ID, retroWorkspace, lastIteration, err, failedAction)
 	if err != nil {
 		e.freezeAvailableArtifacts(runID, effectiveNode, sb.Workspace(), reported, output)
-		if ctx.Err() != nil || runtime.IsSandboxInterrupt(err) {
+		if ctx.Err() != nil || runtime.IsSandboxInterrupt(withoutRunnerDetail(err)) {
 			if ctx.Err() == nil {
 				e.requeueInterruptedNode(runID, node.ID, executionAttempt, executionGeneration)
 			}
@@ -1230,7 +1240,11 @@ func clipHumanGateDetail(detail string) string {
 	if len(detail) <= limit {
 		return detail
 	}
-	return detail[:limit] + "…"
+	end := limit
+	for end > 0 && !utf8.RuneStart(detail[end]) {
+		end--
+	}
+	return detail[:end] + "…"
 }
 
 // joinGateCommands binds each configured gate command against the node's

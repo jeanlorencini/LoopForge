@@ -52,7 +52,7 @@ func (e *Engine) nodeFailedAt(runID string, node domain.WorkflowNode, attempt, g
 	shouldReject := false
 	configurationFailure := errors.Is(err, ErrWorkspaceControlConfiguration)
 	var exit scriptExitError
-	stopReprocessing := isScriptNode(node) && errors.As(err, &exit) && slices.Contains(node.NonRetryableExitCodes, int(exit))
+	stopReprocessing := isScriptNode(node) && errors.As(err, &exit) && slices.Contains(node.NonRetryableExitCodes, exit.code)
 	if stopReprocessing {
 		err = fmt.Errorf("%w. Fix the prerequisite reported in the script logs, then retry manually", err)
 		allowReject = false
@@ -93,10 +93,27 @@ func (e *Engine) nodeFailedAt(runID string, node domain.WorkflowNode, attempt, g
 	}
 }
 
-type scriptExitError int
+type scriptExitError struct {
+	code         int
+	runnerDetail string
+}
 
 func (e scriptExitError) Error() string {
-	return fmt.Sprintf("script exited with code %d", int(e))
+	message := fmt.Sprintf("script exited with code %d", e.code)
+	if e.runnerDetail != "" {
+		message += ": " + e.runnerDetail
+	}
+	return message
+}
+
+// A reported process exit has already classified the failure. The runner's
+// diagnostic text is for the operator and cannot override that decision.
+func withoutRunnerDetail(err error) error {
+	var exit scriptExitError
+	if errors.As(err, &exit) && exit.runnerDetail != "" {
+		return scriptExitError{code: exit.code}
+	}
+	return err
 }
 
 func shouldRetryFailedAttempt(node domain.WorkflowNode, attempt int, err error) bool {
@@ -104,6 +121,7 @@ func shouldRetryFailedAttempt(node domain.WorkflowNode, attempt int, err error) 
 	if errors.Is(err, ErrWorkspaceControlConfiguration) || errors.Is(err, errSOPArtifactWrite) {
 		return false
 	}
+	err = withoutRunnerDetail(err)
 	if err != nil && (isMaxTurnsErr(err) || strings.Contains(err.Error(), "verification ") || runtime.IsCwdMountFailure(err)) {
 		return false
 	}
