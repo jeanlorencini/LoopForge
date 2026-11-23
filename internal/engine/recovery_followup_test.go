@@ -539,3 +539,106 @@ func TestResumePausedNodeKeepsConcurrentCancel(t *testing.T) {
 		t.Fatalf("resume changed state: cancel=%t status=%s node=%s owner=%q task=%s", got.CancelRequested, got.Status, got.Nodes["close"].Status, got.OwnerInstanceID, task.Status)
 	}
 }
+
+func TestParkKeepsConcurrentOperatorPauseCheckpoint(t *testing.T) {
+	e, s := newRecoveryEngine(t)
+	r := completedRecoveryRun("pause-crosses-park")
+	r.WorkflowSnapshot.Nodes = append(r.WorkflowSnapshot.Nodes, domain.WorkflowNode{ID: "gate", Type: "approval"})
+	r.Nodes["close"].Status, r.Nodes["close"].RunnerAttemptID = "running", "original-attempt"
+	r.Nodes["gate"] = &domain.NodeRun{NodeID: "gate", Status: "waiting_approval", Attempt: 1}
+	r.OwnerInstanceID, r.Generation, r.LeaseUntil = e.instanceID, 1, time.Now().Add(time.Minute)
+	if err := s.PutRun(r); err != nil {
+		t.Fatal(err)
+	}
+	task := domain.RunnerTask{ID: "completed-script", RunID: r.ID, NodeID: "close", Attempt: 1,
+		Provider: "terminal", Status: domain.RunnerTaskSuccess, Result: "durable result"}
+	if err := s.PutRunnerTask(task); err != nil {
+		t.Fatal(err)
+	}
+	reads := 0
+	var pauseErr error
+	if err := s.DB.Callback().Query().After("gorm:query").Register("fixture:pause_crosses_park", func(tx *gorm.DB) {
+		if tx.Statement.Table == "run_artifacts" {
+			reads++
+			// The second snapshot belongs to the park write, after the interruption check.
+			if reads == 2 {
+				_, pauseErr = s.RequestRunPause(r.ID)
+			}
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.finishInterruptedAt(r.ID, r.Generation)
+	got, _ := s.RunState(r.ID)
+	if reads < 2 || pauseErr != nil || !got.PauseRequested {
+		t.Fatalf("fixture did not commit the pause: reads=%d err=%v paused=%t", reads, pauseErr, got.PauseRequested)
+	}
+	if got.Status != "waiting" || !isUserPausedNode(got.Nodes["close"]) || isUserPausedNode(got.Nodes["gate"]) ||
+		got.Nodes["close"].RunnerAttemptID != "original-attempt" {
+		t.Fatalf("lost the operator pause checkpoint: status=%s, close=%+v, gate=%+v", got.Status, got.Nodes["close"], got.Nodes["gate"])
+	}
+	storedTask, ok := s.RunnerTask(task.ID)
+	if !ok || storedTask.Status != task.Status || storedTask.Result != task.Result || storedTask.Attempt != task.Attempt {
+		t.Fatalf("durable task changed: %+v", storedTask)
+	}
+	api := New(s, nil)
+	api.ConfigureExecution("control-api", "", time.Minute, false)
+	if err := api.ResumePaused(r.ID, ""); err != nil {
+		t.Fatalf("paused branch could not resume beside the human gate: %v", err)
+	}
+	resumed, _ := s.RunState(r.ID)
+	if resumed.Nodes["close"].Status != "pending" || resumed.Nodes["gate"].Status != "waiting_approval" {
+		t.Fatalf("unexpected resumed checkpoint: close=%s gate=%s", resumed.Nodes["close"].Status, resumed.Nodes["gate"].Status)
+	}
+}
+
+func TestReplayedProgressKeepsObservationOnOriginalAttempt(t *testing.T) {
+	e, s := newRecoveryEngine(t)
+	r := completedRecoveryRun("observation-crosses-rework")
+	node := r.WorkflowSnapshot.Nodes[0]
+	r.Nodes[node.ID].Status, r.Nodes[node.ID].RunnerAttemptID = "running", "old-attempt"
+	r.OwnerInstanceID, r.Generation, r.LeaseUntil = e.instanceID, 1, time.Now().Add(time.Minute)
+	if err := s.PutRun(r); err != nil {
+		t.Fatal(err)
+	}
+	replacement, _ := s.RunState(r.ID)
+	next := replacement.Nodes[node.ID]
+	next.Attempt, next.ReworkCount, next.RunnerAttemptID = 2, 1, "new-attempt"
+	next.Activity, next.SessionID, next.ResumeSessionID = "new activity", "new session", "new resume target"
+	replacement.TelemetrySequence++
+	replacement.Telemetry = []domain.TelemetryEvent{{
+		ID: "replacement-started", RunID: r.ID, NodeID: node.ID, Sequence: replacement.TelemetrySequence,
+		Context: domain.TelemetryContext{RunID: r.ID, NodeID: node.ID, Attempt: 2},
+	}}
+	fired := false
+	var replaceErr error
+	if err := s.DB.Callback().Query().After("gorm:query").Register("fixture:rework_crosses_progress", func(tx *gorm.DB) {
+		if tx.Statement.Table == "run_artifacts" && !fired {
+			fired = true
+			replaceErr = s.PutRunAtRevision(replacement, replacement.Revision)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.enqueueObservation(r.ID, node.ID, domain.TelemetryEvent{
+		ID: "old-attempt-output", Category: "process", Name: "process.stdout", Message: "previous output",
+		SessionID: "old session", Usage: &domain.TokenUsage{InputTokens: 10},
+	})
+
+	e.nodeFailedAt(r.ID, node, 1, r.Generation, errors.New("previous failure"), false)
+	got, ok := s.Run(r.ID)
+	if !fired || replaceErr != nil || !ok {
+		t.Fatalf("fixture did not replace the attempt: fired=%t err=%v found=%t", fired, replaceErr, ok)
+	}
+	current := got.Nodes[node.ID]
+	if current.Status != "running" || current.Attempt != 2 || current.Activity != next.Activity || current.SessionID != next.SessionID ||
+		current.ResumeSessionID != next.ResumeSessionID || current.Usage.TotalTokens != 0 {
+		t.Fatalf("old observation altered the replacement attempt: %+v", current)
+	}
+	if len(got.Telemetry) != 2 || got.Telemetry[0].ID != "replacement-started" || got.Telemetry[0].Context.Attempt != 2 ||
+		got.Telemetry[1].ID != "old-attempt-output" || got.Telemetry[1].Context.Attempt != 1 || got.Telemetry[1].Sequence != got.Telemetry[0].Sequence+1 ||
+		len(got.Logs) != 1 || got.Logs[0].Context.Attempt != 1 {
+		t.Fatalf("old observation lost its original attempt: telemetry=%+v logs=%+v", got.Telemetry, got.Logs)
+	}
+}

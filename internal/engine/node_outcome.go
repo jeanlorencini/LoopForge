@@ -68,8 +68,7 @@ func (e *Engine) updateNodeOutcome(runID, nodeID string, generation, attempt int
 			!shouldCommitNodeOutcome(*r, nr, generation, attempt, success) {
 			return false
 		}
-		if selected != nil && (nr.Attempt != selected.Attempt || nr.RunnerAttemptID != selected.RunnerAttemptID ||
-			nr.ReworkCount != selected.ReworkCount || !nr.StartedAt.Equal(selected.StartedAt)) {
+		if selected != nil && !sameNodeAttempt(selected, nr) {
 			return false
 		}
 		selected = nr
@@ -288,6 +287,7 @@ func (e *Engine) finishInterruptedAt(runID string, generation int) {
 
 func (e *Engine) parkForResumeAt(runID string, generation int, message string) {
 	e.stopRunScheduler(runID)
+	controlRequested := false
 	parked, _ := e.updateRunReplayable(runID, func(r *domain.Run) bool {
 		if r.Generation != generation || ((r.OwnerInstanceID != "" || r.Generation > 0) && !e.ownsRun(*r)) {
 			return false
@@ -295,11 +295,20 @@ func (e *Engine) parkForResumeAt(runID string, generation int, message string) {
 		if domain.TerminalRunStatus(r.Status) {
 			return false
 		}
+		controlRequested = r.PauseRequested || r.CancelRequested
+		if controlRequested {
+			return false
+		}
 		resetInFlightNodesForResume(r, "执行实例退出，等待恢复")
 		r.Status = "running"
 		e.event(r, "", "run.parked", message)
 		return true
 	})
+	if controlRequested {
+		// Settlement rechecks durable controls and gives cancellation priority.
+		e.pauseAt(runID, generation, "运行已由用户暂停")
+		return
+	}
 	if parked {
 		e.detachRunEnvironment(runID)
 		e.observe(runID, "", domain.TelemetryEvent{Category: "orchestration", Name: "run.parked", Phase: "finish", Message: message})

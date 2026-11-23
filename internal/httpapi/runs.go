@@ -319,7 +319,7 @@ func (h *runsHandlers) run(c *gin.Context) {
 			if rejectBlockedIssueRun(h.deps, c, id) {
 				return
 			}
-			respond(c, h.engine.Pass(id, req.NodeID, req.Context))
+			respondRunDecision(c, h.engine.Pass(id, req.NodeID, req.Context, decisionExpectation(req.NodeID, req.Expected)...))
 		}
 	default:
 		c.Status(http.StatusNotFound)

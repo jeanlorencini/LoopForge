@@ -62,10 +62,34 @@ func (e *Engine) updateRunProgress(id string, allowExpiredLease, replay bool, mu
 		return false, nil
 	}
 	pending := e.takePendingObservations(id)
+	nodesAtRead := make(map[string]*domain.NodeRun)
+	for i := range pending {
+		item := &pending[i]
+		if item.nodeID == "" || item.nodeAtRead != nil {
+			continue
+		}
+		if nodesAtRead[item.nodeID] == nil {
+			var node domain.NodeRun
+			if current := r.Nodes[item.nodeID]; current != nil {
+				node = *current
+			}
+			nodesAtRead[item.nodeID] = &node
+		}
+		item.nodeAtRead = nodesAtRead[item.nodeID]
+	}
 	owner, generation := r.OwnerInstanceID, r.Generation
 	for {
+		coalesce := true
 		for _, item := range pending {
-			e.applyObservation(&r, item.nodeID, item.event)
+			var original *domain.NodeRun
+			current := r.Nodes[item.nodeID]
+			if item.nodeAtRead != nil && (!sameNodeAttempt(item.nodeAtRead, current) ||
+				(item.nodeAtRead.Status != current.Status && current.Status != "running" && current.Status != "pending_input")) {
+				original = item.nodeAtRead
+				// Later progress must not coalesce into an earlier attempt's event.
+				coalesce = false
+			}
+			e.applyObservationWithHistory(&r, item.nodeID, item.event, original, coalesce)
 		}
 		applied := mutate == nil || mutate(&r)
 		if (mutate == nil || !applied) && len(pending) == 0 {
@@ -93,6 +117,11 @@ func (e *Engine) updateRunProgress(id string, allowExpiredLease, replay bool, mu
 			return false, nil
 		}
 	}
+}
+
+func sameNodeAttempt(a, b *domain.NodeRun) bool {
+	return a != nil && b != nil && a.Attempt == b.Attempt && a.RunnerAttemptID == b.RunnerAttemptID &&
+		a.ReworkCount == b.ReworkCount && a.StartedAt.Equal(b.StartedAt)
 }
 
 // Subscribe provides provider-neutral live run snapshots. Slow clients receive
