@@ -598,9 +598,9 @@ func (d *Daemon) executeTask(ctx context.Context, task domain.RunnerTask) {
 	}
 
 	releaseGate()
-	completeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	completeCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	req := CompleteRequest{Status: result.status, Result: result.result, Error: result.errMsg, Artifacts: artifacts, Outputs: result.outputs}
+	req := CompleteRequest{Attempt: task.Attempt, Status: result.status, Result: result.result, Error: result.errMsg, Artifacts: artifacts, Outputs: result.outputs}
 	if result.status == domain.RunnerTaskFailed || result.status == domain.RunnerTaskSuccess {
 		exit := result.exitCode
 		req.ExitCode = &exit

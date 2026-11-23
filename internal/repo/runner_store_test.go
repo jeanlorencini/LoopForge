@@ -281,6 +281,46 @@ func TestRunnerTaskExpireRequeuesOrFails(t *testing.T) {
 	}
 }
 
+func TestRunnerTaskExpirySettlesPendingCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		maxAttempts int
+	}{
+		{name: "with retry remaining", maxAttempts: 2},
+		{name: "without retry remaining", maxAttempts: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestRunner(t)
+			task := domain.RunnerTask{
+				ID: "rt-canceled", Provider: "codex", Status: domain.RunnerTaskQueued,
+				MaxAttempts: tc.maxAttempts, Invocation: &domain.RunnerInvocation{CodexAPIKey: "fixture"},
+			}
+			if err := s.PutRunnerTask(task); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+			if _, claimed, err := s.ClaimRunnerTask("runner-a", []string{"codex"}, now, time.Second); err != nil || !claimed {
+				t.Fatalf("claim: %v, %v", claimed, err)
+			}
+			if err := s.CancelRunnerTask(task.ID, now); err != nil {
+				t.Fatal(err)
+			}
+			expired := now.Add(2 * time.Second)
+			if recovered, err := s.ExpireRunnerTasks(expired); err != nil || len(recovered) != 1 {
+				t.Fatalf("expire recovered %d tasks, error %v", len(recovered), err)
+			}
+			final, _ := s.RunnerTask(task.ID)
+			if final.Status != domain.RunnerTaskCanceled || final.CompletedAt == nil || !final.CompletedAt.Equal(expired) ||
+				final.LeaseUntil != nil || final.LeaseOwner != "" || final.DesiredState != "" || final.Invocation.CodexAPIKey != "" {
+				t.Fatalf("pending cancellation lost on expiry: status=%s attempt=%d completed=%v", final.Status, final.Attempt, final.CompletedAt)
+			}
+			if _, claimed, err := s.ClaimRunnerTask("runner-a", []string{"codex"}, expired, time.Second); err != nil || claimed {
+				t.Fatalf("canceled task was claimable: %v, %v", claimed, err)
+			}
+		})
+	}
+}
+
 func TestRunnerTaskEventsIdempotent(t *testing.T) {
 	s := newTestRunner(t)
 	putQueuedTask(t, s, "rt-1", "codex", "", 0)

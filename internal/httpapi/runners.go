@@ -1119,14 +1119,7 @@ func (h *runnersHandlers) runnerTaskComplete(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var input struct {
-		Status    string                    `json:"status"`
-		ExitCode  *int                      `json:"exitCode"`
-		Result    string                    `json:"result"`
-		Error     string                    `json:"error"`
-		Artifacts map[string]string         `json:"artifacts"`
-		Outputs   *domain.RunnerTaskOutputs `json:"outputs"`
-	}
+	var input domain.RunnerTaskCompletion
 	if !decode(c, &input) {
 		return
 	}
@@ -1147,7 +1140,9 @@ func (h *runnersHandlers) runnerTaskComplete(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, map[string]string{"error": message})
 		return
 	}
-	if err := h.repo.CompleteRunnerTask(c.Param("id"), runner.ID, input.Status, input.ExitCode, input.Result, input.Error, input.Artifacts, input.Outputs, time.Now().UTC()); err != nil {
+	taskID := c.Param("id")
+	changed, err := h.repo.CompleteRunnerTaskAttempt(taskID, runner.ID, input, time.Now().UTC())
+	if err != nil {
 		if err == repo.ErrRunnerTaskLeaseLost {
 			c.JSON(http.StatusConflict, map[string]string{"error": "task lease lost"})
 			return
@@ -1155,9 +1150,11 @@ func (h *runnersHandlers) runnerTaskComplete(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	h.engine.NotifyRunnerTaskChanged(c.Param("id"))
-	if task, ok := h.repo.RunnerTask(c.Param("id")); ok {
-		h.engine.OnRunnerTaskCompleted(task)
+	if changed {
+		h.engine.NotifyRunnerTaskChanged(taskID)
+		if task, ok := h.repo.RunnerTask(taskID); ok {
+			h.engine.OnRunnerTaskCompleted(task)
+		}
 	}
 	c.JSON(http.StatusOK, map[string]bool{"ok": true})
 }

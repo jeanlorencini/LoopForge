@@ -614,6 +614,17 @@ type RunnerInputFile struct {
 	Content string `json:"content"`
 }
 
+// RunnerTaskCompletion reports the final result of a claimed attempt.
+type RunnerTaskCompletion struct {
+	Attempt   int                `json:"attempt,omitempty"`
+	Status    string             `json:"status"`
+	ExitCode  *int               `json:"exitCode"`
+	Result    string             `json:"result"`
+	Error     string             `json:"error"`
+	Artifacts map[string]string  `json:"artifacts,omitempty"`
+	Outputs   *RunnerTaskOutputs `json:"outputs,omitempty"`
+}
+
 // RunnerTaskOutputs is what a runner reports about the task workspace after
 // an invocation or script.
 type RunnerTaskOutputs struct {

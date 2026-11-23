@@ -52,6 +52,13 @@ func (c *Client) sessionToken() string {
 
 // ---------- request plumbing ----------
 
+type runnerHTTPError struct {
+	status int
+	text   string
+}
+
+func (e *runnerHTTPError) Error() string { return e.text }
+
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
 	var reader io.Reader
 	if body != nil {
@@ -82,7 +89,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 	if resp.StatusCode == http.StatusNoContent {
 		return nil
 	}
-	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	payload, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode >= 400 {
 		var detail struct {
 			Error string `json:"error"`
@@ -90,7 +97,10 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		if resp.StatusCode == http.StatusConflict && json.Unmarshal(payload, &detail) == nil && detail.Error == ErrTaskLeaseLost.Error() {
 			return ErrTaskLeaseLost
 		}
-		return fmt.Errorf("%s %s: %s", method, path, strings.TrimSpace(string(payload)))
+		return &runnerHTTPError{status: resp.StatusCode, text: fmt.Sprintf("%s %s: %s", method, path, strings.TrimSpace(string(payload)))}
+	}
+	if readErr != nil {
+		return fmt.Errorf("read %s %s response: %w", method, path, readErr)
 	}
 	if out != nil && len(payload) > 0 {
 		if err := json.Unmarshal(payload, out); err != nil {
@@ -286,17 +296,27 @@ func (c *Client) SendEvents(ctx context.Context, taskID string, events []domain.
 	return c.do(ctx, http.MethodPost, "/runners/tasks/"+taskID+"/events", map[string]any{"events": events}, nil)
 }
 
-type CompleteRequest struct {
-	Status    string                    `json:"status"`
-	ExitCode  *int                      `json:"exitCode"`
-	Result    string                    `json:"result"`
-	Error     string                    `json:"error"`
-	Artifacts map[string]string         `json:"artifacts,omitempty"`
-	Outputs   *domain.RunnerTaskOutputs `json:"outputs,omitempty"`
-}
+type CompleteRequest = domain.RunnerTaskCompletion
 
 func (c *Client) Complete(ctx context.Context, taskID string, req CompleteRequest) error {
-	return c.do(ctx, http.MethodPost, "/runners/tasks/"+taskID+"/complete", req, nil)
+	path := "/runners/tasks/" + taskID + "/complete"
+	for attempt := 1; ; attempt++ {
+		requestCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		err := c.do(requestCtx, http.MethodPost, path, req, nil)
+		cancel()
+		if err == nil || req.Attempt == 0 || attempt == 3 || errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrTaskLeaseLost) {
+			return err
+		}
+		var response *runnerHTTPError
+		if errors.As(err, &response) && response.status < 500 && response.status != http.StatusRequestTimeout && response.status != http.StatusTooManyRequests {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
 }
 
 func (c *Client) UploadPreview(ctx context.Context, previewID, token string, body io.Reader) error {
