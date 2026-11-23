@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 	"agentflow/internal/engine"
 	"agentflow/internal/gitwork"
 	"agentflow/internal/managedcli"
+	"agentflow/internal/repo"
 	"agentflow/internal/runtime"
 
 	"github.com/gin-gonic/gin"
@@ -43,7 +45,11 @@ func (h *streamHandlers) streamRun(c *gin.Context) {
 	r := c.Request
 	updates, cancel, err := h.engine.Subscribe(runID)
 	if err != nil {
-		c.JSON(404, map[string]string{"error": err.Error()})
+		if errors.Is(err, repo.ErrRunNotFound) {
+			c.JSON(404, map[string]string{"error": err.Error()})
+		} else {
+			c.JSON(503, map[string]string{"error": "run stream unavailable"})
+		}
 		return
 	}
 	defer cancel()

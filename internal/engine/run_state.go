@@ -2,9 +2,11 @@ package engine
 
 import (
 	"agentflow/internal/domain"
+	"agentflow/internal/repo"
 	"context"
-	"fmt"
+	"errors"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -66,36 +68,36 @@ func (e *Engine) updateRunAtErr(id string, allowExpiredLease bool, mutate func(*
 // Subscribe provides provider-neutral live run snapshots. Slow clients receive
 // the newest state rather than blocking execution workers.
 func (e *Engine) Subscribe(runID string) (<-chan domain.Run, func(), error) {
-	current, ok := e.repo.RunStreamView(runID)
-	if !ok {
-		return nil, nil, fmt.Errorf("run not found")
+	current, err := e.repo.ReadRunStreamView(runID)
+	if err != nil {
+		return nil, nil, err
 	}
 	ch := make(chan domain.Run, 1)
+	ch <- current
 	e.subMu.Lock()
 	if e.subs[runID] == nil {
 		e.subs[runID] = map[chan domain.Run]struct{}{}
 	}
 	e.subs[runID][ch] = struct{}{}
 	e.subMu.Unlock()
-	ch <- current
 	stop := make(chan struct{})
-	go e.pollRun(runID, stop, current.Revision)
+	var once sync.Once
 	cancel := func() {
-		select {
-		case <-stop:
-		default:
+		once.Do(func() {
 			close(stop)
-		}
-		e.subMu.Lock()
-		if _, exists := e.subs[runID][ch]; exists {
+			e.subMu.Lock()
+			defer e.subMu.Unlock()
 			delete(e.subs[runID], ch)
 			close(ch)
-		}
-		if len(e.subs[runID]) == 0 {
-			delete(e.subs, runID)
-		}
-		e.subMu.Unlock()
+			if len(e.subs[runID]) == 0 {
+				delete(e.subs, runID)
+			}
+		})
 	}
+	go func() {
+		defer cancel()
+		e.pollRun(runID, stop, current.Revision)
+	}()
 	return ch, cancel, nil
 }
 
@@ -107,18 +109,18 @@ func (e *Engine) pollRun(runID string, stop <-chan struct{}, revision int) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			latestRevision, ok := e.repo.RunRevision(runID)
-			if !ok {
+			latestRevision, err := e.repo.ReadRunRevision(runID)
+			if errors.Is(err, repo.ErrRunNotFound) {
 				return
 			}
-			if latestRevision == revision {
+			if err != nil || latestRevision == revision {
 				continue
 			}
-			current, ok := e.repo.RunStreamView(runID)
-			if !ok {
+			current, err := e.repo.ReadRunStreamView(runID)
+			if errors.Is(err, repo.ErrRunNotFound) {
 				return
 			}
-			if current.Revision == revision {
+			if err != nil || current.Revision == revision {
 				continue
 			}
 			revision = current.Revision

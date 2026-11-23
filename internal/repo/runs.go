@@ -18,6 +18,8 @@ import (
 
 // ---------- Run header mapping ----------
 
+var ErrRunNotFound = errors.New("run not found")
+
 func runFromRow(row runRow) domain.Run {
 	run := domain.Run{
 		ID: row.ID, Kind: row.Kind, WorkflowID: row.WorkflowID, Status: row.Status, Revision: row.Revision,
@@ -110,6 +112,27 @@ func (r *RunsRepo) Runs() []domain.Run {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out
+}
+
+// RunRecoveryCandidateIDs keeps terminal history and ordinary human waits out of the claim loop.
+func (r *RunsRepo) RunRecoveryCandidateIDs(alignWorkflowID string) ([]string, error) {
+	mode := "json_extract(snapshot, '$.collaborationMode')"
+	align := `json_extract(snapshot, '$.id') = ? OR json_extract(repository, '$.alignOnly') = 1 OR EXISTS
+		(SELECT 1 FROM json_each(repositories) WHERE json_extract(value, '$.alignOnly') = 1)`
+	if r.isMySQL() {
+		mode = "JSON_UNQUOTE(JSON_EXTRACT(snapshot, '$.collaborationMode'))"
+		align = `JSON_UNQUOTE(JSON_EXTRACT(snapshot, '$.id')) = ? OR
+			JSON_CONTAINS(repository, '{"alignOnly":true}') OR JSON_CONTAINS(repositories, '{"alignOnly":true}')`
+	}
+	var ids []string
+	err := r.DB.Model(&runRow{}).
+		Where("COALESCE(kind, '') <> ? AND COALESCE("+mode+", '') <> 'group'", domain.RunKindWorkspace).
+		Where(`status = 'running' OR (status = 'waiting' AND (cancel_requested = ? OR
+			((workflow_id = ? OR `+align+`) AND EXISTS
+				(SELECT 1 FROM run_nodes WHERE run_id = runs.id AND status = 'waiting_approval'))))`,
+			true, alignWorkflowID, alignWorkflowID).
+		Order("created_at DESC").Pluck("id", &ids).Error
+	return ids, err
 }
 
 // RunSummaries returns list-safe Run data. The database removes large node
@@ -351,27 +374,35 @@ func (r *RunsRepo) RunState(id string) (domain.Run, bool) {
 
 // RunView returns header/nodes/artifacts for the UI without hydrating logs.
 func (r *RunsRepo) RunView(id string) (domain.Run, bool) {
-	row, ok := takeRun(r.DB, id)
-	if !ok {
-		return domain.Run{}, false
+	run, err := r.readRunView(id)
+	return run, err == nil
+}
+
+func (r *RunsRepo) readRunView(id string) (domain.Run, error) {
+	var row runRow
+	if err := r.DB.Where("id = ?", id).Take(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return domain.Run{}, ErrRunNotFound
+		}
+		return domain.Run{}, err
 	}
 	run := runFromRow(row)
 	if err := r.loadRunNodesFrom(r.runViewNodesQuery(), &run); err != nil {
-		return domain.Run{}, false
+		return domain.Run{}, err
 	}
 	if err := r.loadArtifactMeta(&run); err != nil {
-		return domain.Run{}, false
+		return domain.Run{}, err
 	}
 	events, err := r.runTimingEvents([]string{run.ID})
 	if err != nil {
-		return domain.Run{}, false
+		return domain.Run{}, err
 	}
 	timing := domain.ComputeRunTiming(run, events[run.ID], time.Now().UTC())
 	run.Timing = &timing
 	if run.WorkflowSnapshot.CollaborationMode == "group" {
 		var rows []runEventRow
 		if err := r.DB.Where("run_id = ?", id).Order("seq DESC").Limit(80).Find(&rows).Error; err != nil {
-			return domain.Run{}, false
+			return domain.Run{}, err
 		}
 		for i := len(rows) - 1; i >= 0; i-- {
 			var event domain.RunEvent
@@ -380,19 +411,24 @@ func (r *RunsRepo) RunView(id string) (domain.Run, bool) {
 			}
 		}
 	}
-	return run, true
+	return run, nil
 }
 
-// RunStreamView matches the SSE contract, which delivers only the latest 80
-// log/telemetry records and artifact metadata, never the historical bodies.
 func (r *RunsRepo) RunStreamView(id string) (domain.Run, bool) {
-	run, ok := r.RunView(id)
-	if !ok {
-		return domain.Run{}, false
+	run, err := r.ReadRunStreamView(id)
+	return run, err == nil
+}
+
+// ReadRunStreamView returns the latest 80 log/telemetry records and
+// distinguishes a missing run from a storage failure.
+func (r *RunsRepo) ReadRunStreamView(id string) (domain.Run, error) {
+	run, err := r.readRunView(id)
+	if err != nil {
+		return domain.Run{}, err
 	}
 	var logs []runLogRow
 	if err := r.DB.Where("run_id = ?", id).Order("seq DESC").Limit(80).Find(&logs).Error; err != nil {
-		return domain.Run{}, false
+		return domain.Run{}, err
 	}
 	for i := len(logs) - 1; i >= 0; i-- {
 		var record domain.LogRecord
@@ -402,7 +438,7 @@ func (r *RunsRepo) RunStreamView(id string) (domain.Run, bool) {
 	}
 	var events []runTelemetryRow
 	if err := r.DB.Where("run_id = ?", id).Order("seq DESC").Limit(80).Find(&events).Error; err != nil {
-		return domain.Run{}, false
+		return domain.Run{}, err
 	}
 	for i := len(events) - 1; i >= 0; i-- {
 		var event domain.TelemetryEvent
@@ -410,7 +446,7 @@ func (r *RunsRepo) RunStreamView(id string) (domain.Run, bool) {
 			run.Telemetry = append(run.Telemetry, event)
 		}
 	}
-	return run, true
+	return run, nil
 }
 
 // RunRevisions returns the current revision of every existing run in ids in
@@ -431,9 +467,18 @@ func (r *RunsRepo) RunRevisions(ids []string) map[string]int {
 }
 
 func (r *RunsRepo) RunRevision(id string) (int, bool) {
+	revision, err := r.ReadRunRevision(id)
+	return revision, err == nil
+}
+
+// ReadRunRevision distinguishes a missing run from a storage failure.
+func (r *RunsRepo) ReadRunRevision(id string) (int, error) {
 	var row runRow
 	err := r.DB.Select("revision").Where("id = ?", id).Take(&row).Error
-	return row.Revision, err == nil
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, ErrRunNotFound
+	}
+	return row.Revision, err
 }
 
 // LiveSandboxRunIDs returns every run whose workspace has not been cleaned.

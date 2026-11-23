@@ -2,6 +2,41 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadApp, settle } from '../lib/load-app.mjs';
 
+test('cancelling or declining retry refreshes the cached approval card', async (t) => {
+  const app = await loadApp();
+  t.after(app.close);
+  const waiting = {
+    id: 'approval-wait', status: 'waiting', workflowId: 'flow-wait',
+    createdAt: '2026-10-20T10:00:00Z',
+    executionContext: { responsibleUserId: 7, projectId: 'project-1' },
+    workflowSnapshot: { id: 'flow-wait', name: 'Pending run', nodes: [{ id: 'step', type: 'agent' }] },
+    nodes: { step: { status: 'waiting_approval', error: '对话轮次用尽' } },
+  };
+  let current = waiting;
+  app.router.get('/api/runs', () => [current]);
+  app.router.get('/api/tasks', []);
+  app.router.get('/api/issues', []);
+  app.router.get('/api/runs/approval-wait', () => current);
+  app.router.post('/api/runs/approval-wait/cancel', () => {
+    current = { ...waiting, status: 'cancelled' };
+    return { ok: true };
+  });
+  app.router.post('/api/runs/approval-wait/decline-retry', () => {
+    current = { ...waiting, status: 'failed' };
+    return { ok: true };
+  });
+  app.evaluate('window.afConfirm=async()=>true');
+  for (const selector of ['[data-cancel-run]', '[data-decline-retry]']) {
+    current = waiting;
+    await app.evaluate('renderApprovals()');
+    const button = app.document.querySelector(`#approvalList ${selector}`);
+    assert.ok(button, selector);
+    button.click();
+    await settle(6);
+    assert.equal(app.document.querySelector('#approvalList .ap-card'), null, selector);
+  }
+});
+
 test('approval helpers explain gates, failures, pauses, and contextual payloads', async (t) => {
   const app = await loadApp();
   t.after(app.close);

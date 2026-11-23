@@ -6,27 +6,33 @@ function mergeSeqItems(prev, incoming, seqOf){
   for(const item of incoming||[]){const seq=Number(seqOf(item)||0);if(seq)bySeq.set(seq,item);else bySeq.set(Symbol(),item)}
   return [...bySeq.values()].sort((a,b)=>Number(seqOf(a)||0)-Number(seqOf(b)||0));
 }
+function currentRunPage(page){
+  const run=state.activeRun;
+  if(!page||!run||state.selectedRun!==run.id)return false;
+  const target=page.adapter?runTracePageTarget(run):runPageTarget(run,state.selectedRunNode);
+  const selected=page.adapter?state.runTelemetry:state.runLogs;
+  return selected===page&&target.runId===page.runId&&target.nodeId===page.nodeId&&
+    (!page.adapter||page.adapter===(state.runTelemetryAdapter||'live'));
+}
+function mergeRunPageDelta(page,records=[],sequence){
+  if(!currentRunPage(page))return;
+  const after=page.maxSeq||0;
+  const unseen=records.filter(e=>Number(e?.sequence)>after);
+  const last=Number(unseen.at(-1)?.sequence||0);
+  page.through=Math.max(page.through||0,sequence||0,last);
+  // Check the unfiltered sequence first. A filter naturally skips some numbers.
+  if(!page.loaded||page.recovery||!unseen.length||!unseen.every((e,i)=>Number(e.sequence)===after+i+1))return;
+  const visible=page.adapter
+    ?unseen.filter(e=>(!page.nodeId||e.nodeId===page.nodeId)&&matchTelemetryAdapter(e,page.adapter))
+    :unseen.filter(e=>!page.nodeId||e.context?.nodeId===page.nodeId);
+  page.items=mergeSeqItems(page.items,visible,e=>e.sequence);
+  page.maxSeq=last;
+}
 function mergeLiveRun(id,incoming,payload){
   const old=state.activeRun?.id===id?state.activeRun:null,byId=new Map((old?.telemetry||[]).map(e=>[e.id,e]));
   for(const e of payload?.telemetryDelta||[])byId.set(e.id,e);
-  if(state.runLogs?.runId===id){
-    const nodeId=state.runLogs.nodeId;
-    const extra=(payload?.logDelta||[]).filter(l=>l&&(!nodeId||l.context?.nodeId===nodeId));
-    if(extra.length){
-      state.runLogs.items=mergeSeqItems(state.runLogs.items, extra, l=>l.sequence);
-      state.runLogs.maxSeq=Math.max(state.runLogs.maxSeq||0,...extra.map(l=>Number(l.sequence||0)));
-      state.runLogs.loaded=true;
-    }
-  }
-  if(state.runTelemetry?.runId===id){
-    const nodeId=state.runTelemetry.nodeId;
-    const extra=(payload?.telemetryDelta||[]).filter(e=>e&&(!nodeId||e.nodeId===nodeId)&&matchTelemetryAdapter(e,state.runTelemetry.adapter||'live'));
-    if(extra.length){
-      state.runTelemetry.items=mergeSeqItems(state.runTelemetry.items, extra, e=>e.sequence);
-      state.runTelemetry.maxSeq=Math.max(state.runTelemetry.maxSeq||0,...extra.map(e=>Number(e.sequence||0)));
-      state.runTelemetry.loaded=true;
-    }
-  }
+  if(state.runLogs?.runId===id)mergeRunPageDelta(state.runLogs,payload?.logDelta,incoming.logSequence);
+  if(state.runTelemetry?.runId===id)mergeRunPageDelta(state.runTelemetry,payload?.telemetryDelta,incoming.telemetrySequence);
   const telemetry=[...byId.values()].sort((a,b)=>a.sequence-b.sequence);
   const nodes={...(old?.nodes||{})};
   for(const [k,n] of Object.entries(incoming.nodes||{})){
@@ -50,13 +56,18 @@ function applyRunPayload(run,{list=true}={}){
 function startLiveRun(id){
   stopLiveRun();
   const previous=state.activeRun?.id===id?state.activeRun:null;
-  const after=previous?.telemetrySequence||state.runTelemetry?.maxSeq||0;
+  const trace=state.runTelemetry;
+  const after=trace?.runId===id&&trace.loaded?(trace.maxSeq||0):(previous?.telemetrySequence||0);
   const logsAfter=state.runLogs?.runId===id?(state.runLogs.maxSeq||0):0;
   const stream=new EventSource(`/api/runs/${encodeURIComponent(id)}/stream?after=${after}&logsAfter=${logsAfter}`);
   state.runStream=stream;
-  stream.addEventListener('run',event=>{
+  let latest=previous;
+  stream.addEventListener('run',async event=>{
     if(state.runStream!==stream)return;
-    const payload=JSON.parse(event.data),run=mergeLiveRun(id,payload.run,payload);
+    const payload=JSON.parse(event.data);
+    if(payload.run.revision!=null&&payload.run.revision<(latest?.revision||0))return;
+    const run=mergeLiveRun(id,payload.run,payload);
+    latest=run;
     patchCachedRun(id,run);
     if(state.selectedRun===id){
       applyRunPayload(run,{list:false});
@@ -74,35 +85,39 @@ function startLiveRun(id){
       state.issueDetailData.run=run;
       if(state.issueDetailTab!=='clarify'||!issueClarifying(state.issueDetailData.issue?.id))renderIssueDetailTab();
     }
-    if(['succeeded','failed','cancelled'].includes(run.status)){stopLiveRun();refreshWorkflowMetrics();renderRuns()}
+    const terminal=['succeeded','failed','cancelled'].includes(run.status);
+    if(state.selectedRun===id&&(terminal||[state.runLogs,state.runTelemetry].some(page=>currentRunPage(page)&&page.through>(page.maxSeq||0)))){
+      try{
+        await refreshRunPagesDelta(id,{onlyGaps:true,terminal,current:()=>state.runStream===stream});
+      }catch{
+        stream.onerror();
+        return;
+      }
+    }
+    if(terminal&&state.runStream===stream&&latest===run){stopLiveRun();refreshWorkflowMetrics();renderRuns()}
   });
   stream.onerror=()=>{stream.close();if(state.runStream!==stream)return;state.runStream=null;startPollingFallback(id)}
 }
-async function refreshRunPagesDelta(id){
-  const run=state.activeRun?.id===id?state.activeRun:{id};
-  const logTarget=runPageTarget(run,state.selectedRunNode);
-  const traceTarget=runTracePageTarget(run);
-  const logPage=state.runLogs,tracePage=state.runTelemetry,jobs=[];
-  if(logPage?.runId===logTarget.runId&&logPage.nodeId===logTarget.nodeId&&logPage.loaded){
-    const params=new URLSearchParams({limit:'100',after:String(logPage.maxSeq||0)});
-    if(logPage.nodeId)params.set('nodeId',logPage.nodeId);
-    jobs.push(api(`/api/runs/${encodeURIComponent(logPage.runId)}/logs?${params}`,{silent:true}).then(data=>{
-      if(state.runLogs!==logPage||!data.logs?.length)return;
-      logPage.items=mergeSeqItems(logPage.items,data.logs,l=>l.sequence);
-      logPage.maxSeq=Math.max(logPage.maxSeq||0,...data.logs.map(l=>Number(l.sequence||0)));
+async function refreshRunPagesDelta(id,{onlyGaps=false,terminal=false,current=()=>true}={}){
+  const relevant=()=>current()&&state.selectedRun===id&&state.activeRun?.id===id;
+  while(relevant()){
+    const run=state.activeRun;
+    const pages=[state.runLogs,state.runTelemetry].filter(currentRunPage);
+    const changed=await Promise.all(pages.map(page=>{
+      if(onlyGaps&&!terminal&&(page.runId!==id||!(page.through>(page.maxSeq||0))))return false;
+      const through=page.runId===id?(page.adapter?run.telemetrySequence:run.logSequence):undefined;
+      return drainRunPage(page,through).catch(error=>{
+        if(currentRunPage(page))throw error;
+        return false;
+      });
     }));
+    if(!relevant())return;
+    if(changed.some((updated,index)=>updated&&currentRunPage(pages[index]))){
+      const host=$('#runDetail');
+      if(host?.dataset.runId===id&&host.dataset.controlSignature===runControlSignature(state.activeRun))patchRunLive(state.activeRun);
+    }
+    if(!terminal||pages.every(page=>currentRunPage(page)&&page.maxSeq>=page.through))return;
   }
-  const adapter=state.runTelemetryAdapter||'live';
-  if(tracePage?.runId===traceTarget.runId&&tracePage.nodeId===traceTarget.nodeId&&tracePage.adapter===adapter&&tracePage.loaded){
-    const params=new URLSearchParams({limit:'100',adapter,after:String(tracePage.maxSeq||0)});
-    if(tracePage.nodeId)params.set('nodeId',tracePage.nodeId);
-    jobs.push(api(`/api/runs/${encodeURIComponent(tracePage.runId)}/telemetry?${params}`,{silent:true}).then(data=>{
-      if(state.runTelemetry!==tracePage||!data.events?.length)return;
-      tracePage.items=mergeSeqItems(tracePage.items,data.events,e=>e.sequence);
-      tracePage.maxSeq=Math.max(tracePage.maxSeq||0,...data.events.map(e=>Number(e.sequence||0)));
-    }));
-  }
-  if(jobs.length){await Promise.all(jobs);if(state.activeRun?.id===id)patchRunLive(state.activeRun)}
 }
 function startPollingFallback(id){
   clearInterval(state.poll);
@@ -117,9 +132,14 @@ function startPollingFallback(id){
       const run=await api(`/api/runs/${encodeURIComponent(id)}`,{silent:true});
       if(state.poll!==timer||!relevant())return;
       patchCachedRun(id,run);
-      if(state.selectedRun===id){applyRunPayload(run,{list:false});await refreshRunPagesDelta(id)}
+      const terminal=['succeeded','failed','cancelled'].includes(run.status);
+      if(state.selectedRun===id){
+        applyRunPayload(run,{list:false});
+        await refreshRunPagesDelta(id,{terminal,current:()=>state.poll===timer});
+      }
+      if(state.poll!==timer||!relevant())return;
       if(state.drawerOpen&&state.issueDetailData?.run?.id===id)renderIssueDetailTab();
-      if(['succeeded','failed','cancelled'].includes(run.status)){stop();renderRuns()}
+      if(terminal){stop();renderRuns()}
     }catch{}finally{busy=false}
   };
   const timer=setInterval(tick,4000);state.poll=timer;tick();
@@ -271,7 +291,7 @@ function renderRuns(){
 function showRunDetail(id){
   if(!id)return;
   stopQueuedRunRefresh();
-  if(state.selectedRun!==id){stopLiveRun();stopPreviewPoll();state.runWorkspace=null}
+  if(state.selectedRun!==id){stopLiveRun();stopPreviewPoll();state.runWorkspace=null;state.runLogs=null;state.runTelemetry=null}
   state.selectedRun=id;
   syncRunHash(id);
   $('#runsView')?.classList.add('detail-open');
@@ -333,7 +353,7 @@ async function syncRunControlState(runId){
   patchCachedRun(runId,run);
   if(!(state.data.runs||[]).some(r=>r.id===runId))state.data.runs=sortRunsDescending([run,...(state.data.runs||[])]);
   const relevant=state.selectedRun===runId||(state.drawerOpen&&state.issueDetailData?.run?.id===runId);
-  if(relevant){if(['queued','running','waiting'].includes(run.status))startLiveRun(runId);else stopLiveRun()}
+  if(relevant&&['queued','running','waiting'].includes(run.status))startLiveRun(runId);
   paintRunControl(runId);
   return run;
 }
@@ -385,44 +405,73 @@ function logLineHTML(l){
 function isHookAdapter(adapter){return adapter==='agent-hooks-v1'||adapter==='codebuddy-hooks-v1'}
 function hookTraceDetails(e){const a=e.attributes||{},facts=[["ID",a.hookId],["事件",a.hook],["仓库",a.repositoryName||a.repositoryDir||a.repositoryId],["阶段",a.executionPhase],["语言",a.language],["Matcher",a.matcher],["耗时",a.durationMs!=null?`${a.durationMs} ms`:""],["退出码",a.exitCode!=null?String(a.exitCode):""]].filter(x=>x[1]!==''&&x[1]!=null);return `${facts.length?`<dl class="hook-trace-facts">${facts.map(([k,v])=>`<div><dt>${k}</dt><dd>${escapeHTML(v)}</dd></div>`).join('')}</dl>`:''}${a.stdout?`<details class="hook-trace-output"><summary>stdout</summary><pre>${escapeHTML(a.stdout)}</pre></details>`:''}${a.stderr?`<details class="hook-trace-output error"><summary>stderr</summary><pre>${escapeHTML(a.stderr)}</pre></details>`:''}`}
 function telemetryItemHTML(e){const hook=isHookAdapter(e.source?.adapter),tag=hook?'Hook':e.source?.adapter==='codebuddy-otel-v1'?'OTEL':'',title=hook?(e.attributes?.hookName||e.attributes?.hookId||e.name):e.name,repository=e.attributes?.repositoryName||e.attributes?.repositoryDir||e.attributes?.repositoryId||'';return `<article class="telemetry-event ${e.category}"><time>${new Date(e.timestamp).toLocaleTimeString()}</time><span class="telemetry-category">${telemetryLabel(e)}${tag?`<em class="adapter-tag">${tag}</em>`:''}</span><div><b>${escapeHTML(title)}</b><p>${escapeHTML(e.message||'')}</p>${hook?hookTraceDetails(e):''}<small>${escapeHTML(e.nodeId||'run')}${repository?` · ${escapeHTML(repository)}`:''}${hook&&e.source?.provider?` · ${escapeHTML(e.source.provider)}`:''}${e.model?` · ${escapeHTML(e.model)}`:''}${e.toolCallId?` · ${escapeHTML(e.toolCallId)}`:''}</small></div></article>`}
-async function loadRunLogs(runId,nodeId,more=false){
-  if(!more&&state.runLogs?.runId===runId&&state.runLogs?.nodeId===nodeId&&state.runLogs.loading)return;
-  const params=new URLSearchParams({limit:'100'});
-  if(nodeId)params.set('nodeId',nodeId);
-  if(more&&state.runLogs?.runId===runId&&state.runLogs.nodeId===nodeId&&state.runLogs.nextBefore)params.set('before',String(state.runLogs.nextBefore));
-  const prev=(!more||state.runLogs?.runId!==runId||state.runLogs?.nodeId!==nodeId)?(state.runLogs?.runId===runId&&state.runLogs?.nodeId===nodeId?state.runLogs.items:[]):state.runLogs.items;
-  if(!more){state.runLogs={runId,nodeId,items:prev||[],loaded:!!(prev&&prev.length),loading:true,hasMore:!!state.runLogs?.hasMore,nextBefore:state.runLogs?.nextBefore||0,maxSeq:state.runLogs?.maxSeq||0}}
-  try{
-    const data=await api(`/api/runs/${encodeURIComponent(runId)}/logs?${params}`,{silent:true});
-    const incoming=data.logs||[];
-    const items=more?mergeSeqItems(incoming, prev||[], l=>l.sequence):mergeSeqItems(prev||[], incoming, l=>l.sequence);
-    const seqs=items.map(l=>Number(l.sequence||0));
-    state.runLogs={runId,nodeId,items,loaded:true,loading:false,hasMore:!!data.hasMore||(!more&&incoming.length>=100),nextBefore:data.nextBefore||(seqs.length?Math.min(...seqs.filter(Boolean)):0),maxSeq:seqs.length?Math.max(...seqs):0};
-    if(state.activeRun&&runPageTarget(state.activeRun,state.selectedRunNode).runId===runId){const host=$('#runDetail');if(host?.dataset.runId===state.activeRun.id)patchRunLive(state.activeRun);else renderRunDetail(state.activeRun)}
-  }catch(e){if(state.runLogs?.runId===runId)state.runLogs.loading=false;toast(e.message,'err')}
+function loadRunLogs(runId,nodeId,more=false){
+  return loadRunPage(runId,nodeId,'',more);
 }
-async function loadRunTelemetry(runId,nodeId,more=false){
-  const adapter=state.runTelemetryAdapter||'live';
-  const current=state.runTelemetry;
-  const same=current?.runId===runId&&current.nodeId===nodeId&&current.adapter===adapter;
+function loadRunTelemetry(runId,nodeId,more=false){
+  return loadRunPage(runId,nodeId,state.runTelemetryAdapter||'live',more);
+}
+async function queryRunPage(page,cursor){
+  const params=new URLSearchParams({limit:'100',...cursor});
+  if(page.nodeId)params.set('nodeId',page.nodeId);
+  if(page.adapter)params.set('adapter',page.adapter);
+  const path=page.adapter?'telemetry':'logs';
+  const data=await api(`/api/runs/${encodeURIComponent(page.runId)}/${path}?${params}`,{silent:true});
+  return {...data,items:(page.adapter?data.events:data.logs)||[]};
+}
+function loadRunPage(runId,nodeId,adapter,more){
+  const key=adapter?'runTelemetry':'runLogs';
+  const current=state[key];
+  const same=current?.runId===runId&&current.nodeId===nodeId&&(current.adapter||'')===adapter;
   const page=same?current:{runId,nodeId,adapter,items:[],nextBefore:0,maxSeq:0};
-  if(page.loading)return;
-  state.runTelemetry=page;
-  page.loading=true;
-  const params=new URLSearchParams({limit:'100',adapter});
-  if(nodeId)params.set('nodeId',nodeId);
-  if(more&&page.nextBefore)params.set('before',String(page.nextBefore));
-  try{
-    const data=await api(`/api/runs/${encodeURIComponent(runId)}/telemetry?${params}`,{silent:true});
-    if(state.runTelemetry!==page)return;
-    const incoming=data.events||[];
-    page.items=more?mergeSeqItems(incoming,page.items,e=>e.sequence):mergeSeqItems(page.items,incoming,e=>e.sequence);
-    const seqs=page.items.map(e=>Number(e.sequence||0)).filter(Boolean);
-    Object.assign(page,{loaded:true,loading:false,hasMore:!!data.hasMore||(!more&&incoming.length>=100),nextBefore:data.nextBefore||(seqs.length?Math.min(...seqs):0),maxSeq:seqs.length?Math.max(...seqs):0});
-    const run=state.activeRun;
-    if(run&&runTracePageTarget(run).runId===runId){const host=$('#runDetail');if(host?.dataset.runId===run.id)patchRunLive(run);else renderRunDetail(run)}
-  }catch(e){if(state.runTelemetry===page)toast(e.message,'err')}
-  finally{page.loading=false}
+  if(page.loading)return page.loading;
+  state[key]=page;
+  const cursor=more&&page.nextBefore?{before:String(page.nextBefore)}:{};
+  page.loading=(async()=>{
+    try{
+      const data=await queryRunPage(page,cursor);
+      if(!currentRunPage(page))return;
+      page.items=more?mergeSeqItems(data.items,page.items,e=>e.sequence):mergeSeqItems(page.items,data.items,e=>e.sequence);
+      page.hasMore=data.hasMore??(!more&&data.items.length>=100);
+      page.nextBefore=data.nextBefore||data.items[0]?.sequence||0;
+      if(!more)page.maxSeq=Math.max(page.maxSeq||0,data.sequence||0,data.items.at(-1)?.sequence||0);
+      page.loaded=true;
+      patchRunLive(state.activeRun);
+    }catch(e){if(currentRunPage(page))toast(e.message,'err')}
+    finally{page.loading=null}
+  })();
+  return page.loading;
+}
+async function drainRunPage(page,through){
+  page.through=Math.max(page.through||0,through||0);
+  if(!page.loaded)await (page.loading||loadRunPage(page.runId,page.nodeId,page.adapter||'',false));
+  if(!currentRunPage(page))return false;
+  if(page.recovery)return page.recovery;
+  if(!page.loaded)throw new Error('Could not load run records');
+  if(through!=null&&page.maxSeq>=page.through)return false;
+  page.recovery=(async()=>{
+    let changed=false;
+    while(currentRunPage(page)){
+      const after=page.maxSeq||0;
+      const data=await queryRunPage(page,{after:String(after)});
+      if(!currentRunPage(page))return false;
+      const next=Number(data.nextAfter||data.items.at(-1)?.sequence||0);
+      if(data.hasMore&&next<=after)throw new Error('Run record cursor did not advance');
+      if(data.items.length){
+        page.items=mergeSeqItems(page.items,data.items,e=>e.sequence);
+        changed=true;
+      }
+      page.maxSeq=Math.max(after,next,data.hasMore?0:data.sequence||0);
+      if(!data.hasMore){
+        if(page.maxSeq<page.through)throw new Error('Run record history is incomplete');
+        return changed;
+      }
+      if(through!=null&&page.maxSeq>=page.through)return changed;
+    }
+    return false;
+  })();
+  try{return await page.recovery}
+  finally{page.recovery=null}
 }
 function ensureRunPages(run){
   if(!run?.id)return;
@@ -1124,7 +1173,7 @@ function watchChildRuns(r){
     if(activeViewName()!=='runs'||$('#runsDetailSection')?.hidden)return;
     if(!run||run.id!==r.id||state.selectedRun!==r.id||!['running','waiting'].includes(run.status)){clearInterval(state.childRunTimer);state.childRunTimer=null;return}
     refreshChildRuns(run);
-    if(runPageTarget(run,state.selectedRunNode).child)refreshRunPagesDelta(run.id);
+    if(runPageTarget(run,state.selectedRunNode).child||runTracePageTarget(run).child)refreshRunPagesDelta(run.id).catch(()=>{});
   },4000);
 }
 function childSOPPanelHTML(r,nodeId){
