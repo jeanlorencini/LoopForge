@@ -173,14 +173,11 @@ func (e *Engine) enqueueWorkflowRunnerTask(ctx context.Context, task domain.Runn
 	if err := ctx.Err(); err != nil {
 		return domain.RunnerTask{}, false, err
 	}
-	current, ok := e.repo.RunState(a.runID)
-	if !ok || current.Generation != a.generation || !e.ownsRun(current) || !a.matches(current.Nodes[a.nodeID]) || !nodeExecutionLive(current.Nodes[a.nodeID], a.attempt) {
+	if task.RunID != a.runID {
 		return domain.RunnerTask{}, false, repo.ErrRunLeaseLost
 	}
-	if current.CancelRequested || current.PauseRequested {
-		return domain.RunnerTask{}, false, context.Canceled
-	}
-	stored, inserted, err := e.repo.InsertWorkflowRunnerTask(task)
+	node := domain.NodeRun{NodeID: a.nodeID, Attempt: a.attempt, RunnerAttemptID: a.attemptID, StartedAt: a.startedAt}
+	stored, inserted, err := e.repo.InsertWorkflowRunnerTask(ctx, task, e.instanceID, a.generation, node)
 	if err == nil && !inserted && (!sameWorkflowRunnerOperation(stored, task) || !validWorkflowRunnerStatus(stored)) {
 		err = a.diagnostic("task " + stored.ID + " does not match the next operation")
 	}

@@ -12,10 +12,6 @@ import (
 )
 
 func (e *Engine) persistControlDecision(runID string, r domain.Run, expected ...NodeExpectation) error {
-	return e.persistRunDecision(runID, r, len(expected) > 0)
-}
-
-func (e *Engine) persistRunDecision(runID string, r domain.Run, checkRevision bool) error {
 	if r.Status == "running" {
 		r.CancelRequested = false
 		r.PauseRequested = false
@@ -23,13 +19,13 @@ func (e *Engine) persistRunDecision(runID string, r domain.Run, checkRevision bo
 	// pause_requested is not part of the run snapshot write. Clear it whenever
 	// the decision itself released the pause, including a group that stays
 	// waiting because nothing was in flight.
-	if !checkRevision && !r.PauseRequested && !r.CancelRequested {
+	if len(expected) == 0 && !r.PauseRequested && !r.CancelRequested {
 		if err := e.repo.ClearRunControl(runID); err != nil {
 			return err
 		}
 	}
 	var err error
-	if checkRevision {
+	if len(expected) > 0 {
 		err = e.repo.PutRunAtRevision(r, r.Revision)
 	} else {
 		err = e.repo.PutRun(r)
@@ -37,15 +33,19 @@ func (e *Engine) persistRunDecision(runID string, r domain.Run, checkRevision bo
 	if err != nil {
 		return err
 	}
-	e.publish(runID)
+	e.resumeAfterDecision(r)
+	return nil
+}
+
+func (e *Engine) resumeAfterDecision(r domain.Run) {
+	e.publish(r.ID)
 	if e.executes() {
-		e.resume(runID)
-		return nil
+		e.resume(r.ID)
+		return
 	}
 	if r.OwnerInstanceID != "" {
-		_ = e.repo.ReleaseRunLease(runID, r.OwnerInstanceID, r.Generation)
+		_ = e.repo.ReleaseRunLease(r.ID, r.OwnerInstanceID, r.Generation)
 	}
-	return nil
 }
 
 func (e *Engine) Cancel(runID string) error {
@@ -778,13 +778,19 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 		}
 		e.event(&r, "", "run.resumed", message)
 		appendControlTelemetry(&r, "", "run.resumed", message)
-		if r.Status == "running" {
-			markRunRelationsRunning(e.repo, r)
+		if releaseLease {
+			err = e.repo.PutLeasedRunAtRevision(r, e.instanceID)
+		} else {
+			err = e.repo.PutRunAtRevision(r, r.Revision)
 		}
-		if err := e.persistRunDecision(runID, r, true); err != nil {
+		if err != nil {
 			return err
 		}
 		releaseLease = false
+		if r.Status == "running" {
+			markRunRelationsRunning(e.repo, r)
+		}
+		e.resumeAfterDecision(r)
 		return nil
 	}
 	if e.executes() {

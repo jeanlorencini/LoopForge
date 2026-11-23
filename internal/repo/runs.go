@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -964,6 +965,7 @@ type runWriteGuard struct {
 	revision          int
 	progress          bool
 	allowExpiredLease bool
+	leaseOwner        string
 }
 
 type runHistoryCursors struct {
@@ -1040,7 +1042,11 @@ func (r *RunsRepo) writeRunOnce(run domain.Run, lockKey string, guard *runWriteG
 			if run.Generation != current.Generation || progress && run.OwnerInstanceID != current.OwnerInstanceID {
 				return ErrRunLeaseLost
 			}
-			leaseExpired := current.OwnerInstanceID != "" && (current.LeaseUntil == nil || !current.LeaseUntil.After(time.Now().UTC()))
+			now := time.Now().UTC()
+			if guard != nil && guard.leaseOwner != "" && !runLeaseMatches(current, guard.leaseOwner, run.Generation, now) {
+				return ErrRunLeaseLost
+			}
+			leaseExpired := current.OwnerInstanceID != "" && (current.LeaseUntil == nil || !current.LeaseUntil.After(now))
 			if leaseExpired && (!domain.TerminalRunStatus(run.Status) || progress && !guard.allowExpiredLease && !domain.TerminalRunStatus(current.Status)) {
 				return ErrRunLeaseLost
 			}
@@ -1245,6 +1251,43 @@ func (r *RunsRepo) takeRunForUpdate(tx *gorm.DB, id string) (runRow, error) {
 	var row runRow
 	err := r.locking(tx.Where("id = ?", id)).Take(&row).Error
 	return row, err
+}
+
+func runLeaseMatches(row runRow, owner string, generation int, now time.Time) bool {
+	return owner != "" && generation > 0 && row.OwnerInstanceID == owner && row.Generation == generation && row.LeaseUntil != nil && row.LeaseUntil.After(now)
+}
+
+// guardWorkflowRunnerDispatch holds the run's write lock until the task insert commits.
+func (r *RunsRepo) guardWorkflowRunnerDispatch(tx *gorm.DB, runID, owner string, generation int, expected domain.NodeRun) error {
+	current, err := r.takeRunForUpdate(tx, runID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrRunLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	if current.Status != "running" || !runLeaseMatches(current, owner, generation, time.Now().UTC()) {
+		return ErrRunLeaseLost
+	}
+	if current.CancelRequested || current.PauseRequested {
+		return context.Canceled
+	}
+	var row runNodeRow
+	err = tx.Where("run_id = ? AND node_id = ?", runID, expected.NodeID).Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrRunLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	var node domain.NodeRun
+	if (row.Status != "running" && row.Status != "pending_input") || row.Attempt != expected.Attempt || json.Unmarshal(row.Payload, &node) != nil {
+		return ErrRunLeaseLost
+	}
+	if node.RunnerAttemptID != expected.RunnerAttemptID || (expected.RunnerAttemptID == "" && !node.StartedAt.Equal(expected.StartedAt)) {
+		return ErrRunLeaseLost
+	}
+	return nil
 }
 
 func (r *RunsRepo) TryAcquireRunLease(runID, instanceID string, generation int, ttl time.Duration) error {
@@ -2086,4 +2129,16 @@ func (r *RunsRepo) PutRunAtRevision(v domain.Run, revision int) error {
 	v.UpdatedAt = time.Now().UTC()
 	v.Revision++
 	return r.writeRun(v, runWriteGuard{revision: revision})
+}
+
+// PutLeasedRunAtRevision checks the caller's live lease before committing a
+// control decision that clears pause/cancel flags at the snapshot revision.
+func (r *RunsRepo) PutLeasedRunAtRevision(v domain.Run, owner string) error {
+	if owner == "" {
+		return ErrRunLeaseLost
+	}
+	guard := runWriteGuard{revision: v.Revision, leaseOwner: owner}
+	v.UpdatedAt = time.Now().UTC()
+	v.Revision++
+	return r.writeRun(v, guard)
 }

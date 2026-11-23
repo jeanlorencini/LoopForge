@@ -5,6 +5,7 @@ import (
 	"agentflow/internal/repo"
 	"agentflow/internal/runtime"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -36,6 +37,50 @@ func TestResumePausedCompletedGraphWithExecution(t *testing.T) {
 	got := waitRun(t, s, r.ID, 10*time.Second, func(run domain.Run) bool { return run.Status == "succeeded" && run.OwnerInstanceID == "" })
 	if got.Nodes["close"].Attempt != 1 {
 		t.Fatal("resume repeated the completed node")
+	}
+}
+
+func TestLeasedResumeDecisionRequiresLiveOwner(t *testing.T) {
+	for _, state := range []string{"live", "released", "expired", "taken over"} {
+		t.Run(state, func(t *testing.T) {
+			e, s := newRecoveryEngine(t)
+			r := completedRecoveryRun("paused-decision")
+			r.Status, r.PauseRequested = "waiting", true
+			if state == "expired" {
+				r.OwnerInstanceID, r.Generation, r.LeaseUntil = e.instanceID, 1, time.Now().Add(-time.Minute)
+			}
+			if err := s.PutRun(r); err != nil {
+				t.Fatal(err)
+			}
+			if state != "expired" {
+				if err := s.TryAcquireRunLease(r.ID, e.instanceID, 0, time.Minute); err != nil {
+					t.Fatal(err)
+				}
+			}
+			snapshot, _ := s.RunState(r.ID)
+			if state == "released" || state == "taken over" {
+				if err := s.ReleaseRunLease(r.ID, e.instanceID, snapshot.Generation); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if state == "taken over" {
+				if err := s.TryAcquireRunLease(r.ID, "replacement-worker", snapshot.Generation, time.Minute); err != nil {
+					t.Fatal(err)
+				}
+			}
+			snapshot.Status, snapshot.PauseRequested = "running", false
+			err := s.PutLeasedRunAtRevision(snapshot, e.instanceID)
+			got, _ := s.RunState(r.ID)
+			if state == "live" {
+				if err != nil || got.Status != "running" || got.PauseRequested {
+					t.Fatalf("resume commit failed: err=%v, status=%s, paused=%t", err, got.Status, got.PauseRequested)
+				}
+				return
+			}
+			if !errors.Is(err, repo.ErrRunLeaseLost) || got.Status != "waiting" || !got.PauseRequested || got.Revision != snapshot.Revision {
+				t.Fatalf("stale decision changed durable state: err=%v, status=%s, paused=%t, revision=%d", err, got.Status, got.PauseRequested, got.Revision)
+			}
+		})
 	}
 }
 

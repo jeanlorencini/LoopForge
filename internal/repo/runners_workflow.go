@@ -1,24 +1,47 @@
 package repo
 
 import (
-	"agentflow/internal/domain"
+	"context"
 	"time"
+
+	"agentflow/internal/domain"
+	"gorm.io/gorm"
 )
 
-// InsertWorkflowRunnerTask keeps the original payload, claims and result when
-// two workers reach the same operation of an interrupted attempt.
-func (r *RunnersRepo) InsertWorkflowRunnerTask(task domain.RunnerTask) (domain.RunnerTask, bool, error) {
-	now := time.Now().UTC()
-	task.CreatedAt, task.UpdatedAt = now, now
-	created, err := insertIgnore(r.DB, "runner_tasks", runnerTaskRowValues(task))
-	if err != nil || created {
-		return task, created, err
+// InsertWorkflowRunnerTask queues an operation under the run's lease and
+// control lock. A duplicate keeps the original payload, claim and result.
+func (r *RunnersRepo) InsertWorkflowRunnerTask(ctx context.Context, task domain.RunnerTask, owner string, generation int, node domain.NodeRun) (domain.RunnerTask, bool, error) {
+	if task.NodeID != node.NodeID {
+		return domain.RunnerTask{}, false, ErrRunLeaseLost
 	}
-	var row runnerTaskRow
-	if err := r.DB.Where("id = ?", task.ID).Take(&row).Error; err != nil {
+	var stored domain.RunnerTask
+	var created bool
+	err := r.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := r.runs.guardWorkflowRunnerDispatch(tx, task.RunID, owner, generation, node); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		task.CreatedAt, task.UpdatedAt = now, now
+		inserted, err := insertIgnore(tx, "runner_tasks", runnerTaskRowValues(task))
+		if err != nil {
+			return err
+		}
+		created = inserted
+		if inserted {
+			stored = task
+			return nil
+		}
+		var row runnerTaskRow
+		if err := r.locking(tx).Where("id = ?", task.ID).Take(&row).Error; err != nil {
+			return err
+		}
+		stored = runnerTaskFromRow(row)
+		return nil
+	})
+	if err != nil {
 		return domain.RunnerTask{}, false, err
 	}
-	return runnerTaskFromRow(row), false, nil
+	return stored, created, nil
 }
 
 // WorkflowRunnerTasks reads an attempt's durable operations and, if its node
