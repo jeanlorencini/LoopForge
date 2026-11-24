@@ -41,7 +41,7 @@ PREVIOUS_SCRIPTS = {
 }
 
 INSTALLED_SCRIPTS = {
-    "git-branch": SOURCE_SCRIPTS["git-branch"],
+    "git-branch": "da2f5ee85829711c4204aea34d18c7a8739e2ba8e6937fe9883bedb130c2e6b8",
     "validate-spec": "5b1ef088c7d11702f18e54404104d1c6f93a55cf3c0156cd18c0817a4cc55a37",
     "validate-tests": "5cf5b6ac2e9af44bd177bffbe78f2296af3c67bcd247009c7591681a13955954",
     "git-commit": "b388b11032201c9b8841a7e8e901ded296fa8b0935f89f495574ac82f03ef331",
@@ -485,15 +485,7 @@ def reserve():
     print("I3: reserva conferida e selada na área de estado da SOP.")
 '''
 
-GIT = r'''REPORT = ROOT / "review.md"
-REVIEW_INPUT = STORE / "review-input.json"
-REVIEW_PROOF = STORE / "review-proof.json"
-FINAL_PROOF = STORE / "final-proof.json"
-DELIVERY_PROOF = STORE / "delivery.json"
-OID = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
-
-
-def repository():
+REPOSITORY = r'''def repository():
     if (ROOT / ".git").exists():
         return ROOT
     matches = []
@@ -518,7 +510,71 @@ def git(repo, *args):
     result = subprocess.run(["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
     return result.stdout
+'''
 
+
+BOUND_BRANCH = r'''manifest = os.environ.get("AGENTFLOW_WORK_BRANCHES")
+scope = os.environ.get("AGENTFLOW_EXECUTION_SCOPE", "run" if manifest is not None else "repositories")
+workspace = Path(sys.argv[2]).resolve()
+invalid = "I0 precisa de um vínculo válido com uma única branch de trabalho e sua base."
+if scope == "run":
+    fields = (manifest or "").split("\t")
+    if len(fields) != 3 or "\n" in (manifest or "") or workspace != ROOT:
+        raise PrerequisiteError(invalid)
+    location, branch, base = fields
+    if not location:
+        raise PrerequisiteError(invalid)
+elif scope == "repositories":
+    location = os.environ.get("AGENTFLOW_REPOSITORY_DIR") or "."
+    branch = os.environ.get("AGENTFLOW_WORK_BRANCH")
+    base = os.environ.get("AGENTFLOW_BASE_BRANCH")
+else:
+    raise PrerequisiteError(invalid)
+
+checkout = Path(location)
+if (not branch or not base or branch == base or checkout.drive
+        or checkout.is_absolute() or ".." in checkout.parts):
+    raise PrerequisiteError(invalid)
+repo = (workspace / checkout).resolve()
+if (not repo.is_relative_to(workspace) or repo != (repository() if scope == "run" else ROOT)
+        or Path(git(repo, "rev-parse", "--show-toplevel").decode().rstrip("\n")).resolve() != repo):
+    raise PrerequisiteError("O checkout diverge do repositório vinculado ao I0.")
+if git(repo, "branch", "--show-current").decode().rstrip("\n") != branch:
+    raise PrerequisiteError("O checkout diverge da branch de trabalho vinculada ao I0.")
+head = git(repo, "rev-parse", "--short", "HEAD").decode().strip()
+if git(repo, "status", "--porcelain", "--untracked-files=all"):
+    raise PrerequisiteError("O checkout tem alterações locais. Preserve-as antes de iniciar o I0.")
+paths = {repo / ".sop/git-branch": branch, repo / ".sop/git-base": base}
+if git(repo, "ls-files", "--", ".sop/git-branch", ".sop/git-base"):
+    raise PrerequisiteError("Mantenha o vínculo da SOP fora do índice do Git.")
+base_ref = "refs/heads/" + base
+try:
+    git(repo, "check-ref-format", base_ref)
+    git(repo, "remote", "get-url", "origin")
+    git(repo, "fetch", "--quiet", "--no-tags", "--no-prune", "--no-recurse-submodules",
+        "--refmap=", "origin", base_ref)
+    git(repo, "rev-parse", "--verify", "FETCH_HEAD^{commit}")
+except subprocess.CalledProcessError as exc:
+    raise PrerequisiteError("Não foi possível confirmar a base vinculada ao I0 no remoto origin.") from exc
+directory(repo / ".sop")
+for path in paths:
+    if (path.exists() or path.is_symlink()) and not stat.S_ISREG(ordinary(path).st_mode):
+        raise PrerequisiteError("O vínculo da SOP precisa de arquivos regulares.")
+for path, value in paths.items():
+    path.write_bytes((value + "\n").encode("utf-8"))
+print(f"BRANCH_NOVA={branch} BASE={base} ({head})")
+'''
+
+
+GIT = r'''REPORT = ROOT / "review.md"
+REVIEW_INPUT = STORE / "review-input.json"
+REVIEW_PROOF = STORE / "review-proof.json"
+FINAL_PROOF = STORE / "final-proof.json"
+DELIVERY_PROOF = STORE / "delivery.json"
+OID = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
+
+
+''' + REPOSITORY + r'''
 
 def git_oid(repo, *args):
     oid = git(repo, *args).decode("ascii").strip()
@@ -766,6 +822,12 @@ print(""")
     return shell_stage(CRITERIA + PREFLIGHT + SEAL, body)
 
 
+def git_branch_stage(script):
+    return ('set -eu\nSOP_ROOT="$PWD"\n' + shell_guard(REPOSITORY, BOUND_BRANCH)
+            + 'if [ "${AGENTFLOW_EXECUTION_SCOPE+x}${AGENTFLOW_WORK_BRANCHES+x}${AGENTFLOW_WORK_BRANCH+x}${AGENTFLOW_BASE_BRANCH+x}" ]; then\n'
+            + '    sop_guard "${AGENTFLOW_WORKSPACE-$PWD}"\n    exit\nfi\n' + script)
+
+
 def git_stage(script, commit):
     guard = shell_guard(SEAL + GIT, "delivery_gate(sys.argv[2])")
     action = "before-commit" if commit else "before-merge"
@@ -914,10 +976,14 @@ def apply_reliability(workflow):
     final_policy = {"onFailure": "reject", "rejectTo": "review", "maxReworks": 1}
     if installed:
         previous = fingerprint(nodes["reserve"]["script"]) == PREVIOUS_SCRIPTS["reserve"]
+        unbound = fingerprint(nodes["git-branch"]["script"]) == SOURCE_SCRIPTS["git-branch"]
         expected = {**INSTALLED_SCRIPTS, **{name: fingerprint(code) for name, code in generated.items()}}
         if expected.keys() != (SOURCE_SCRIPTS.keys() | {"bind-review"}):
             raise ValueError("Incomplete published SOP script fingerprints.")
-        check_scripts(nodes, PREVIOUS_SCRIPTS if previous else expected, installed=True)
+        current = PREVIOUS_SCRIPTS if previous else expected
+        if unbound and not previous:
+            current = {**current, "git-branch": SOURCE_SCRIPTS["git-branch"]}
+        check_scripts(nodes, current, installed=True)
         check_manifest(nodes)
         if any(nodes[name].get("agentInstructions") != instructions(name, nodes[name], previous) for name in INSTRUCTIONS):
             raise ValueError("Expected active SOP agent instructions.")
@@ -928,6 +994,9 @@ def apply_reliability(workflow):
             for name, script in generated.items():
                 nodes[name]["script"] = script
             nodes["tests"]["agentInstructions"] = instructions("tests", nodes["tests"])
+        if unbound:
+            nodes["git-branch"]["script"] = git_branch_stage(nodes["git-branch"]["script"])
+        if previous or unbound:
             check_scripts(nodes, expected, installed=True)
         return
 
@@ -940,6 +1009,7 @@ def apply_reliability(workflow):
     nodes["tests"]["taskPrompt"] = task_prompt
     check_scripts(nodes, SOURCE_SCRIPTS, installed=False)
     check_manifest(nodes)
+    nodes["git-branch"]["script"] = git_branch_stage(nodes["git-branch"]["script"])
     generated.update({
         "validate-spec": spec_stage(nodes["validate-spec"]["script"]),
         "validate-tests": tests_stage(nodes["validate-tests"]["script"]),
@@ -971,8 +1041,9 @@ def check_scripts(nodes, expected, installed):
     for name, digest in expected.items():
         node = nodes[name]
         language = "python" if not installed and name.startswith("validate-") else "shell"
+        scopes = ("", "run", "repositories") if name == "git-branch" else ("", "run")
         if (node.get("scriptLanguage") != language or fingerprint(node["script"]) != digest
-                or node.get("executionScope", "") not in ("", "run") or node.get("maxAttempts") != 1):
+                or node.get("executionScope", "") not in scopes or node.get("maxAttempts") != 1):
             raise ValueError(f"Unsupported or partially patched SOP entry point at {name}.")
         if installed and name != "git-branch" and node.get("nonRetryableExitCodes") != stop_codes(name):
             raise ValueError(f"Unexpected exit policy at {name}.")

@@ -278,6 +278,88 @@ def test_CA001_import():
         self.stage(scripts["verify"], 78, "divergiram da aprovação")
 
     @unittest.skipUnless(EXPORTS, "requires a local published SOP export")
+    def test_resume_delivers_to_the_bound_work_branch(self):
+        source = json.loads(EXPORTS[0].read_text(encoding="utf-8-sig"))
+        SOP["apply_reliability"](source)
+        scripts = {node["id"]: node["script"] for node in source["nodes"] if "script" in node}
+        self.init_local_origin()
+        branch, base = "feature/synthetic-run", "release/synthetic-base"
+        self.git("push", "-q", "origin", f"HEAD:refs/heads/{base}")
+        self.git("checkout", "-qb", branch)
+        self.git("commit", "--allow-empty", "-qm", "prior work")
+        starting_head = self.git("rev-parse", "HEAD")
+        binding = {"AGENTFLOW_EXECUTION_SCOPE": "run", "AGENTFLOW_WORK_BRANCHES": f"clone\t{branch}\t{base}"}
+        self.stage(scripts["git-branch"], 0, f"BRANCH_NOVA={branch} BASE={base}", environment=binding)
+        self.assertEqual(self.git("rev-parse", "HEAD"), starting_head)
+        self.assertFalse(self.git("branch", "--list", "sop/*"))
+        self.stage(scripts["validate-tests"], 0)
+        self.stage(scripts["reserve"], 0)
+        self.write("clone/product.txt", "candidate\n")
+        self.git("add", "product.txt")
+        self.stage(scripts["verify"], 0)
+        self.gate("review")
+        tree = self.git("write-tree")
+        self.write("review.md", f"Reviewed-Git-Tree: {tree}\n")
+        self.stage(scripts["bind-review"], 0)
+        self.stage(scripts["verify-final"], 0)
+        self.git("checkout", "-qb", "sop/obsolete")
+        self.stage(scripts["git-commit"], 1, "branch diferente", environment=binding)
+        self.git("checkout", "-q", branch)
+        self.assertEqual(self.git("rev-parse", "HEAD"), starting_head)
+        self.stage(scripts["git-commit"], 0, environment=binding)
+        self.assertEqual((self.repo / ".sop/git-branch").read_bytes(), f"{branch}\n".encode())
+        self.assertEqual((self.repo / ".sop/git-base").read_bytes(), f"{base}\n".encode())
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}"), tree)
+        self.assertEqual(self.git("ls-remote", "origin", f"refs/heads/{branch}"),
+                         self.git("rev-parse", "HEAD") + f"\trefs/heads/{branch}")
+        self.assertFalse(self.git("ls-remote", "origin", "refs/heads/sop/*"))
+
+    @unittest.skipUnless(EXPORTS, "requires a local published SOP export")
+    def test_bound_setup_rejects_invalid_or_dirty_checkouts(self):
+        source = json.loads(EXPORTS[0].read_text(encoding="utf-8-sig"))
+        setup = next(node for node in source["nodes"] if node["id"] == "git-branch")
+        setup["executionScope"] = "repositories"
+        SOP["apply_reliability"](source)
+        self.init_local_origin()
+        branch = "feature/synthetic-run"
+        self.git("branch", branch)
+        starting_head = self.git("rev-parse", "HEAD")
+        for manifest, message in (
+            ("", "uma única branch"),
+            (f"clone\t{branch}\tmain\nother\t{branch}\tmain", "uma única branch"),
+            (f"other\t{branch}\tmain", "checkout diverge do repositório"),
+        ):
+            with self.subTest(manifest=manifest):
+                self.stage(setup["script"], 78, message, environment={
+                    "AGENTFLOW_EXECUTION_SCOPE": "run", "AGENTFLOW_WORK_BRANCHES": manifest,
+                })
+
+        script = 'export AGENTFLOW_WORKSPACE="$PWD"\ncd clone\n' + setup["script"]
+        binding = {"AGENTFLOW_EXECUTION_SCOPE": "repositories", "AGENTFLOW_REPOSITORY_DIR": "clone",
+                   "AGENTFLOW_WORK_BRANCH": branch, "AGENTFLOW_BASE_BRANCH": "main"}
+        self.stage(script, 78, "uma única branch", environment=binding | {"AGENTFLOW_WORK_BRANCH": ""})
+        self.stage(script, 78, "checkout diverge da branch", environment=binding)
+        self.assertEqual(self.git("branch", "--show-current"), "main")
+        self.git("checkout", "-q", branch)
+        changed = self.write("clone/product.txt", "local changes\n")
+        self.stage(script, 78, "alterações locais", environment=binding)
+        self.assertEqual(changed.read_text(), "local changes\n")
+        self.git("restore", "--", "product.txt")
+        remote = self.temp / "remote.git"
+        base_ref = "refs/heads/release/deleted"
+        self.git("push", "-q", "origin", "HEAD:" + base_ref)
+        self.git("update-ref", "-d", base_ref, repo=remote)
+        self.assertEqual(self.git("rev-parse", "refs/remotes/origin/release/deleted"), starting_head)
+        self.stage(script, 78, "base vinculada", environment=binding | {"AGENTFLOW_BASE_BRANCH": "release/deleted"})
+        self.git("remote", "set-url", "origin", str(self.temp / "unavailable.git"))
+        self.stage(script, 78, "base vinculada", environment=binding)
+        self.assertFalse((self.repo / ".sop").exists())
+        self.git("remote", "set-url", "origin", str(remote))
+        self.stage(script, 0, f"BRANCH_NOVA={branch} BASE=main", environment=binding)
+        self.assertEqual(self.git("rev-parse", "HEAD"), starting_head)
+        self.assertEqual(self.git("rev-parse", "FETCH_HEAD^{commit}"), starting_head)
+
+    @unittest.skipUnless(EXPORTS, "requires a local published SOP export")
     def test_delivery_reconciles_a_lost_merge_response(self):
         source = json.loads(EXPORTS[0].read_text(encoding="utf-8-sig"))
         SOP["apply_reliability"](source)
@@ -453,8 +535,18 @@ def test_CA001_import():
             derived = json.loads(out.read_text(encoding="utf-8"))
             previous = {node["id"]: node for node in source["nodes"]}
             nodes = {node["id"]: node for node in derived["nodes"]}
-            for name in ("approve-tests", "approve-merge", "git-branch"):
+            for name in ("approve-tests", "approve-merge"):
                 self.assertEqual(previous[name], nodes[name])
+            bound = nodes["git-branch"]
+            original = previous["git-branch"]
+            self.assertEqual(bound | {"script": original["script"]}, original)
+            self.assertNotEqual(bound["script"], original["script"])
+            outdated = self.temp / "before-binding.json"
+            upgraded = self.temp / "upgraded.json"
+            before_binding = derived | {"nodes": [original if n["id"] == "git-branch" else n for n in derived["nodes"]]}
+            write_file(outdated, json.dumps(before_binding))
+            apply(outdated, upgraded, 0)
+            self.assertEqual(out.read_bytes(), upgraded.read_bytes())
             for name in ("tests", "fix"):
                 self.assertEqual(previous[name]["taskPrompt"], nodes[name]["taskPrompt"])
             self.assertIn("envNonempty", nodes["tests"]["agentInstructions"])
@@ -470,13 +562,12 @@ def test_CA001_import():
             write_file(altered, json.dumps(source))
             apply(altered, invalid, 1)
             self.assertFalse(invalid.exists())
-            installed = next(node for node in derived["nodes"] if node["id"] == "reserve")
-            altered_bytes = installed["script"] + "\n# syntactic but unrecognized edit"
-            original_script = installed["script"]
-            installed["script"] = altered_bytes
-            write_file(altered, json.dumps(derived))
-            apply(altered, invalid, 1)
-            installed["script"] = original_script
+            for entry in (nodes["reserve"], bound):
+                script = entry["script"]
+                entry["script"] += "\n# syntactic but unrecognized edit"
+                write_file(altered, json.dumps(derived))
+                apply(altered, invalid, 1)
+                entry["script"] = script
 
             for node in nodes.values():
                 if node.get("scriptLanguage") == "shell":
@@ -501,7 +592,7 @@ def test_CA001_import():
         (gate_root / "child-run--spec").rename(gate_root / "spec")
 
         self.init_local_origin()
-        self.stage(scripts["git-branch"], 0)
+        self.stage(scripts["git-branch"], 0, "BRANCH_NOVA=sop/")
         self.exercise_workflow(scripts)
 
 
