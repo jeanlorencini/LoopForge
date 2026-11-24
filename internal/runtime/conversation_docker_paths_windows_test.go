@@ -3,9 +3,12 @@ package runtime
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -49,6 +52,14 @@ func init() {
 		for scanner.Scan() {
 		}
 	case containsArg(os.Args, "-i") && strings.Contains(joined, dockerConversationProcessSupervisor):
+		if os.Getenv("LOOPFORGE_WINDOWS_DOCKER_SCRIPT_PROBE") == "1" {
+			script, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				os.Exit(3)
+			}
+			fmt.Printf("%x\n", sha256.Sum256(script))
+			break
+		}
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		fmt.Print(line)
 	default:
@@ -103,6 +114,46 @@ func readWindowsDockerCalls(t *testing.T, log string) [][]string {
 		t.Fatal(err)
 	}
 	return calls
+}
+
+func TestWindowsDockerLongSOPScript(t *testing.T) {
+	log := installWindowsDockerRecorder(t)
+	t.Setenv("LOOPFORGE_WINDOWS_DOCKER_SCRIPT_PROBE", "1")
+	sandbox := &dockerSandbox{name: "windows-long-sop-script", workspace: t.TempDir()}
+	script := "# SOP script transport probe\n" + strings.Repeat("# é \"quotes\" \\shell\n", 2400) + "printf 'done\\n'\n\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	out, err := sandbox.execOnce(ctx, CommandSpec{Argv: []string{"sh", "-lc", script}, Provider: "script"}, nil)
+	if err != nil {
+		t.Fatalf("run long SOP script in Docker: %v", err)
+	}
+	if got, want := strings.TrimSpace(out), fmt.Sprintf("%x", sha256.Sum256([]byte(script))); got != want {
+		t.Fatalf("Docker received script digest %q, want %q", got, want)
+	}
+	for _, call := range readWindowsDockerCalls(t, log) {
+		if strings.Contains(strings.Join(call, "\n"), "# SOP script transport probe") {
+			t.Fatal("script body was passed as a Windows process argument")
+		}
+	}
+
+	_, err = sandbox.execOnce(ctx, CommandSpec{Argv: []string{"sh", "-lc", "true\x00false"}, Provider: "script"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "NUL byte") {
+		t.Fatalf("NUL in a shell script must be rejected: %v", err)
+	}
+}
+
+func TestWindowsDockerScriptStdinPreservesEnvironment(t *testing.T) {
+	t.Setenv("script", "profile-provided value")
+	cmd := exec.Command(windowsTestShell(t), "-c", dockerShellScriptFromStdin)
+	cmd.Stdin = strings.NewReader(`if IFS= read -r line; then exit 88; fi
+printf '%s\n' "$script"
+exit 37
+`)
+	out, err := cmd.CombinedOutput()
+	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 37 || strings.TrimSpace(string(out)) != "profile-provided value" {
+		t.Fatalf("script environment, stdin, or exit changed: %q: %v", out, err)
+	}
 }
 
 func TestWindowsDockerConversationSeparatesHostAndContainerPaths(t *testing.T) {
