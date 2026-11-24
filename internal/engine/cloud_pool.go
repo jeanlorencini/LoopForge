@@ -247,8 +247,9 @@ func (e *Engine) bindPoolRunner(ctx context.Context, run domain.Run, nodeID stri
 		msg = fmt.Sprintf("执行机器 %s 不可用，已切换到云端执行机器 %s 重新拉取代码", name, runner.Name)
 	}
 	node := run.Nodes[nodeID]
-	updated, err := e.updateRunReplayable(run.ID, func(c *domain.Run) bool {
-		if c.Generation != run.Generation || c.OwnerInstanceID != run.OwnerInstanceID || c.ExecutionContext != ec ||
+	canBind := func(c *domain.Run, expected domain.TelemetryContext) bool {
+		if c.Generation != run.Generation || c.OwnerInstanceID != run.OwnerInstanceID || c.ExecutionContext != expected ||
+			(c.OwnerInstanceID != "" && !e.ownsRun(*c)) ||
 			c.CancelRequested || c.PauseRequested || domain.TerminalRunStatus(c.Status) {
 			return false
 		}
@@ -256,6 +257,12 @@ func (e *Engine) bindPoolRunner(ctx context.Context, run domain.Run, nodeID stri
 			return false
 		}
 		if (convert || previous != "") && hasCodeWorkspace(*c) && hasWorkspaceProgress(*c, nodeID) {
+			return false
+		}
+		return true
+	}
+	updated, err := e.updateRunReplayable(run.ID, func(c *domain.Run) bool {
+		if !canBind(c, ec) {
 			return false
 		}
 		c.ExecutionContext = target
@@ -272,7 +279,7 @@ func (e *Engine) bindPoolRunner(ctx context.Context, run domain.Run, nodeID stri
 	if !ok {
 		return run, errors.New("run not found")
 	}
-	if bound.ExecutionContext != target || bound.Generation != run.Generation || bound.OwnerInstanceID != run.OwnerInstanceID {
+	if !canBind(&bound, target) {
 		return run, fmt.Errorf("绑定云端执行机器 %s：%w", runner.ID, repo.ErrRunDecisionStale)
 	}
 	// This host's sandbox is no longer the execution environment. Drain only

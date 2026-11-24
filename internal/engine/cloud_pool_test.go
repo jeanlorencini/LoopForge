@@ -54,8 +54,16 @@ func TestCloudPoolPicksOnlyPlatformRunnersForListedProjects(t *testing.T) {
 
 func TestBindPoolRunnerRequiresDurableBinding(t *testing.T) {
 	t.Parallel()
-	for _, name := range []string{"concurrent log", "concurrent pause"} {
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		pauseAt   int
+		wantBound bool
+	}{
+		{name: "concurrent log", wantBound: true},
+		{name: "pause before commit", pauseAt: 2},
+		{name: "pause after commit", pauseAt: 3, wantBound: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			e, s := retryEngine(t)
 			e.ConfigureCloudRunnerPool(CloudRunnerPool{Label: "pool=cloud", Projects: []string{"*"}, Required: true})
 			if err := s.PutRunner(domain.Runner{ID: "builtin", Status: domain.RunnerStatusOnline, RunnerVersion: "0.4.0", Labels: []string{"pool=cloud"}}); err != nil {
@@ -78,15 +86,12 @@ func TestBindPoolRunnerRequiresDurableBinding(t *testing.T) {
 					return
 				}
 				reads++
-				// The second snapshot belongs to the binding write, after runner selection.
-				if reads != 2 {
-					return
-				}
-				if name == "concurrent pause" {
+				// The second snapshot is read before the binding write; the third is read to publish it after commit.
+				if reads == tc.pauseAt {
 					if _, err := s.RequestRunPause(run.ID); err != nil {
 						t.Fatal(err)
 					}
-				} else {
+				} else if tc.pauseAt == 0 && reads == 2 {
 					signal := domain.Run{ID: run.ID, Logs: []domain.LogRecord{{Body: "concurrent log"}}}
 					if err := s.AppendRunSignals(signal, "fix"); err != nil {
 						t.Fatal(err)
@@ -101,9 +106,16 @@ func TestBindPoolRunnerRequiresDurableBinding(t *testing.T) {
 			if !ok {
 				t.Fatal("run not found after binding")
 			}
-			if name == "concurrent pause" {
-				if !errors.Is(err, repo.ErrRunDecisionStale) || !stored.PauseRequested || e.defaultExecutionRunner(stored) != "" || len(stored.Events) != 0 || sandbox.closed {
-					t.Fatalf("pause must stop binding and retain the sandbox: paused=%t runner=%q events=%+v sandbox closed=%t err=%v", stored.PauseRequested, e.defaultExecutionRunner(stored), stored.Events, sandbox.closed, err)
+			if tc.wantBound {
+				if e.defaultExecutionRunner(stored) != "builtin" || len(stored.Events) != 1 || stored.Events[0].Type != "execution.bound" {
+					t.Fatalf("missing durable binding: context=%+v events=%+v", stored.ExecutionContext, stored.Events)
+				}
+			} else if e.defaultExecutionRunner(stored) != "" || len(stored.Events) != 0 {
+				t.Fatalf("binding persisted after pause: context=%+v events=%+v", stored.ExecutionContext, stored.Events)
+			}
+			if tc.pauseAt != 0 {
+				if !errors.Is(err, repo.ErrRunDecisionStale) || !stored.PauseRequested || sandbox.closed {
+					t.Fatalf("pause must stop execution and retain the sandbox: paused=%t sandbox closed=%t err=%v", stored.PauseRequested, sandbox.closed, err)
 				}
 				return
 			}
@@ -113,9 +125,8 @@ func TestBindPoolRunnerRequiresDurableBinding(t *testing.T) {
 			if e.defaultExecutionRunner(bound) != "builtin" {
 				t.Fatalf("successful binding selected runner %q", e.defaultExecutionRunner(bound))
 			}
-			if e.defaultExecutionRunner(stored) != "builtin" || len(stored.Events) != 1 || stored.Events[0].Type != "execution.bound" ||
-				len(stored.Logs) != 1 || stored.Logs[0].Body != "concurrent log" {
-				t.Fatalf("missing durable binding or concurrent log: context=%+v events=%+v logs=%+v", stored.ExecutionContext, stored.Events, stored.Logs)
+			if len(stored.Logs) != 1 || stored.Logs[0].Body != "concurrent log" {
+				t.Fatalf("missing concurrent log: %+v", stored.Logs)
 			}
 			if !sandbox.closed {
 				t.Fatal("moving a run onto the pool runner must remove the control-plane container")
