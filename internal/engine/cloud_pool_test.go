@@ -10,6 +10,8 @@ import (
 	"agentflow/internal/domain"
 	"agentflow/internal/repo"
 	"agentflow/internal/runtime"
+
+	"gorm.io/gorm"
 )
 
 func TestCloudPoolPicksOnlyPlatformRunnersForListedProjects(t *testing.T) {
@@ -50,38 +52,75 @@ func TestCloudPoolPicksOnlyPlatformRunnersForListedProjects(t *testing.T) {
 	}
 }
 
-func TestBindPoolRunnerDiscardsLocalSandbox(t *testing.T) {
+func TestBindPoolRunnerRequiresDurableBinding(t *testing.T) {
 	t.Parallel()
-	s, err := repo.OpenTest()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(s.Close)
-	e := New(s, runtime.NewManager(t.TempDir()))
-	e.ConfigureCloudRunnerPool(CloudRunnerPool{Label: "pool=cloud", Projects: []string{"*"}, Required: true})
-	if err := s.PutRunner(domain.Runner{ID: "builtin", Status: domain.RunnerStatusOnline, RunnerVersion: "0.4.0", Labels: []string{"pool=cloud"}}); err != nil {
-		t.Fatal(err)
-	}
-	run := domain.Run{
-		ID: "run-local", Status: "running",
-		ExecutionContext: domain.TelemetryContext{ProjectID: "skillhub", ExecutionMode: domain.ExecutionModeCloud},
-		Nodes:            map[string]*domain.NodeRun{"fix": {NodeID: "fix", Status: "running"}},
-	}
-	if err := s.PutRun(run); err != nil {
-		t.Fatal(err)
-	}
-	sandbox := &recordingSandbox{workspace: e.sandboxes.RunWorkspace(run.ID)}
-	e.runEnvs[run.ID] = &runEnvironment{sandbox: sandbox}
+	for _, name := range []string{"concurrent log", "concurrent pause"} {
+		t.Run(name, func(t *testing.T) {
+			e, s := retryEngine(t)
+			e.ConfigureCloudRunnerPool(CloudRunnerPool{Label: "pool=cloud", Projects: []string{"*"}, Required: true})
+			if err := s.PutRunner(domain.Runner{ID: "builtin", Status: domain.RunnerStatusOnline, RunnerVersion: "0.4.0", Labels: []string{"pool=cloud"}}); err != nil {
+				t.Fatal(err)
+			}
+			run := domain.Run{
+				ID: "run-local", Status: "running",
+				ExecutionContext: domain.TelemetryContext{ProjectID: "skillhub", ExecutionMode: domain.ExecutionModeCloud},
+				Nodes:            map[string]*domain.NodeRun{"fix": {NodeID: "fix", Status: "running"}},
+			}
+			if err := s.PutRun(run); err != nil {
+				t.Fatal(err)
+			}
+			sandbox := &recordingSandbox{workspace: e.sandboxes.RunWorkspace(run.ID)}
+			e.runEnvs[run.ID] = &runEnvironment{sandbox: sandbox}
 
-	bound, err := e.bindPoolRunner(context.Background(), run, "fix")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bound.ExecutionContext.ExecutionRunnerID != "builtin" {
-		t.Fatalf("runner=%q", bound.ExecutionContext.ExecutionRunnerID)
-	}
-	if !sandbox.closed {
-		t.Fatal("moving a run onto the pool runner must remove the control-plane container")
+			reads := 0
+			if err := s.DB.Callback().Query().After("gorm:query").Register("fixture:signal_crosses_pool_bind", func(tx *gorm.DB) {
+				if tx.Statement.Table != "run_artifacts" {
+					return
+				}
+				reads++
+				// The second snapshot belongs to the binding write, after runner selection.
+				if reads != 2 {
+					return
+				}
+				if name == "concurrent pause" {
+					if _, err := s.RequestRunPause(run.ID); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					signal := domain.Run{ID: run.ID, Logs: []domain.LogRecord{{Body: "concurrent log"}}}
+					if err := s.AppendRunSignals(signal, "fix"); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			bound, err := e.bindPoolRunner(context.Background(), run, "fix")
+			stored, ok := s.Run(run.ID)
+			if !ok {
+				t.Fatal("run not found after binding")
+			}
+			if name == "concurrent pause" {
+				if !errors.Is(err, repo.ErrRunDecisionStale) || !stored.PauseRequested || e.defaultExecutionRunner(stored) != "" || len(stored.Events) != 0 || sandbox.closed {
+					t.Fatalf("pause must stop binding and retain the sandbox: paused=%t runner=%q events=%+v sandbox closed=%t err=%v", stored.PauseRequested, e.defaultExecutionRunner(stored), stored.Events, sandbox.closed, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if e.defaultExecutionRunner(bound) != "builtin" {
+				t.Fatalf("successful binding selected runner %q", e.defaultExecutionRunner(bound))
+			}
+			if e.defaultExecutionRunner(stored) != "builtin" || len(stored.Events) != 1 || stored.Events[0].Type != "execution.bound" ||
+				len(stored.Logs) != 1 || stored.Logs[0].Body != "concurrent log" {
+				t.Fatalf("missing durable binding or concurrent log: context=%+v events=%+v logs=%+v", stored.ExecutionContext, stored.Events, stored.Logs)
+			}
+			if !sandbox.closed {
+				t.Fatal("moving a run onto the pool runner must remove the control-plane container")
+			}
+		})
 	}
 }
 
