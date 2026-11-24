@@ -12,6 +12,7 @@ import (
 
 	"agentflow/internal/domain"
 	"agentflow/internal/gitwork"
+	"agentflow/internal/repo"
 	"agentflow/internal/runtime"
 )
 
@@ -122,25 +123,28 @@ func (e *Engine) requireWorkBranchCapabilities(runnerID string, repositories []d
 	if runnerID == "" {
 		return nil
 	}
+	var runner *domain.Runner
 	for _, repository := range repositories {
-		if repository.Provider == domain.RepositoryProviderSSH {
-			runner, ok := e.repo.Runner(runnerID)
-			if !ok || !runner.SupportsGitSSH() {
-				return fmt.Errorf("Git SSH 仓库需要执行机器升级至 %s 或更新版本，请先更新 Runner", domain.RunnerVersionGitSSH)
+		if repository.Provider != domain.RepositoryProviderSSH && !repository.CreateNewWorkBranch && !repository.RequireExistingWorkBranch {
+			continue
+		}
+		if runner == nil {
+			registered, err := e.readRunnerBeforeClaim(runnerID)
+			if err != nil {
+				return err
 			}
+			runner = &registered
+		}
+		if repository.Provider == domain.RepositoryProviderSSH && !runner.SupportsGitSSH() {
+			return fmt.Errorf("Git SSH 仓库需要执行机器升级至 %s 或更新版本，请先更新 Runner", domain.RunnerVersionGitSSH)
 		}
 		if repository.CreateNewWorkBranch {
-			runner, ok := e.repo.Runner(runnerID)
-			if !ok || !runner.SupportsCreateNewWorkBranch() {
+			if !runner.SupportsCreateNewWorkBranch() {
 				return fmt.Errorf("按指定名字新建分支需要执行机器升级至 %s 或更新版本，请先更新 Runner", domain.RunnerVersionCreateNewWorkBranch)
 			}
 			continue
 		}
-		if !repository.RequireExistingWorkBranch {
-			continue
-		}
-		runner, ok := e.repo.Runner(runnerID)
-		if !ok || !runner.SupportsExistingWorkBranch() {
+		if repository.RequireExistingWorkBranch && !runner.SupportsExistingWorkBranch() {
 			return fmt.Errorf("继续已有分支需要执行机器升级至 %s 或更新版本，请先更新 Runner", domain.RunnerVersionExistingWorkBranch)
 		}
 	}
@@ -184,79 +188,6 @@ func (e *Engine) runnerSandboxSpec(run domain.Run) (*domain.RunnerSandboxSpec, e
 // task-scoped invocation. The run's repository travels with the task so the
 // sandbox/workspace is created on that machine.
 func (e *Engine) dispatchRunnerTask(ctx context.Context, runnerID string, run domain.Run, node domain.WorkflowNode, sb *runEnvironment, workspace string, ex domain.ExecutorDefinition, agent domain.AgentDefinition, assets domain.AgentAssetBundle, prompt, invocationID string, options runtime.InvocationOptions, sink runtime.EventSink) (string, error) {
-	if err := e.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts()); err != nil {
-		return "", err
-	}
-	if err := e.requireRunnerProvider(runnerID, ex.Kind); err != nil {
-		return "", err
-	}
-	runner, _ := e.repo.Runner(runnerID)
-	authMode := runner.RuntimeAuthMode(ex.Kind)
-	resumeSessionID := resolveRunnerResumeSessionID(run, node.ID, options)
-	invocation := &domain.RunnerInvocation{
-		ArchivedFiles:                 e.legacyArchivedWorkspaceFiles(run, node.ID),
-		RunID:                         run.ID,
-		NodeID:                        node.ID,
-		InvocationID:                  invocationID,
-		ResumeSessionID:               resumeSessionID,
-		Executor:                      ex,
-		Agent:                         agent,
-		Assets:                        assets,
-		Artifacts:                     node.ArtifactOutputs,
-		HumanContext:                  run.HumanContext,
-		CredentialSource:              authMode,
-		GateResultPath:                options.GateResultPath,
-		RepositoryPreparationFallback: firstRepositoryAgent(run.WorkflowSnapshot, node),
-	}
-	if strings.TrimSpace(options.GateResultPath) != "" {
-		invocation.Artifacts = append(invocation.Artifacts, gateResultContract(options.GateResultPath))
-	}
-	if authMode == domain.RuntimeAuthPersonal {
-		switch ex.Kind {
-		case "codex":
-			if strings.TrimSpace(sb.credentialSnapshot().Codex.APIKey) == "" {
-				return "", errors.New("当前责任人未配置 Codex API Key：请先在个人配置中配置，或将执行机器认证方式切回本机登录")
-			}
-			invocation.CodexAPIKey = sb.credentialSnapshot().Codex.APIKey
-			invocation.CodexBaseURL = sb.credentialSnapshot().Codex.BaseURL
-		case "claude-code":
-			if strings.TrimSpace(sb.credentialSnapshot().ClaudeCode.APIKey) == "" {
-				return "", errors.New("当前责任人未配置 Claude Code API Key：请先在个人配置中配置，或将执行机器认证方式切回本机登录")
-			}
-			invocation.ClaudeCodeAPIKey = sb.credentialSnapshot().ClaudeCode.APIKey
-			invocation.ClaudeCodeBaseURL = sb.credentialSnapshot().ClaudeCode.BaseURL
-		case "codebuddy":
-			if strings.TrimSpace(sb.credentialSnapshot().CodeBuddy.APIKey) == "" {
-				return "", errors.New("当前责任人未配置 CodeBuddy API Key：请先在个人配置中配置")
-			}
-			invocation.CodeBuddyAPIKey = sb.credentialSnapshot().CodeBuddy.APIKey
-			invocation.CodeBuddyInternetEnvironment = sb.credentialSnapshot().CodeBuddy.InternetEnvironment
-		default:
-			if runtime.IsAgentCLI(ex.Kind) {
-				cred := sb.credentialSnapshot().AgentCLI[ex.Kind]
-				if strings.TrimSpace(cred.APIKey) == "" {
-					return "", fmt.Errorf("当前责任人未配置 %s API Key：请先在个人配置中配置", runtime.AgentCLILabel(ex.Kind))
-				}
-				invocation.AgentCLIAPIKey = cred.APIKey
-				invocation.AgentCLIBaseURL = cred.BaseURL
-				invocation.AgentCLIProtocol = cred.Protocol
-				invocation.AgentCLIModels = cred.Models
-			}
-		}
-	}
-	bindRunnerRepositories(invocation, run, sb.credentialSnapshot().GitUserName, sb.credentialSnapshot().GitUserEmail)
-	reported := sb.reportedOutputs(node.ID)
-	if reported != nil {
-		invocation.Artifacts = nil
-		invocation.ReportOutputs = true
-		invocation.Inputs = reported.inputs
-		invocation.OutputFiles = artifactOutputFiles(run, node)
-		if path := strings.TrimSpace(options.GateResultPath); path != "" {
-			invocation.OutputFiles = append(invocation.OutputFiles, path)
-		}
-		invocation.RecoverOutputs = normalizeExecutionScope(node.ExecutionScope) != domain.ExecutionScopeRepositories
-	}
-	invocation.MCPCallServers = e.resolveScriptMCPAssets(run.ExecutionContext.ProjectID, run.ExecutionContext.ResponsibleUserID).MCPServers
 	task := domain.RunnerTask{
 		ID:          fmt.Sprintf("rt-%d-%s", time.Now().UnixNano(), safeRunnerPath(node.ID)),
 		RunnerID:    runnerID,
@@ -267,28 +198,114 @@ func (e *Engine) dispatchRunnerTask(ctx context.Context, runnerID string, run do
 		MaxAttempts: 1, // engine-level retry/loop owns re-invocation policy
 		RunID:       run.ID,
 		NodeID:      node.ID,
-		Invocation:  invocation,
+		Invocation:  &domain.RunnerInvocation{InvocationID: invocationID},
 	}
-	sandboxSpec, err := e.runnerSandboxSpec(run)
+	reused, err := nextWorkflowRunnerTask(ctx, &task, "agent")
 	if err != nil {
 		return "", err
 	}
-	task.Sandbox = sandboxSpec
-	if err := validateSOPHandoffRunnerPayload(run, task); err != nil {
-		return "", err
+	reported := sb.reportedOutputs(node.ID)
+	if !reused {
+		if err := e.requireRunnerProvider(runnerID, ex.Kind); err != nil {
+			return "", err
+		}
+		if err := e.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts()); err != nil {
+			return "", err
+		}
+		runner, _ := e.repo.Runner(runnerID)
+		authMode := runner.RuntimeAuthMode(ex.Kind)
+		resumeSessionID := resolveRunnerResumeSessionID(run, node.ID, options)
+		invocation := &domain.RunnerInvocation{
+			ArchivedFiles:                 e.legacyArchivedWorkspaceFiles(run, node.ID),
+			RunID:                         run.ID,
+			NodeID:                        node.ID,
+			InvocationID:                  invocationID,
+			ResumeSessionID:               resumeSessionID,
+			Executor:                      ex,
+			Agent:                         agent,
+			Assets:                        assets,
+			Artifacts:                     node.ArtifactOutputs,
+			HumanContext:                  run.HumanContext,
+			CredentialSource:              authMode,
+			GateResultPath:                options.GateResultPath,
+			RepositoryPreparationFallback: firstRepositoryAgent(run.WorkflowSnapshot, node),
+		}
+		if strings.TrimSpace(options.GateResultPath) != "" {
+			invocation.Artifacts = append(invocation.Artifacts, gateResultContract(options.GateResultPath))
+		}
+		if authMode == domain.RuntimeAuthPersonal {
+			switch ex.Kind {
+			case "codex":
+				if strings.TrimSpace(sb.credentialSnapshot().Codex.APIKey) == "" {
+					return "", errors.New("当前责任人未配置 Codex API Key：请先在个人配置中配置，或将执行机器认证方式切回本机登录")
+				}
+				invocation.CodexAPIKey = sb.credentialSnapshot().Codex.APIKey
+				invocation.CodexBaseURL = sb.credentialSnapshot().Codex.BaseURL
+			case "claude-code":
+				if strings.TrimSpace(sb.credentialSnapshot().ClaudeCode.APIKey) == "" {
+					return "", errors.New("当前责任人未配置 Claude Code API Key：请先在个人配置中配置，或将执行机器认证方式切回本机登录")
+				}
+				invocation.ClaudeCodeAPIKey = sb.credentialSnapshot().ClaudeCode.APIKey
+				invocation.ClaudeCodeBaseURL = sb.credentialSnapshot().ClaudeCode.BaseURL
+			case "codebuddy":
+				if strings.TrimSpace(sb.credentialSnapshot().CodeBuddy.APIKey) == "" {
+					return "", errors.New("当前责任人未配置 CodeBuddy API Key：请先在个人配置中配置")
+				}
+				invocation.CodeBuddyAPIKey = sb.credentialSnapshot().CodeBuddy.APIKey
+				invocation.CodeBuddyInternetEnvironment = sb.credentialSnapshot().CodeBuddy.InternetEnvironment
+			default:
+				if runtime.IsAgentCLI(ex.Kind) {
+					cred := sb.credentialSnapshot().AgentCLI[ex.Kind]
+					if strings.TrimSpace(cred.APIKey) == "" {
+						return "", fmt.Errorf("当前责任人未配置 %s API Key：请先在个人配置中配置", runtime.AgentCLILabel(ex.Kind))
+					}
+					invocation.AgentCLIAPIKey = cred.APIKey
+					invocation.AgentCLIBaseURL = cred.BaseURL
+					invocation.AgentCLIProtocol = cred.Protocol
+					invocation.AgentCLIModels = cred.Models
+				}
+			}
+		}
+		bindRunnerRepositories(invocation, run, sb.credentialSnapshot().GitUserName, sb.credentialSnapshot().GitUserEmail)
+		if reported != nil {
+			invocation.Artifacts = nil
+			invocation.ReportOutputs = true
+			invocation.Inputs = reported.inputs
+			invocation.OutputFiles = artifactOutputFiles(run, node)
+			if path := strings.TrimSpace(options.GateResultPath); path != "" {
+				invocation.OutputFiles = append(invocation.OutputFiles, path)
+			}
+			invocation.RecoverOutputs = normalizeExecutionScope(node.ExecutionScope) != domain.ExecutionScopeRepositories
+		}
+		invocation.MCPCallServers = e.resolveScriptMCPAssets(run.ExecutionContext.ProjectID, run.ExecutionContext.ResponsibleUserID).MCPServers
+
+		sandboxSpec, err := e.runnerSandboxSpec(run)
+		if err != nil {
+			return "", err
+		}
+		task.Sandbox = sandboxSpec
+		task.Invocation = invocation
+		if err := validateSOPHandoffRunnerPayload(run, task); err != nil {
+			return "", err
+		}
+		stored, inserted, err := e.enqueueWorkflowRunnerTask(ctx, task)
+		if err != nil {
+			return "", err
+		}
+		task = stored
+		if inserted {
+			e.notifyRunnerDispatch(ex.Kind)
+			if sink != nil {
+				sink(domain.TelemetryEvent{
+					Category: "sandbox", Name: "runner.dispatch", Phase: "start",
+					Message:    fmt.Sprintf("任务下发到执行机器 %s（provider=%s task=%s）", runnerID, ex.Kind, task.ID),
+					Attributes: map[string]any{"provider": ex.Kind, "runnerId": runnerID, "taskId": task.ID},
+				})
+			}
+		}
 	}
-	if err := e.repo.PutRunnerTask(task); err != nil {
-		return "", err
-	}
-	e.notifyRunnerDispatch(ex.Kind)
-	if sink != nil {
-		sink(domain.TelemetryEvent{
-			Category: "sandbox", Name: "runner.dispatch", Phase: "start",
-			Message:    fmt.Sprintf("任务下发到执行机器 %s（provider=%s task=%s）", runnerID, ex.Kind, task.ID),
-			Attributes: map[string]any{"provider": ex.Kind, "runnerId": runnerID, "taskId": task.ID},
-		})
-	}
-	final, err := e.awaitRunnerTask(ctx, task.ID, sink)
+
+	final, err := e.awaitWorkflowRunnerTask(ctx, task.ID, sink)
 	if err != nil {
 		return "", err
 	}
@@ -321,7 +338,7 @@ func (e *Engine) dispatchRunnerTask(ctx context.Context, runnerID string, run do
 		}
 		return "", explainGitAuthFailure(errors.New(msg), strings.TrimSpace(sb.credentialSnapshot().GitHTTPCredentials["github.com"].Token) != "")
 	case domain.RunnerTaskCanceled:
-		return "", errors.New("runner task canceled")
+		return "", runnerTaskCanceledError(final, "runner task canceled")
 	default:
 		return "", fmt.Errorf("runner task ended in unexpected state %q", final.Status)
 	}
@@ -401,33 +418,10 @@ func shellSingleQuote(value string) string {
 // execution machine. Repository metadata is included so a script can also be
 // the first node; subsequent shared-layout nodes reuse the same checkout and
 // its workspace-local Git index flags.
-func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run domain.Run, nodeID, workspace, language, script, artifactDirectory string, artifacts []domain.ArtifactContract, sb *runEnvironment, gitToken, gitUserName, gitUserEmail string, assets domain.AgentAssetBundle, sink runtime.EventSink) (string, error) {
-	if err := e.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts()); err != nil {
-		return "", err
-	}
-	if err := e.requireRunnerProvider(runnerID, "terminal"); err != nil {
-		return "", err
-	}
+func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run domain.Run, nodeID, workspace, language, script, artifactDirectory string, artifacts []domain.ArtifactContract, sb *runEnvironment, gitToken, gitUserName, gitUserEmail string, assets domain.AgentAssetBundle, sink runtime.EventSink) (string, *int, error) {
 	command := script
 	if strings.EqualFold(strings.TrimSpace(language), "python") {
 		command = "python3 -c " + shellSingleQuote(script)
-	}
-	invocation := &domain.RunnerInvocation{
-		ArchivedFiles: e.legacyArchivedWorkspaceFiles(run, nodeID),
-		RunID:         run.ID, NodeID: nodeID, Artifacts: artifacts, ArtifactDirectory: artifactDirectory, Assets: assets, MCPCallServers: assets.MCPServers, HumanContext: run.HumanContext}
-	bindRunnerRepositories(invocation, run, gitUserName, gitUserEmail)
-	reported := sb.reportedOutputs(nodeID)
-	if reported != nil {
-		invocation.Artifacts = nil
-		invocation.ArtifactDirectory = ""
-		invocation.ReportOutputs = true
-		invocation.Inputs = reported.inputs
-		for _, contract := range artifacts {
-			if rel, ok := artifactRelPath(artifactDirectory, contract.Path); ok {
-				invocation.OutputFiles = append(invocation.OutputFiles, rel)
-			}
-		}
-		invocation.RecoverOutputs = strings.TrimSpace(artifactDirectory) == ""
 	}
 	task := domain.RunnerTask{
 		ID:          fmt.Sprintf("rt-%d-%s-script", time.Now().UnixNano(), safeRunnerPath(nodeID)),
@@ -439,30 +433,64 @@ func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run 
 		MaxAttempts: 1,
 		RunID:       run.ID,
 		NodeID:      nodeID,
-		Invocation:  invocation,
 	}
-	var err error
-	task.Sandbox, err = e.runnerSandboxSpec(run)
+	reused, err := nextWorkflowRunnerTask(ctx, &task, "script")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	if err := validateSOPHandoffRunnerPayload(run, task); err != nil {
-		return "", err
+	reported := sb.reportedOutputs(nodeID)
+	if !reused {
+		if err := e.requireRunnerProvider(runnerID, "terminal"); err != nil {
+			return "", nil, err
+		}
+		if err := e.requireWorkBranchCapabilities(runnerID, run.RepositoryContexts()); err != nil {
+			return "", nil, err
+		}
+		invocation := &domain.RunnerInvocation{
+			ArchivedFiles: e.legacyArchivedWorkspaceFiles(run, nodeID),
+			RunID:         run.ID, NodeID: nodeID, Artifacts: artifacts, ArtifactDirectory: artifactDirectory, Assets: assets, MCPCallServers: assets.MCPServers, HumanContext: run.HumanContext}
+		bindRunnerRepositories(invocation, run, gitUserName, gitUserEmail)
+		if reported != nil {
+			invocation.Artifacts = nil
+			invocation.ArtifactDirectory = ""
+			invocation.ReportOutputs = true
+			invocation.Inputs = reported.inputs
+			for _, contract := range artifacts {
+				if rel, ok := artifactRelPath(artifactDirectory, contract.Path); ok {
+					invocation.OutputFiles = append(invocation.OutputFiles, rel)
+				}
+			}
+			invocation.RecoverOutputs = strings.TrimSpace(artifactDirectory) == ""
+		}
+
+		task.Sandbox, err = e.runnerSandboxSpec(run)
+		if err != nil {
+			return "", nil, err
+		}
+		task.Invocation = invocation
+		if err := validateSOPHandoffRunnerPayload(run, task); err != nil {
+			return "", nil, err
+		}
+		stored, inserted, err := e.enqueueWorkflowRunnerTask(ctx, task)
+		if err != nil {
+			return "", nil, err
+		}
+		task = stored
+		if inserted {
+			e.notifyRunnerDispatch("terminal")
+			if sink != nil {
+				sink(domain.TelemetryEvent{
+					Category: "sandbox", Name: "runner.dispatch", Phase: "start",
+					Message:    fmt.Sprintf("脚本下发到执行机器 %s（task=%s）", runnerID, task.ID),
+					Attributes: map[string]any{"provider": "terminal", "runnerId": runnerID, "taskId": task.ID},
+				})
+			}
+		}
 	}
-	if err := e.repo.PutRunnerTask(task); err != nil {
-		return "", err
-	}
-	e.notifyRunnerDispatch("terminal")
-	if sink != nil {
-		sink(domain.TelemetryEvent{
-			Category: "sandbox", Name: "runner.dispatch", Phase: "start",
-			Message:    fmt.Sprintf("脚本下发到执行机器 %s（task=%s）", runnerID, task.ID),
-			Attributes: map[string]any{"provider": "terminal", "runnerId": runnerID, "taskId": task.ID},
-		})
-	}
-	final, err := e.awaitRunnerTask(ctx, task.ID, sink)
+
+	final, err := e.awaitWorkflowRunnerTask(ctx, task.ID, sink)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if reported != nil {
 		reported.absorb(final.Outputs)
@@ -470,23 +498,28 @@ func (e *Engine) dispatchRunnerScript(ctx context.Context, runnerID string, run 
 	}
 	switch final.Status {
 	case domain.RunnerTaskSuccess:
+		exitCode := final.ExitCode
+		if exitCode != nil && *exitCode < 0 {
+			exitCode = nil
+		}
 		if reported == nil {
-			if err := restoreRunnerArtifacts(filepath.Join(sb.Workspace(), filepath.FromSlash(artifactDirectory)), artifacts, final.Artifacts); err != nil {
-				return final.Result, fmt.Errorf("restore runner script artifacts: %w", err)
+			if err := restoreRunnerArtifacts(filepath.Join(sb.Workspace(), filepath.FromSlash(task.Invocation.ArtifactDirectory)), task.Invocation.Artifacts, final.Artifacts); err != nil {
+				return final.Result, exitCode, fmt.Errorf("restore runner script artifacts: %w", err)
 			}
 		}
-		return final.Result, nil
+		return final.Result, exitCode, nil
 	case domain.RunnerTaskCanceled:
-		return final.Result, errors.New("runner script canceled")
+		return final.Result, nil, runnerTaskCanceledError(final, "runner script canceled")
 	default:
-		message := strings.TrimSpace(final.Error)
-		if message == "" {
-			message = strings.TrimSpace(final.Result)
+		message := clipHumanGateDetail(final.Error)
+		// Older runners use zero for failures that occur before a command starts.
+		if final.ExitCode != nil && (*final.ExitCode > 0 || *final.ExitCode == 0 && final.ExitCodeObserved) {
+			return final.Result, final.ExitCode, scriptExitError{code: *final.ExitCode, detail: message}
 		}
 		if message == "" {
 			message = "script failed on runner"
 		}
-		return final.Result, errors.New(message)
+		return final.Result, nil, errors.New(message)
 	}
 }
 
@@ -516,7 +549,7 @@ func (e *Engine) validateExecutionReconnect(run domain.Run, nodeID string) error
 	if !ok {
 		return fmt.Errorf("无法重连原执行环境：执行机器 %s 不存在", runnerID)
 	}
-	if runner.Status != domain.RunnerStatusOnline {
+	if !runnerIsAvailable(runner) {
 		return fmt.Errorf("无法重连原执行环境：执行机器 %s（%s）当前离线", runnerID, runner.Name)
 	}
 	for _, node := range run.WorkflowSnapshot.Nodes {
@@ -622,7 +655,7 @@ func (e *Engine) queueRunnerPreviewArchive(run domain.Run, spec domain.RunnerPre
 // bound runner machine inside the node's task workspace. The invocation
 // carries the same repository git token as a script task: a gate such as
 // `git push` otherwise starts with prompts disabled and no credentials.
-func (e *Engine) dispatchRunnerCommand(ctx context.Context, runnerID, runID, nodeID, workspace, command string, gateSink runtime.EventSink) (string, error) {
+func (e *Engine) dispatchRunnerCommand(ctx context.Context, runnerID, runID, nodeID, workspace, command string, gateSink runtime.EventSink, gateKey ...string) (string, error) {
 	task := domain.RunnerTask{
 		ID:          fmt.Sprintf("rt-%d-gate", time.Now().UnixNano()),
 		RunnerID:    runnerID,
@@ -634,22 +667,38 @@ func (e *Engine) dispatchRunnerCommand(ctx context.Context, runnerID, runID, nod
 		RunID:       runID,
 		NodeID:      nodeID,
 	}
-	if run, ok := e.repo.RunState(runID); ok {
-		var err error
-		task.Sandbox, err = e.runnerSandboxSpec(run)
+	operation := "gate"
+	if len(gateKey) > 0 {
+		operation += ":" + gateKey[0]
+	}
+	reused, err := nextWorkflowRunnerTask(ctx, &task, operation)
+	if err != nil {
+		return "", err
+	}
+	if !reused {
+
+		if run, ok := e.repo.RunState(runID); ok {
+			var err error
+			task.Sandbox, err = e.runnerSandboxSpec(run)
+			if err != nil {
+				return "", err
+			}
+			task.Invocation = e.gateCommandInvocation(run, nodeID)
+		}
+		stored, inserted, err := e.enqueueWorkflowRunnerTask(ctx, task)
 		if err != nil {
 			return "", err
 		}
-		task.Invocation = e.gateCommandInvocation(run, nodeID)
+		task = stored
+		if inserted {
+			e.notifyRunnerDispatch("terminal")
+			if gateSink != nil {
+				gateSink(domain.TelemetryEvent{Category: "process", Name: "process.started", Phase: "start", Message: "门禁命令下发到执行器：" + command})
+			}
+		}
 	}
-	if err := e.repo.PutRunnerTask(task); err != nil {
-		return "", err
-	}
-	e.notifyRunnerDispatch("terminal")
-	if gateSink != nil {
-		gateSink(domain.TelemetryEvent{Category: "process", Name: "process.started", Phase: "start", Message: "门禁命令下发到执行器：" + command})
-	}
-	final, err := e.awaitRunnerTask(ctx, task.ID, gateSink)
+
+	final, err := e.awaitWorkflowRunnerTask(ctx, task.ID, gateSink)
 	if err != nil {
 		return "", err
 	}
@@ -660,7 +709,7 @@ func (e *Engine) dispatchRunnerCommand(ctx context.Context, runnerID, runID, nod
 		}
 		return final.Result, nil
 	case domain.RunnerTaskCanceled:
-		return "", errors.New("runner task canceled")
+		return "", runnerTaskCanceledError(final, "runner task canceled")
 	default:
 		msg := strings.TrimSpace(final.Error)
 		if msg == "" {
@@ -671,6 +720,13 @@ func (e *Engine) dispatchRunnerCommand(ctx context.Context, runnerID, runID, nod
 		}
 		return final.Result, errors.New(msg)
 	}
+}
+
+func runnerTaskCanceledError(task domain.RunnerTask, fallback string) error {
+	if detail := clipHumanGateDetail(task.Error); detail != "" {
+		return fmt.Errorf("%s: %s", fallback, detail)
+	}
+	return errors.New(fallback)
 }
 
 // gateCommandInvocation is the payload a verification command needs on the
@@ -746,6 +802,11 @@ func (e *Engine) awaitRunnerTask(ctx context.Context, taskID string, sink runtim
 			})
 		}
 	}
+	changed, unsubscribe := e.subscribeRunnerTask(taskID)
+	defer unsubscribe()
+	// API and worker processes can share the queue without sharing notifications.
+	poll := time.NewTicker(time.Second)
+	defer poll.Stop()
 	for {
 		current, ok := e.repo.RunnerTask(taskID)
 		if !ok {
@@ -758,38 +819,39 @@ func (e *Engine) awaitRunnerTask(ctx context.Context, taskID string, sink runtim
 			e.flushAllObservations()
 			return current, nil
 		}
-		changed, unsubscribe := e.subscribeRunnerTask(taskID)
-		// Re-read after subscribing to close the check/subscribe race.
-		current, ok = e.repo.RunnerTask(taskID)
-		if !ok {
-			unsubscribe()
-			return domain.RunnerTask{}, fmt.Errorf("runner task %s disappeared", taskID)
+		if current.Status == domain.RunnerTaskQueued && current.RunnerID != "" && ctx.Err() == nil {
+			// Leave the task claimable when a transient database error prevents reconciliation.
+			if failed, err := e.repo.FailQueuedRunnerTaskIfUnavailable(taskID, current.RunnerID, time.Now().UTC()); err == nil && failed {
+				e.NotifyRunnerTaskChanged(taskID)
+				continue
+			}
 		}
-		lastEventSeq = bridgeRunnerEventsToSink(current, e.repo.RunnerTaskEventsAfter(taskID, lastEventSeq), lastEventSeq, sink)
-		reportStatus(current)
-		switch current.Status {
-		case domain.RunnerTaskSuccess, domain.RunnerTaskFailed, domain.RunnerTaskCanceled:
-			unsubscribe()
-			e.flushAllObservations()
-			return current, nil
-		}
-		// Runner events and completion are written through the API process in
-		// production, while this await loop belongs to the worker process. Poll
-		// the shared durable queue frequently enough to preserve live telemetry;
-		// the in-process subscription still provides an immediate fast path.
-		fallback := time.NewTimer(time.Second)
 		select {
 		case <-ctx.Done():
-			fallback.Stop()
-			unsubscribe()
-			_ = e.repo.CancelRunnerTask(taskID, time.Now().UTC())
+			if e.shouldCancelDetachedRunnerTask(ctx) {
+				_ = e.repo.CancelRunnerTask(taskID, time.Now().UTC())
+			}
 			return domain.RunnerTask{}, ctx.Err()
 		case <-changed:
-		case <-fallback.C:
+		case <-poll.C:
 		}
-		fallback.Stop()
-		unsubscribe()
 	}
+}
+
+func (e *Engine) awaitWorkflowRunnerTask(ctx context.Context, taskID string, sink runtime.EventSink) (domain.RunnerTask, error) {
+	task, err := e.awaitRunnerTask(ctx, taskID, sink)
+	if err != nil || task.RunnerID == "" || task.Attempt != 0 ||
+		task.ExitCode != nil || task.CompletedAt == nil || task.Error == "" {
+		return task, err
+	}
+	// Only queue reconciliation and runner removal record an error before the first claim.
+	switch task.Status {
+	case domain.RunnerTaskFailed:
+		return task, runnerUnavailableBeforeClaimError(task.Error)
+	case domain.RunnerTaskCanceled:
+		return task, runnerUnavailableBeforeClaimError(task.Error + ". To continue, reconnect that runner and retry")
+	}
+	return task, nil
 }
 
 // bridgeRunnerEventsToSink normalizes durable runner events in the process
@@ -828,6 +890,11 @@ func bridgeRunnerEventsToSink(task domain.RunnerTask, events []domain.RunnerTask
 			if observation.Provider == "" {
 				observation.Provider = task.Provider
 			}
+			// Accounting events keep individual IDs even when streaming fragments are coalesced.
+			if strings.TrimSpace(observation.ID) == "" && (observation.Usage != nil ||
+				observation.Category == "tool" && observation.Name == "tool.call" && observation.Phase == "finish") {
+				observation.ID = fmt.Sprintf("runner-event:%s:%d", task.ID, event.Seq)
+			}
 			sink(observation)
 			continue
 		}
@@ -864,16 +931,47 @@ func bridgeRunnerEventsToSink(task domain.RunnerTask, events []domain.RunnerTask
 	return after
 }
 
-// requireRunnerProvider validates that the bound runner is online and has the
-// executor's CLI enabled, so a misbound role fails fast with a clear message
-// instead of queueing a task nobody can claim.
-func (e *Engine) requireRunnerProvider(runnerID, provider string) error {
-	runner, ok := e.repo.Runner(strings.TrimSpace(runnerID))
-	if !ok {
-		return fmt.Errorf("执行器 %s 不存在：请到「个人 → 执行器」页面重新绑定", runnerID)
+type runnerUnavailableBeforeClaimError string
+
+func (e runnerUnavailableBeforeClaimError) Error() string { return string(e) }
+
+func isRunnerUnavailableBeforeClaim(err error) bool {
+	var unavailable runnerUnavailableBeforeClaimError
+	return errors.As(err, &unavailable)
+}
+
+func runnerIsAvailable(runner domain.Runner) bool {
+	return runner.Status == domain.RunnerStatusOnline &&
+		(runner.LastSeenAt == nil || !runner.LastSeenAt.Before(time.Now().UTC().Add(-repo.RunnerOfflineThreshold)))
+}
+
+func (e *Engine) readRunnerBeforeClaim(runnerID string) (domain.Runner, error) {
+	runner, err := e.repo.ReadRunner(strings.TrimSpace(runnerID))
+	if errors.Is(err, repo.ErrRunnerNotFound) {
+		return runner, runnerUnavailableBeforeClaimError(fmt.Sprintf("runner %q is missing before claim. To continue, reconnect that runner and retry", runnerID))
 	}
-	if runner.Status != domain.RunnerStatusOnline {
-		return fmt.Errorf("执行器 %s（%s）当前离线，无法路由 %s 任务", runnerID, runner.Name, provider)
+	if err != nil {
+		return runner, fmt.Errorf("read runner %q before claim: %w", runnerID, err)
+	}
+	return runner, nil
+}
+
+func (e *Engine) requireAvailableRunner(runnerID string) (domain.Runner, error) {
+	runner, err := e.readRunnerBeforeClaim(runnerID)
+	if err != nil {
+		return runner, err
+	}
+	if !runnerIsAvailable(runner) {
+		return runner, runnerUnavailableBeforeClaimError(fmt.Sprintf("runner %q is offline or its heartbeat has expired before claim. To continue, reconnect that runner and retry", runnerID))
+	}
+	return runner, nil
+}
+
+// requireRunnerProvider keeps a task off the queue when the bound CLI cannot claim it.
+func (e *Engine) requireRunnerProvider(runnerID, provider string) error {
+	runner, err := e.requireAvailableRunner(runnerID)
+	if err != nil {
+		return err
 	}
 	if !runner.SupportsProvider(provider) {
 		return fmt.Errorf("执行器 %s（%s）未启用 %s CLI：请在执行器页面开启或改用云端 API Key 模式", runnerID, runner.Name, provider)

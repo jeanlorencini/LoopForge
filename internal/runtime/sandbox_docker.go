@@ -30,6 +30,8 @@ type dockerSandbox struct {
 	mu                  sync.Mutex
 	browserMu           sync.Mutex
 	started             bool
+	retainedContainerID string
+	parked              bool
 	cliSetupOnce        sync.Once
 	cliSetupGate        chan struct{}
 	// execGate lets parallel branches exec concurrently (read side) while a
@@ -42,6 +44,57 @@ func (s *dockerSandbox) ID() string        { return s.id }
 func (s *dockerSandbox) Workspace() string { return s.workspace }
 func (s *dockerSandbox) Driver() string    { return "docker" }
 
+// Park stops an idle shared sandbox while retaining its writable layer.
+func (s *dockerSandbox) Park(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.parked || (!s.started && s.retainedContainerID == "") {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, dockerTeardownTimeout)
+	defer cancel()
+	id, err := s.containerForResume(ctx)
+	if err != nil {
+		return err
+	}
+	s.retainedContainerID = id
+	if err := removeDockerContainer(ctx, dockerBrowserContainerName(s.name)); err != nil {
+		return err
+	}
+	s.started = false
+	if out, err := exec.CommandContext(ctx, "docker", "stop", id).CombinedOutput(); err != nil {
+		return fmt.Errorf("stop idle Docker sandbox %s: %w: %s", s.name, err, strings.TrimSpace(string(out)))
+	}
+	s.parked = true
+	return nil
+}
+
+func (s *dockerSandbox) containerForResume(ctx context.Context) (string, error) {
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "--type", "container", "--format", "{{.Id}}", s.name).CombinedOutput()
+	if dockerObjectGone(string(out), err) {
+		return "", fmt.Errorf("retained Docker sandbox %s is missing. Restore its environment from the approved source before retrying", s.name)
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect retained Docker sandbox %s: %w: %s", s.name, err, strings.TrimSpace(string(out)))
+	}
+	id := strings.TrimSpace(string(out))
+	if id == "" || (s.retainedContainerID != "" && id != s.retainedContainerID) {
+		return "", fmt.Errorf("retained Docker sandbox %s changed container identity. Restore its environment from the approved source before retrying", s.name)
+	}
+	mounts, err := inspectDockerWorkspaceMounts(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if mounts == nil || !s.matchesWorkspace(ctx, id, mounts.source) {
+		return "", fmt.Errorf("retained Docker sandbox %s does not match the run workspace. Restore its original workspace before retrying", s.name)
+	}
+	return id, nil
+}
+
+func (s *dockerSandbox) matchesWorkspace(ctx context.Context, container, source string) bool {
+	return dockerBindMatchesWorkspace(source, s.workspace) || dockerBindMatchesWorkspace(dockerRecordedWorkspace(ctx, container), s.workspace)
+}
+
 // Close tears the sandbox down by name rather than by the in-memory started
 // flag. A worker that restarted inherits a live container but a fresh struct
 // with started=false and no builtImage, so trusting those fields leaks the
@@ -50,13 +103,19 @@ func (s *dockerSandbox) Driver() string    { return "docker" }
 func (s *dockerSandbox) Close(ctx context.Context) error {
 	s.mu.Lock()
 	s.started = false
+	s.parked = false
+	target := s.retainedContainerID
+	s.retainedContainerID = ""
 	image := s.builtImage
 	s.builtImage = ""
 	s.mu.Unlock()
 	if image == "" {
 		image = tempDockerImageName(s.id)
 	}
-	removeDockerSandbox(ctx, s.name, image)
+	if target == "" {
+		target = s.name
+	}
+	removeDockerSandboxTarget(ctx, s.name, target, image)
 	return nil
 }
 
@@ -64,6 +123,10 @@ func (s *dockerSandbox) Close(ctx context.Context) error {
 // (agentflow-tmp-*) are removed with it; content-hashed cache images stay so
 // the next SOP with the same Dockerfile does not rebuild from node:22.
 func removeDockerSandbox(ctx context.Context, container, image string) {
+	removeDockerSandboxTarget(ctx, container, container, image)
+}
+
+func removeDockerSandboxTarget(ctx context.Context, container, target, image string) {
 	if !dockerAvailable() {
 		return
 	}
@@ -73,7 +136,7 @@ func removeDockerSandbox(ctx context.Context, container, image string) {
 	ctx, cancel := context.WithTimeout(ctx, dockerTeardownTimeout)
 	defer cancel()
 	if strings.TrimSpace(container) != "" {
-		_ = removeDockerWorkspaceContainers(ctx, container)
+		_ = removeDockerWorkspaceContainers(ctx, container, target)
 	}
 	if ephemeralDockerImage(image) {
 		_ = exec.CommandContext(ctx, "docker", "rmi", "-f", image).Run()
@@ -85,13 +148,13 @@ const (
 	legacyDockerScriptSuffix = "-scripts"
 )
 
-func removeDockerWorkspaceContainers(ctx context.Context, container string) error {
+func removeDockerWorkspaceContainers(ctx context.Context, container, target string) error {
 	// Older runs can still own a script companion. Reclaim it with the workspace.
 	if err := removeDockerContainer(ctx, container+legacyDockerScriptSuffix); err != nil {
 		return err
 	}
 	removeDockerBrowser(ctx, container)
-	return removeDockerContainer(ctx, container)
+	return removeDockerContainer(ctx, target)
 }
 
 func removeDockerContainer(ctx context.Context, name string) error {
@@ -146,7 +209,7 @@ func (s *dockerSandbox) Exec(ctx context.Context, command CommandSpec, sink Even
 		recErr := s.Recreate(ctx)
 		s.execGate.Unlock()
 		if recErr != nil {
-			return out, fmt.Errorf("current working directory is outside of container mount namespace: %w", err)
+			return out, fmt.Errorf("current working directory is outside of container mount namespace: %w (recovery: %w)", err, recErr)
 		}
 		s.execGate.RLock()
 		out, err = s.execOnce(ctx, command, sink)
@@ -165,6 +228,38 @@ func (s *dockerSandbox) Exec(ctx context.Context, command CommandSpec, sink Even
 		}
 	}
 	return out, err
+}
+
+type dockerExecCleanupError struct {
+	error
+	commandErr error
+	exitCode   *int
+}
+
+const dockerExecCleanupMessage = "停止 CLI 子进程失败"
+
+func (e *dockerExecCleanupError) Unwrap() error { return e.error }
+
+// SandboxExitBeforeCleanupFailure separates the command's exit from a failed cleanup.
+// A nil exit code means the command's exit status was not available.
+func SandboxExitBeforeCleanupFailure(err error) (*int, bool) {
+	var cleanup *dockerExecCleanupError
+	if errors.As(err, &cleanup) {
+		return cleanup.exitCode, true
+	}
+	return nil, false
+}
+
+func dockerCommandExitCode(state *os.ProcessState, out string, err error) *int {
+	if state == nil || state.ExitCode() < 0 {
+		return nil
+	}
+	var processErr *exec.ExitError
+	if err != nil && (!errors.As(err, &processErr) || isDockerCwdUnsafe(out, err) || IsSandboxInterrupt(annotateDockerExecError(out, err))) {
+		return nil
+	}
+	code := state.ExitCode()
+	return &code
 }
 
 func (s *dockerSandbox) execOnce(ctx context.Context, command CommandSpec, sink EventSink) (out string, err error) {
@@ -192,6 +287,7 @@ func (s *dockerSandbox) execOnce(ctx context.Context, command CommandSpec, sink 
 			`cd "$1" && shift && exec "$@"`, "conversation", command.WorkingDir}, dropShellLoginFlag(command.Argv)...)
 	}
 	processFile := ""
+	var cmd *exec.Cmd
 	if command.OwnProcessGroup || goruntime.GOOS == "windows" {
 		processFile = path.Join(filepath.ToSlash(conversationExecutionRoot(s.requirements.ConversationRoot, true)), "home", "tmp", fmt.Sprintf("process-%d.pid", time.Now().UnixNano()))
 		if goruntime.GOOS == "windows" {
@@ -226,12 +322,16 @@ func (s *dockerSandbox) execOnce(ctx context.Context, command CommandSpec, sink 
 				stopErr = exec.CommandContext(stopCtx, "docker", stopArgs...).Run()
 			}
 			if stopErr != nil {
-				err = errors.Join(err, fmt.Errorf("停止 CLI 子进程失败: %w", stopErr))
+				err = &dockerExecCleanupError{
+					error:      errors.Join(err, fmt.Errorf("%s: %w", dockerExecCleanupMessage, stopErr)),
+					commandErr: err,
+					exitCode:   dockerCommandExitCode(cmd.ProcessState, out, err),
+				}
 			}
 		}()
 	}
 	args = append(args, argv...)
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd = exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdin = command.Stdin
 	out, err = runCommand(cmd, sink, command)
 	if goruntime.GOOS == "windows" && err != nil && strings.Contains(out, dockerWindowsPythonRequired) {
@@ -454,10 +554,17 @@ func dockerInterruptExcerpt(out string) string {
 const dockerInterruptTailLines = 5
 
 func isDockerCwdUnsafe(out string, err error) bool {
+	// A failed stop must not replay the command or replace its container.
+	var cleanup *dockerExecCleanupError
+	if errors.As(err, &cleanup) {
+		err = cleanup.commandErr
+	}
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(out + "\n" + err.Error())
+	// Persisted node errors retain the diagnostic text without the error type.
+	commandError, _, _ := strings.Cut(err.Error(), dockerExecCleanupMessage+": ")
+	msg := strings.ToLower(out + "\n" + commandError)
 	return strings.Contains(msg, "outside of container mount") || strings.Contains(msg, "container breakout") || strings.Contains(msg, "oci runtime exec failed") || strings.Contains(msg, "exit status 126")
 }
 
@@ -773,6 +880,12 @@ func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
 	if s.started && !recreate {
 		return nil
 	}
+	if s.retainedContainerID != "" {
+		if recreate {
+			return fmt.Errorf("Docker sandbox %s retains run data. Recover its workspace before replacing the container", s.name)
+		}
+		return s.resume(ctx)
+	}
 	s.started = false
 	name, workspace, p := s.name, s.workspace, s.profile
 	mounts, err := inspectDockerWorkspaceMounts(ctx, name)
@@ -780,7 +893,7 @@ func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
 		return err
 	}
 	if mounts != nil {
-		if !dockerBindMatchesWorkspace(mounts.source, workspace) && !dockerBindMatchesWorkspace(dockerRecordedWorkspace(ctx, name), workspace) {
+		if !s.matchesWorkspace(ctx, name, mounts.source) {
 			return fmt.Errorf("docker sandbox %s is bound to %s, not %s", name, mounts.source, workspace)
 		}
 		if !recreate && !mounts.legacyMasks {
@@ -856,7 +969,7 @@ func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
 	// Resolve the replacement image and mounts before retiring a workspace with
 	// legacy masks. Its new container ID invalidates old preparation receipts.
 	if mounts != nil || recreate {
-		if err := removeDockerWorkspaceContainers(ctx, name); err != nil {
+		if err := removeDockerWorkspaceContainers(ctx, name, name); err != nil {
 			return err
 		}
 	}
@@ -876,6 +989,22 @@ func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
 		_ = exec.Command("docker", "rm", "-f", name).Run()
 		s.started = false
 		return err
+	}
+	s.started = true
+	return nil
+}
+
+func (s *dockerSandbox) resume(ctx context.Context) error {
+	id, err := s.containerForResume(ctx)
+	if err != nil {
+		return err
+	}
+	s.parked = false
+	if out, err := exec.CommandContext(ctx, "docker", "start", id).CombinedOutput(); err != nil {
+		return fmt.Errorf("resume Docker sandbox %s: %w: %s", s.name, err, strings.TrimSpace(string(out)))
+	}
+	if err := waitDockerWorkspaceReady(ctx, id); err != nil {
+		return fmt.Errorf("resume Docker sandbox %s: %w", s.name, err)
 	}
 	s.started = true
 	return nil

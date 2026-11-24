@@ -2,6 +2,7 @@
 """Add the runtime preflight to an exported acceptance-test SOP."""
 
 import argparse
+from hashlib import sha256
 import json
 from pathlib import Path
 
@@ -37,6 +38,8 @@ FRESH_FILES = 'FRESH_FILES = ("testes.md", "verify.sh", "verify-reservado.sh")'
 FRESH_FILES_WITH_MANIFEST = FRESH_FILES[:-1] + f', "{MANIFEST}")'
 SUCCESS = 'print("I2: entregáveis validados.")'
 IMPORTS = "import ast\nimport os\nimport platform\nimport shutil\n"
+BASE_VALIDATOR = "b603dc8eda2c753216e1bf17749b85f30f2f79b608b2694ad40351df49d7b2f6"
+PREFLIGHT_VALIDATOR = "2030cd2368144e7329a1f1d376b14b248cf1cab5918ed1f112be59f90b612741"
 PREFLIGHT = r'''manifest_path = Path("tests/ambiente.json")
 try:
     requirements = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
@@ -76,16 +79,16 @@ def apply_preflight(workflow):
     tests = nodes["tests"]
     validation = nodes["validate-tests"]
     prompt, outputs, script = tests["taskPrompt"], tests["artifactOutputs"], validation["script"]
-    if TEST_PROMPT in prompt and MANIFEST_OUTPUT in outputs and all(
-        text in script for text in (IMPORTS, FRESH_FILES_WITH_MANIFEST, PREFLIGHT)
-    ):
+    if tests.get("type") != "agent" or validation.get("type") != "script" or validation.get("scriptLanguage") != "python":
+        raise ValueError("Expected the Python I2 acceptance-test validator.")
+    digest = sha256(script.encode("utf-8")).hexdigest()
+    matching = [output for output in outputs if
+                output.get("path") == MANIFEST or output.get("name") == MANIFEST_OUTPUT["name"]]
+    if digest == PREFLIGHT_VALIDATOR and prompt.endswith(TEST_PROMPT) and matching == [MANIFEST_OUTPUT]:
         return
-    if MANIFEST in prompt or MANIFEST in script or any(
-        output.get("path") == MANIFEST or output.get("name") == MANIFEST_OUTPUT["name"]
-        for output in outputs
-    ):
+    if MANIFEST in prompt or matching or MANIFEST in script:
         raise ValueError("The workflow already has a different runtime preflight.")
-    if any(script.count(marker) != 1 for marker in ("import ast\n", FRESH_FILES, SUCCESS)):
+    if digest != BASE_VALIDATOR:
         raise ValueError("Expected the Python I2 acceptance-test validator.")
 
     tests["taskPrompt"] = prompt + TEST_PROMPT

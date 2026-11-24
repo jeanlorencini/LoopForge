@@ -147,6 +147,7 @@ type NodeRun struct {
 	NodeID          string      `json:"nodeId"`
 	Status          string      `json:"status"`
 	Attempt         int         `json:"attempt"`
+	RunnerAttemptID string      `json:"runnerAttemptId,omitempty"`
 	ReworkCount     int         `json:"reworkCount"`
 	SandboxID       string      `json:"sandboxId,omitempty"`
 	Output          string      `json:"output,omitempty"`

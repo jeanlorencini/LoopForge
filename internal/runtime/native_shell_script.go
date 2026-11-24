@@ -14,6 +14,10 @@ import (
 // the original shell flags, positional arguments, stdin, cwd and environment.
 // It must only be used for host processes, never paths inside a container.
 func PrepareHostShellCommand(command CommandSpec) (CommandSpec, func(), error) {
+	return prepareHostShellCommand(command, nil)
+}
+
+func prepareHostShellCommand(command CommandSpec, defaults map[string]string) (CommandSpec, func(), error) {
 	cleanup := func() {}
 	if goruntime.GOOS != "windows" || len(command.Argv) < 3 {
 		return command, cleanup, nil
@@ -31,7 +35,24 @@ func PrepareHostShellCommand(command CommandSpec) (CommandSpec, func(), error) {
 		command.Argv[0] = binary
 	}
 	flags := command.Argv[1]
-	if flags != "-c" && flags != "-lc" && flags != "-cl" || len(command.Argv[2]) < 6000 {
+	if flags != "-c" && flags != "-lc" && flags != "-cl" {
+		return command, cleanup, nil
+	}
+	var prelude string
+	if binary, ok := windowsGitShellExecutable(command.Argv[0]); ok {
+		command.Argv[0] = binary
+		// Git's login profile puts Unix tools ahead of the native PATH.
+		prelude = "export PATH=\"$PATH:/usr/bin:/bin:/cmd\"\n"
+		if flags != "-c" {
+			if !hasWindowsShellTERM(defaults, command.environment) {
+				// Without TERM, Git can enable winpty aliases for a process with no terminal.
+				command = WithCommandEnvironment(command, map[string]string{"TERM": "dumb"})
+			}
+			prelude = "export PATH=\"${ORIGINAL_PATH:+$ORIGINAL_PATH:}$PATH:/cmd\"\n"
+		}
+	}
+	if len(prelude)+len(command.Argv[2]) < 6000 {
+		command.Argv[2] = prelude + command.Argv[2]
 		return command, cleanup, nil
 	}
 	directory, err := os.MkdirTemp("", "agentflow-shell-")
@@ -47,8 +68,40 @@ func PrepareHostShellCommand(command CommandSpec) (CommandSpec, func(), error) {
 		cleanup()
 		return command, func() {}, fmt.Errorf("write native shell script: %w", err)
 	}
-	command.Argv[2] = ". " + shellSingleQuote(filepath.ToSlash(file))
+	command.Argv[2] = prelude + ". " + shellSingleQuote(filepath.ToSlash(file))
 	return command, cleanup, nil
+}
+
+func hasWindowsShellTERM(overlays ...map[string]string) bool {
+	if _, present := os.LookupEnv("TERM"); present {
+		return true
+	}
+	for _, overlay := range overlays {
+		for key := range overlay {
+			if strings.EqualFold(key, "TERM") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// The Git launcher in bin prepends Unix tools even for non-login shells.
+func windowsGitShellExecutable(binary string) (string, bool) {
+	dir := filepath.Dir(binary)
+	if !strings.EqualFold(filepath.Base(dir), "bin") {
+		return binary, false
+	}
+	root := filepath.Dir(dir)
+	if !strings.EqualFold(filepath.Base(root), "usr") {
+		dir = filepath.Join(root, "usr", "bin")
+	}
+	for _, name := range []string{filepath.Base(binary), "cygpath.exe"} {
+		if info, err := os.Stat(filepath.Join(dir, name)); err != nil || !info.Mode().IsRegular() {
+			return binary, false
+		}
+	}
+	return filepath.Join(dir, filepath.Base(binary)), true
 }
 
 // findWindowsHostShell prefers Git for Windows and never launches a WSL alias.

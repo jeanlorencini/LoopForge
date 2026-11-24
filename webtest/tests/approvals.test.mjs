@@ -2,6 +2,108 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadApp, settle } from '../lib/load-app.mjs';
 
+function approvalFixture(id) {
+  return {
+    id, status: 'waiting', workflowId: 'fixture-flow', projectId: 'project-1',
+    createdAt: '2026-10-20T10:00:00Z', executionContext: { responsibleUserId: 7, projectId: 'project-1' },
+    workflowSnapshot: { id: 'fixture-flow', name: id, nodes: [
+      { id: 'build', name: 'Build', type: 'script' }, { id: 'gate', name: 'Gate', type: 'approval', rejectTo: 'build' },
+    ] },
+    nodes: { gate: { status: 'waiting_approval', attempt: 2, reworkCount: 1 } },
+  };
+}
+
+test('approval submits the displayed attempt and refreshes after a conflict', async (t) => {
+  const app = await loadApp();
+  t.after(app.close);
+  let current = approvalFixture('stale-card');
+  app.router.get('/api/runs', () => [current]);
+  app.router.get('/api/runs/stale-card', () => current);
+  app.router.post('/api/runs/stale-card/approve', ({ body }) => {
+    if (body.expected?.attempt === 2) return { status: 409, body: { code: 'run_decision_stale', error: 'conflict' } };
+    current = { ...current, status: 'running' };
+    return { ok: true };
+  });
+  app.evaluate(`state.currentUser={id:7,loginName:'reviewer'}`);
+  await app.evaluate('renderApprovals()');
+  const button = app.document.querySelector('#approvalList [data-approve]');
+  assert.ok(button);
+  current = { ...current, nodes: { gate: { ...current.nodes.gate, attempt: 3, reworkCount: 2 } } };
+  app.evaluate(`state.data.runs=[${JSON.stringify(current)}]`);
+  button.click();
+  await settle(6);
+  const call = app.router.calls.find(c => c.path === '/api/runs/stale-card/approve');
+  assert.deepEqual(call.body.expected, { status: 'waiting_approval', attempt: 2, reworkCount: 1 });
+  assert.equal(current.status, 'waiting');
+  assert.match(app.document.querySelector('.toast-err')?.textContent || '', /节点状态已变化|latest attempt/i);
+  assert.ok(app.router.calls.some(c => c.path === '/api/runs/stale-card' && c.method === 'GET'));
+});
+
+test('batch approve and reject freeze the selected attempts before prompting', async (t) => {
+  for (const action of ['approve', 'reject']) {
+    await t.test(action, async (subtest) => {
+      const app = await loadApp();
+      subtest.after(app.close);
+      const runs = [approvalFixture('batch-one'), approvalFixture('batch-two')];
+      app.router.get('/api/runs', runs);
+      app.evaluate(`
+        state.currentUser={id:7,loginName:'reviewer'};
+        window.afConfirm=window.afPrompt=()=>new Promise(resolve=>{window.finishPrompt=resolve});
+      `);
+      await app.evaluate('renderApprovals()');
+      const selectAll = app.document.querySelector('[data-ap-select-all]');
+      assert.ok(selectAll);
+      selectAll.click();
+      const button = app.document.querySelector(`[data-ap-batch-${action}]`);
+      assert.equal(button.disabled, false);
+      button.click();
+      app.evaluate(`state.approvalItems[0].nodes.gate.attempt=3; window.finishPrompt('accept')`);
+      await settle(6);
+      const calls = app.router.calls.filter(c => c.method === 'POST' && c.path.endsWith(`/${action}`));
+      assert.equal(calls.length, 2);
+      for (const call of calls) {
+        assert.deepEqual(call.body.expected, { status: 'waiting_approval', attempt: 2, reworkCount: 1 });
+        if (action === 'reject') assert.equal(call.body.targetId, 'build');
+      }
+    });
+  }
+});
+
+test('cancelling or declining retry refreshes the cached approval card', async (t) => {
+  const app = await loadApp();
+  t.after(app.close);
+  const waiting = {
+    id: 'approval-wait', status: 'waiting', workflowId: 'flow-wait',
+    createdAt: '2026-10-20T10:00:00Z',
+    executionContext: { responsibleUserId: 7, projectId: 'project-1' },
+    workflowSnapshot: { id: 'flow-wait', name: 'Pending run', nodes: [{ id: 'step', type: 'agent' }] },
+    nodes: { step: { status: 'waiting_approval', error: '对话轮次用尽' } },
+  };
+  let current = waiting;
+  app.router.get('/api/runs', () => [current]);
+  app.router.get('/api/tasks', []);
+  app.router.get('/api/issues', []);
+  app.router.get('/api/runs/approval-wait', () => current);
+  app.router.post('/api/runs/approval-wait/cancel', () => {
+    current = { ...waiting, status: 'cancelled' };
+    return { ok: true };
+  });
+  app.router.post('/api/runs/approval-wait/decline-retry', () => {
+    current = { ...waiting, status: 'failed' };
+    return { ok: true };
+  });
+  app.evaluate('window.afConfirm=async()=>true');
+  for (const selector of ['[data-cancel-run]', '[data-decline-retry]']) {
+    current = waiting;
+    await app.evaluate('renderApprovals()');
+    const button = app.document.querySelector(`#approvalList ${selector}`);
+    assert.ok(button, selector);
+    button.click();
+    await settle(6);
+    assert.equal(app.document.querySelector('#approvalList .ap-card'), null, selector);
+  }
+});
+
 test('approval helpers explain gates, failures, pauses, and contextual payloads', async (t) => {
   const app = await loadApp();
   t.after(app.close);
@@ -105,4 +207,40 @@ test('approval list sends context and removes the approved run after refreshing'
   app.document.querySelector('#confirmOkBtn').click();
   await app.evaluate(`window.__pauseRun`);
   assert.ok(app.router.calls.some(c => c.method === 'POST' && c.path === '/api/runs/approval-run/pause'));
+});
+
+test('manual script pass submits the displayed failed attempt and refreshes on conflict', async (t) => {
+  const app = await loadApp();
+  t.after(app.close);
+  const run = {
+    ...approvalFixture('stale-script'),
+    status: 'failed',
+    nodes: { build: { status: 'failed', attempt: 2, reworkCount: 1, error: 'exit 1' } },
+  };
+  const current = { ...run, nodes: { build: { ...run.nodes.build, attempt: 3, reworkCount: 2 } } };
+  app.router.get('/api/runs', [current]);
+  app.router.get('/api/runs/stale-script', current);
+  app.router.post('/api/runs/stale-script/pass', ({ body }) =>
+    body.expected?.attempt === 2
+      ? { status: 409, body: { code: 'run_decision_stale', error: 'conflict' } }
+      : { ok: true });
+  app.evaluate(`
+    const scriptRun = ${JSON.stringify(run)};
+    const host = document.createElement('div');
+    host.innerHTML = failedNodeRecoveryCalloutHTML(scriptRun.id, scriptRun.workflowSnapshot.nodes[0], scriptRun.nodes.build);
+    document.body.append(host);
+    const drawer = document.createElement('div');
+    drawer.id = 'script-issue-actions';
+    drawer.innerHTML = issueProgressActionsHTML({id:'script-issue'}, scriptRun);
+    document.body.append(drawer);
+    state.data.runs = [${JSON.stringify(current)}];
+    window.afConfirm = async () => true;
+  `);
+  const drawerButton = app.document.querySelector('#script-issue-actions [data-pass-node]');
+  assert.deepEqual(JSON.parse(drawerButton.dataset.decisionExpectation), { status: 'failed', attempt: 2, reworkCount: 1 });
+  await app.evaluate(`passFailedNode('stale-script', 'build', document.querySelector('[data-pass-node]'))`);
+  const call = app.router.calls.find(c => c.path === '/api/runs/stale-script/pass');
+  assert.deepEqual(call?.body.expected, { status: 'failed', attempt: 2, reworkCount: 1 });
+  assert.match(app.document.querySelector('.toast-err')?.textContent || '', /节点状态已变化|latest attempt/i);
+  assert.ok(app.router.calls.some(c => c.path === '/api/runs/stale-script' && c.method === 'GET'));
 });

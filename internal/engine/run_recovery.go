@@ -118,36 +118,21 @@ func (e *Engine) ResumeInterruptedRuns() []string {
 	for _, id := range promoted {
 		e.publish(id)
 	}
-	for _, listed := range e.repo.Runs() {
-		if listed.IsWorkspace() || listed.HistoricalGroup() {
+	ids, err := e.repo.RunRecoveryCandidateIDs(BaselineAlignWorkflowID)
+	if err != nil {
+		log.Printf("list run recovery candidates: %v", err)
+		return resumed
+	}
+	for _, id := range ids {
+		r, ok := e.repo.RunState(id)
+		if !ok || r.IsWorkspace() || r.HistoricalGroup() {
 			continue
 		}
 		// Approval and operator-paused Runs normally have no scheduler. A cancel
 		// request that raced with the last worker write must therefore be claimed
 		// and settled by the recovery loop instead of waiting forever.
-		if listed.Status == "waiting" && !listed.CancelRequested && alignRunWaitingApproval(listed) {
-			r, ok := e.repo.RunState(listed.ID)
-			if !ok || r.Status != "waiting" || r.CancelRequested || !alignRunWaitingApproval(r) {
-				continue
-			}
-			if r.OwnerInstanceID != "" && r.LeaseUntil.After(time.Now().UTC()) {
-				continue
-			}
-			if _, err := e.acquireLease(r); err != nil {
-				continue
-			}
-			e.updateRun(r.ID, func(current *domain.Run) {
-				if autoSucceedAlignApprovals(current, time.Now().UTC()) {
-					e.event(current, "", "gate.auto_approved", "基线对齐无需人工确认，已自动通过")
-				}
-			})
-			e.resume(r.ID)
-			resumed = append(resumed, r.ID)
-			continue
-		}
-		if listed.Status == "waiting" && listed.CancelRequested {
-			r, ok := e.repo.RunState(listed.ID)
-			if !ok || r.Status != "waiting" || !r.CancelRequested {
+		if r.Status == "waiting" {
+			if !r.CancelRequested && !alignRunWaitingApproval(r) {
 				continue
 			}
 			if r.OwnerInstanceID != "" && r.LeaseUntil.After(time.Now().UTC()) {
@@ -157,30 +142,48 @@ func (e *Engine) ResumeInterruptedRuns() []string {
 			if err != nil {
 				continue
 			}
-			_ = e.cancelRunnerTasksForRun(r.ID)
-			e.settleOrphan(r.ID, "运行已被手动终止")
-			_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
-			continue
-		}
-		if listed.Status == "running" {
-			fresh, ok := e.repo.RunState(listed.ID)
-			if !ok || fresh.Status != "running" {
+			if acquired.CancelRequested {
+				e.finishAt(r.ID, acquired.Generation, "cancelled", "运行已被手动终止")
+				_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
 				continue
 			}
-			status, msg, done := settleStatusForCompletedGraph(workflowForRun(e.repo, fresh), fresh)
-			// A scheduled run still has to push into the integration branch after
-			// the last node succeeds. Settling here deletes that checkout mid-push.
-			if done && !(status == "succeeded" && scheduledIntegratePending(fresh)) {
-				e.finishAt(fresh.ID, fresh.Generation, status, msg)
+			if acquired.Status != "waiting" || acquired.PauseRequested || !alignRunWaitingApproval(acquired) {
+				_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
 				continue
 			}
-		}
-		if listed.Status != "running" {
+			updated, _ := e.updateRunReplayable(r.ID, func(current *domain.Run) bool {
+				if current.Generation != acquired.Generation || !e.ownsRun(*current) || current.Status != "waiting" ||
+					current.CancelRequested || current.PauseRequested || !alignRunWaitingApproval(*current) ||
+					!autoSucceedAlignApprovals(current, time.Now().UTC()) {
+					return false
+				}
+				e.event(current, "", "gate.auto_approved", "基线对齐无需人工确认，已自动通过")
+				return true
+			})
+			if !updated {
+				_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
+				continue
+			}
+			e.resume(r.ID)
+			resumed = append(resumed, r.ID)
 			continue
 		}
-		r, ok := e.repo.RunState(listed.ID)
-		if !ok || r.Status != "running" {
+		if r.Status != "running" {
 			continue
+		}
+		if r.OwnerInstanceID != "" && r.LeaseUntil.After(time.Now().UTC()) {
+			continue
+		}
+		status, msg, done := settleStatusForCompletedGraph(workflowForRun(e.repo, r), r)
+		// A scheduled run still has to push into the integration branch after
+		// the last node succeeds. Settling here deletes that checkout mid-push.
+		if done && !r.CancelRequested && !r.PauseRequested && !(status == "succeeded" && scheduledIntegratePending(r)) {
+			e.finishAt(r.ID, r.Generation, status, msg)
+			current, ok := e.repo.RunState(r.ID)
+			if !ok || current.Status != "running" || (!current.CancelRequested && !current.PauseRequested) {
+				continue
+			}
+			r = current
 		}
 		if r.OwnerInstanceID != "" && r.LeaseUntil.After(time.Now().UTC()) {
 			continue
@@ -206,19 +209,17 @@ func (e *Engine) ResumeInterruptedRuns() []string {
 		if err != nil {
 			continue
 		}
-		if r.CancelRequested || acquired.CancelRequested {
-			_ = e.cancelRunnerTasksForRun(r.ID)
-			e.settleOrphan(r.ID, "运行已被手动终止")
+		if acquired.CancelRequested {
+			e.finishAt(r.ID, acquired.Generation, "cancelled", "运行已被手动终止")
 			_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
 			continue
 		}
-		if r.PauseRequested || acquired.PauseRequested {
-			_ = e.cancelRunnerTasksForRun(r.ID)
+		if acquired.PauseRequested {
 			e.pauseAt(r.ID, acquired.Generation, "运行已由用户暂停")
 			_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
 			continue
 		}
-		if blocked {
+		if blocked || acquired.Status != "running" {
 			// The control request was withdrawn between the check above and the
 			// lease. Hand the run back instead of resuming another host's bind.
 			_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
@@ -238,11 +239,20 @@ func (e *Engine) ResumeInterruptedRuns() []string {
 			_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
 			continue
 		}
-		e.updateRun(r.ID, func(current *domain.Run) {
+		updated, _ := e.updateRunReplayable(r.ID, func(current *domain.Run) bool {
+			if current.Generation != acquired.Generation || !e.ownsRun(*current) || current.Status != "running" ||
+				current.CancelRequested || current.PauseRequested {
+				return false
+			}
 			resetInFlightNodesForResume(current, "执行实例退出，等待恢复")
 			current.Status = "running"
 			e.event(current, "", "run.resumed", fmt.Sprintf("服务恢复后继续执行（generation=%d, previousOwner=%s）", acquired.Generation, previousOwner))
+			return true
 		})
+		if !updated {
+			_ = e.repo.ReleaseRunLease(r.ID, e.instanceID, acquired.Generation)
+			continue
+		}
 		e.observe(r.ID, "", domain.TelemetryEvent{Category: "orchestration", Name: "run.resumed", Phase: "start", Message: "过期执行租约已接管", Attributes: map[string]any{"generation": acquired.Generation, "previousOwner": previousOwner}})
 		e.resume(r.ID)
 		resumed = append(resumed, r.ID)

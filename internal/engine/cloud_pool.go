@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"agentflow/internal/domain"
+	"agentflow/internal/repo"
 )
 
 // CloudRunnerPool routes runs whose responsible user has no default
@@ -166,8 +167,8 @@ func isPoolRun(run domain.Run) bool {
 func (e *Engine) bindPoolRunner(ctx context.Context, run domain.Run, nodeID string) (domain.Run, error) {
 	if run.ExecutionContext.ExecutionPinned {
 		if id := run.ExecutionContext.ExecutionRunnerID; id != "" {
-			if r, ok := e.repo.Runner(id); !ok || r.Status != domain.RunnerStatusOnline {
-				return run, fmt.Errorf("会话绑定的执行机器暂不可用，请等待原机器恢复")
+			if _, err := e.requireAvailableRunner(id); err != nil {
+				return run, err
 			}
 		}
 		return run, nil
@@ -232,24 +233,54 @@ func (e *Engine) bindPoolRunner(ctx context.Context, run domain.Run, nodeID stri
 		case <-time.After(2 * time.Second):
 		}
 	}
-	e.updateRun(run.ID, func(c *domain.Run) {
-		c.ExecutionContext.ExecutionMode = domain.ExecutionModeRunner
-		c.ExecutionContext.ExecutionPool = domain.ExecutionModeCloud
-		c.ExecutionContext.ExecutionRunnerID = runner.ID
-		c.ExecutionContext.RunnerWorkspaceLayout = domain.RunnerWorkspaceLayoutShared
-		msg := fmt.Sprintf("已分配云端执行机器 %s", runner.Name)
-		if previous != "" {
-			name := previous
-			if old, ok := e.repo.Runner(previous); ok && strings.TrimSpace(old.Name) != "" {
-				name = old.Name
-			}
-			msg = fmt.Sprintf("执行机器 %s 不可用，已切换到云端执行机器 %s 重新拉取代码", name, runner.Name)
+	target := ec
+	target.ExecutionMode = domain.ExecutionModeRunner
+	target.ExecutionPool = domain.ExecutionModeCloud
+	target.ExecutionRunnerID = runner.ID
+	target.RunnerWorkspaceLayout = domain.RunnerWorkspaceLayoutShared
+	msg := fmt.Sprintf("已分配云端执行机器 %s", runner.Name)
+	if previous != "" {
+		name := previous
+		if old, ok := e.repo.Runner(previous); ok && strings.TrimSpace(old.Name) != "" {
+			name = old.Name
 		}
+		msg = fmt.Sprintf("执行机器 %s 不可用，已切换到云端执行机器 %s 重新拉取代码", name, runner.Name)
+	}
+	node := run.Nodes[nodeID]
+	canBind := func(c *domain.Run, expected domain.TelemetryContext) bool {
+		if c.Generation != run.Generation || c.OwnerInstanceID != run.OwnerInstanceID || c.ExecutionContext != expected ||
+			(c.OwnerInstanceID != "" && !e.ownsRun(*c)) ||
+			c.CancelRequested || c.PauseRequested || domain.TerminalRunStatus(c.Status) {
+			return false
+		}
+		if current := c.Nodes[nodeID]; (node != nil || current != nil) && (!sameNodeAttempt(node, current) || node.Status != current.Status) {
+			return false
+		}
+		if (convert || previous != "") && hasCodeWorkspace(*c) && hasWorkspaceProgress(*c, nodeID) {
+			return false
+		}
+		return true
+	}
+	updated, err := e.updateRunReplayable(run.ID, func(c *domain.Run) bool {
+		if !canBind(c, ec) {
+			return false
+		}
+		c.ExecutionContext = target
 		e.event(c, nodeID, "execution.bound", msg)
+		return true
 	})
+	if err != nil {
+		return run, fmt.Errorf("绑定云端执行机器 %s：%w", runner.ID, err)
+	}
+	if !updated {
+		return run, fmt.Errorf("绑定云端执行机器 %s：%w", runner.ID, repo.ErrRunDecisionStale)
+	}
 	bound, ok := e.repo.RunState(run.ID)
 	if !ok {
 		return run, errors.New("run not found")
+	}
+	if !canBind(&bound, target) {
+		return run, fmt.Errorf("绑定云端执行机器 %s：%w", runner.ID, repo.ErrRunDecisionStale)
 	}
 	// This host's sandbox is no longer the execution environment. Drain only
 	// detaches it, and the idle sweep skips a run once it has a runner, so

@@ -6,27 +6,33 @@ function mergeSeqItems(prev, incoming, seqOf){
   for(const item of incoming||[]){const seq=Number(seqOf(item)||0);if(seq)bySeq.set(seq,item);else bySeq.set(Symbol(),item)}
   return [...bySeq.values()].sort((a,b)=>Number(seqOf(a)||0)-Number(seqOf(b)||0));
 }
+function currentRunPage(page){
+  const run=state.activeRun;
+  if(!page||!run||state.selectedRun!==run.id)return false;
+  const target=page.adapter?runTracePageTarget(run):runPageTarget(run,state.selectedRunNode);
+  const selected=page.adapter?state.runTelemetry:state.runLogs;
+  return selected===page&&target.runId===page.runId&&target.nodeId===page.nodeId&&
+    (!page.adapter||page.adapter===(state.runTelemetryAdapter||'live'));
+}
+function mergeRunPageDelta(page,records=[],sequence){
+  if(!currentRunPage(page))return;
+  const after=page.maxSeq||0;
+  const unseen=records.filter(e=>Number(e?.sequence)>after);
+  const last=Number(unseen.at(-1)?.sequence||0);
+  page.through=Math.max(page.through||0,sequence||0,last);
+  // Check the unfiltered sequence first. A filter naturally skips some numbers.
+  if(!page.loaded||page.recovery||!unseen.length||!unseen.every((e,i)=>Number(e.sequence)===after+i+1))return;
+  const visible=page.adapter
+    ?unseen.filter(e=>(!page.nodeId||e.nodeId===page.nodeId)&&matchTelemetryAdapter(e,page.adapter))
+    :unseen.filter(e=>!page.nodeId||e.context?.nodeId===page.nodeId);
+  page.items=mergeSeqItems(page.items,visible,e=>e.sequence);
+  page.maxSeq=last;
+}
 function mergeLiveRun(id,incoming,payload){
   const old=state.activeRun?.id===id?state.activeRun:null,byId=new Map((old?.telemetry||[]).map(e=>[e.id,e]));
   for(const e of payload?.telemetryDelta||[])byId.set(e.id,e);
-  if(state.runLogs?.runId===id){
-    const nodeId=state.runLogs.nodeId;
-    const extra=(payload?.logDelta||[]).filter(l=>l&&(!nodeId||l.context?.nodeId===nodeId));
-    if(extra.length){
-      state.runLogs.items=mergeSeqItems(state.runLogs.items, extra, l=>l.sequence);
-      state.runLogs.maxSeq=Math.max(state.runLogs.maxSeq||0,...extra.map(l=>Number(l.sequence||0)));
-      state.runLogs.loaded=true;
-    }
-  }
-  if(state.runTelemetry?.runId===id){
-    const nodeId=state.runTelemetry.nodeId;
-    const extra=(payload?.telemetryDelta||[]).filter(e=>e&&(!nodeId||e.nodeId===nodeId)&&matchTelemetryAdapter(e,state.runTelemetry.adapter||'live'));
-    if(extra.length){
-      state.runTelemetry.items=mergeSeqItems(state.runTelemetry.items, extra, e=>e.sequence);
-      state.runTelemetry.maxSeq=Math.max(state.runTelemetry.maxSeq||0,...extra.map(e=>Number(e.sequence||0)));
-      state.runTelemetry.loaded=true;
-    }
-  }
+  if(state.runLogs?.runId===id)mergeRunPageDelta(state.runLogs,payload?.logDelta,incoming.logSequence);
+  if(state.runTelemetry?.runId===id)mergeRunPageDelta(state.runTelemetry,payload?.telemetryDelta,incoming.telemetrySequence);
   const telemetry=[...byId.values()].sort((a,b)=>a.sequence-b.sequence);
   const nodes={...(old?.nodes||{})};
   for(const [k,n] of Object.entries(incoming.nodes||{})){
@@ -50,13 +56,18 @@ function applyRunPayload(run,{list=true}={}){
 function startLiveRun(id){
   stopLiveRun();
   const previous=state.activeRun?.id===id?state.activeRun:null;
-  const after=previous?.telemetrySequence||state.runTelemetry?.maxSeq||0;
+  const trace=state.runTelemetry;
+  const after=trace?.runId===id&&trace.loaded?(trace.maxSeq||0):(previous?.telemetrySequence||0);
   const logsAfter=state.runLogs?.runId===id?(state.runLogs.maxSeq||0):0;
   const stream=new EventSource(`/api/runs/${encodeURIComponent(id)}/stream?after=${after}&logsAfter=${logsAfter}`);
   state.runStream=stream;
-  stream.addEventListener('run',event=>{
+  let latest=previous;
+  stream.addEventListener('run',async event=>{
     if(state.runStream!==stream)return;
-    const payload=JSON.parse(event.data),run=mergeLiveRun(id,payload.run,payload);
+    const payload=JSON.parse(event.data);
+    if(payload.run.revision!=null&&payload.run.revision<(latest?.revision||0))return;
+    const run=mergeLiveRun(id,payload.run,payload);
+    latest=run;
     patchCachedRun(id,run);
     if(state.selectedRun===id){
       applyRunPayload(run,{list:false});
@@ -74,35 +85,39 @@ function startLiveRun(id){
       state.issueDetailData.run=run;
       if(state.issueDetailTab!=='clarify'||!issueClarifying(state.issueDetailData.issue?.id))renderIssueDetailTab();
     }
-    if(['succeeded','failed','cancelled'].includes(run.status)){stopLiveRun();refreshWorkflowMetrics();renderRuns()}
+    const terminal=['succeeded','failed','cancelled'].includes(run.status);
+    if(state.selectedRun===id&&(terminal||[state.runLogs,state.runTelemetry].some(page=>currentRunPage(page)&&page.through>(page.maxSeq||0)))){
+      try{
+        await refreshRunPagesDelta(id,{onlyGaps:true,terminal,current:()=>state.runStream===stream});
+      }catch{
+        stream.onerror();
+        return;
+      }
+    }
+    if(terminal&&state.runStream===stream&&latest===run){stopLiveRun();refreshWorkflowMetrics();renderRuns()}
   });
   stream.onerror=()=>{stream.close();if(state.runStream!==stream)return;state.runStream=null;startPollingFallback(id)}
 }
-async function refreshRunPagesDelta(id){
-  const run=state.activeRun?.id===id?state.activeRun:{id};
-  const logTarget=runPageTarget(run,state.selectedRunNode);
-  const traceTarget=runTracePageTarget(run);
-  const logPage=state.runLogs,tracePage=state.runTelemetry,jobs=[];
-  if(logPage?.runId===logTarget.runId&&logPage.nodeId===logTarget.nodeId&&logPage.loaded){
-    const params=new URLSearchParams({limit:'100',after:String(logPage.maxSeq||0)});
-    if(logPage.nodeId)params.set('nodeId',logPage.nodeId);
-    jobs.push(api(`/api/runs/${encodeURIComponent(logPage.runId)}/logs?${params}`,{silent:true}).then(data=>{
-      if(state.runLogs!==logPage||!data.logs?.length)return;
-      logPage.items=mergeSeqItems(logPage.items,data.logs,l=>l.sequence);
-      logPage.maxSeq=Math.max(logPage.maxSeq||0,...data.logs.map(l=>Number(l.sequence||0)));
+async function refreshRunPagesDelta(id,{onlyGaps=false,terminal=false,current=()=>true}={}){
+  const relevant=()=>current()&&state.selectedRun===id&&state.activeRun?.id===id;
+  while(relevant()){
+    const run=state.activeRun;
+    const pages=[state.runLogs,state.runTelemetry].filter(currentRunPage);
+    const changed=await Promise.all(pages.map(page=>{
+      if(onlyGaps&&!terminal&&(page.runId!==id||!(page.through>(page.maxSeq||0))))return false;
+      const through=page.runId===id?(page.adapter?run.telemetrySequence:run.logSequence):undefined;
+      return drainRunPage(page,through).catch(error=>{
+        if(currentRunPage(page))throw error;
+        return false;
+      });
     }));
+    if(!relevant())return;
+    if(changed.some((updated,index)=>updated&&currentRunPage(pages[index]))){
+      const host=$('#runDetail');
+      if(host?.dataset.runId===id&&host.dataset.controlSignature===runControlSignature(state.activeRun))patchRunLive(state.activeRun);
+    }
+    if(!terminal||pages.every(page=>currentRunPage(page)&&page.maxSeq>=page.through))return;
   }
-  const adapter=state.runTelemetryAdapter||'live';
-  if(tracePage?.runId===traceTarget.runId&&tracePage.nodeId===traceTarget.nodeId&&tracePage.adapter===adapter&&tracePage.loaded){
-    const params=new URLSearchParams({limit:'100',adapter,after:String(tracePage.maxSeq||0)});
-    if(tracePage.nodeId)params.set('nodeId',tracePage.nodeId);
-    jobs.push(api(`/api/runs/${encodeURIComponent(tracePage.runId)}/telemetry?${params}`,{silent:true}).then(data=>{
-      if(state.runTelemetry!==tracePage||!data.events?.length)return;
-      tracePage.items=mergeSeqItems(tracePage.items,data.events,e=>e.sequence);
-      tracePage.maxSeq=Math.max(tracePage.maxSeq||0,...data.events.map(e=>Number(e.sequence||0)));
-    }));
-  }
-  if(jobs.length){await Promise.all(jobs);if(state.activeRun?.id===id)patchRunLive(state.activeRun)}
 }
 function startPollingFallback(id){
   clearInterval(state.poll);
@@ -117,9 +132,14 @@ function startPollingFallback(id){
       const run=await api(`/api/runs/${encodeURIComponent(id)}`,{silent:true});
       if(state.poll!==timer||!relevant())return;
       patchCachedRun(id,run);
-      if(state.selectedRun===id){applyRunPayload(run,{list:false});await refreshRunPagesDelta(id)}
+      const terminal=['succeeded','failed','cancelled'].includes(run.status);
+      if(state.selectedRun===id){
+        applyRunPayload(run,{list:false});
+        await refreshRunPagesDelta(id,{terminal,current:()=>state.poll===timer});
+      }
+      if(state.poll!==timer||!relevant())return;
       if(state.drawerOpen&&state.issueDetailData?.run?.id===id)renderIssueDetailTab();
-      if(['succeeded','failed','cancelled'].includes(run.status)){stop();renderRuns()}
+      if(terminal){stop();renderRuns()}
     }catch{}finally{busy=false}
   };
   const timer=setInterval(tick,4000);state.poll=timer;tick();
@@ -271,7 +291,7 @@ function renderRuns(){
 function showRunDetail(id){
   if(!id)return;
   stopQueuedRunRefresh();
-  if(state.selectedRun!==id){stopLiveRun();stopPreviewPoll();state.runWorkspace=null}
+  if(state.selectedRun!==id){stopLiveRun();stopPreviewPoll();state.runWorkspace=null;state.runLogs=null;state.runTelemetry=null}
   state.selectedRun=id;
   syncRunHash(id);
   $('#runsView')?.classList.add('detail-open');
@@ -289,7 +309,7 @@ function showRunDetail(id){
     if(state.selectedRun!==id)return;
     state.activeRun=r;
     if(shouldPatchRunLive(r))patchRunLive(r);else renderRunDetail(r);
-    if(['queued','running','waiting'].includes(r.status))startLiveRun(r.id);else stopLiveRun();
+    await followRunDetail(r);
   }).catch(e=>toast(e.message,'err'));
 }
 function showRunList(){
@@ -322,8 +342,19 @@ function selectRun(id,keepPages=false){
     state.activeRun=r;
     renderRuns();
     if(shouldPatchRunLive(r))patchRunLive(r);else renderRunDetail(r);
-    if(['queued','running','waiting'].includes(r.status))startLiveRun(r.id);else stopLiveRun();
+    await followRunDetail(r);
   }).catch(e=>toast(e.message,'err'));
+}
+async function followRunDetail(run){
+  if(['queued','running','waiting'].includes(run.status)){startLiveRun(run.id);return}
+  stopLiveRun();
+  if(!['succeeded','failed','cancelled'].includes(run.status))return;
+  const current=()=>state.selectedRun===run.id&&state.activeRun===run;
+  try{
+    await refreshRunPagesDelta(run.id,{terminal:true,current});
+  }catch{
+    if(current())startPollingFallback(run.id);
+  }
 }
 function runStatus(s){return ({queued:'排队中',running:'运行中',waiting:'待确认',paused:'已暂停',succeeded:'已完成',failed:'失败',cancelled:'已取消'}[s]||s)}
 function runControlSignature(r){return `${r?.status||''}:${Boolean(r?.pauseRequested)}:${Boolean(r?.cancelRequested)}:${r?.admissionState||''}`}
@@ -333,7 +364,7 @@ async function syncRunControlState(runId){
   patchCachedRun(runId,run);
   if(!(state.data.runs||[]).some(r=>r.id===runId))state.data.runs=sortRunsDescending([run,...(state.data.runs||[])]);
   const relevant=state.selectedRun===runId||(state.drawerOpen&&state.issueDetailData?.run?.id===runId);
-  if(relevant){if(['queued','running','waiting'].includes(run.status))startLiveRun(runId);else stopLiveRun()}
+  if(relevant&&['queued','running','waiting'].includes(run.status))startLiveRun(runId);
   paintRunControl(runId);
   return run;
 }
@@ -385,44 +416,73 @@ function logLineHTML(l){
 function isHookAdapter(adapter){return adapter==='agent-hooks-v1'||adapter==='codebuddy-hooks-v1'}
 function hookTraceDetails(e){const a=e.attributes||{},facts=[["ID",a.hookId],["事件",a.hook],["仓库",a.repositoryName||a.repositoryDir||a.repositoryId],["阶段",a.executionPhase],["语言",a.language],["Matcher",a.matcher],["耗时",a.durationMs!=null?`${a.durationMs} ms`:""],["退出码",a.exitCode!=null?String(a.exitCode):""]].filter(x=>x[1]!==''&&x[1]!=null);return `${facts.length?`<dl class="hook-trace-facts">${facts.map(([k,v])=>`<div><dt>${k}</dt><dd>${escapeHTML(v)}</dd></div>`).join('')}</dl>`:''}${a.stdout?`<details class="hook-trace-output"><summary>stdout</summary><pre>${escapeHTML(a.stdout)}</pre></details>`:''}${a.stderr?`<details class="hook-trace-output error"><summary>stderr</summary><pre>${escapeHTML(a.stderr)}</pre></details>`:''}`}
 function telemetryItemHTML(e){const hook=isHookAdapter(e.source?.adapter),tag=hook?'Hook':e.source?.adapter==='codebuddy-otel-v1'?'OTEL':'',title=hook?(e.attributes?.hookName||e.attributes?.hookId||e.name):e.name,repository=e.attributes?.repositoryName||e.attributes?.repositoryDir||e.attributes?.repositoryId||'';return `<article class="telemetry-event ${e.category}"><time>${new Date(e.timestamp).toLocaleTimeString()}</time><span class="telemetry-category">${telemetryLabel(e)}${tag?`<em class="adapter-tag">${tag}</em>`:''}</span><div><b>${escapeHTML(title)}</b><p>${escapeHTML(e.message||'')}</p>${hook?hookTraceDetails(e):''}<small>${escapeHTML(e.nodeId||'run')}${repository?` · ${escapeHTML(repository)}`:''}${hook&&e.source?.provider?` · ${escapeHTML(e.source.provider)}`:''}${e.model?` · ${escapeHTML(e.model)}`:''}${e.toolCallId?` · ${escapeHTML(e.toolCallId)}`:''}</small></div></article>`}
-async function loadRunLogs(runId,nodeId,more=false){
-  if(!more&&state.runLogs?.runId===runId&&state.runLogs?.nodeId===nodeId&&state.runLogs.loading)return;
-  const params=new URLSearchParams({limit:'100'});
-  if(nodeId)params.set('nodeId',nodeId);
-  if(more&&state.runLogs?.runId===runId&&state.runLogs.nodeId===nodeId&&state.runLogs.nextBefore)params.set('before',String(state.runLogs.nextBefore));
-  const prev=(!more||state.runLogs?.runId!==runId||state.runLogs?.nodeId!==nodeId)?(state.runLogs?.runId===runId&&state.runLogs?.nodeId===nodeId?state.runLogs.items:[]):state.runLogs.items;
-  if(!more){state.runLogs={runId,nodeId,items:prev||[],loaded:!!(prev&&prev.length),loading:true,hasMore:!!state.runLogs?.hasMore,nextBefore:state.runLogs?.nextBefore||0,maxSeq:state.runLogs?.maxSeq||0}}
-  try{
-    const data=await api(`/api/runs/${encodeURIComponent(runId)}/logs?${params}`,{silent:true});
-    const incoming=data.logs||[];
-    const items=more?mergeSeqItems(incoming, prev||[], l=>l.sequence):mergeSeqItems(prev||[], incoming, l=>l.sequence);
-    const seqs=items.map(l=>Number(l.sequence||0));
-    state.runLogs={runId,nodeId,items,loaded:true,loading:false,hasMore:!!data.hasMore||(!more&&incoming.length>=100),nextBefore:data.nextBefore||(seqs.length?Math.min(...seqs.filter(Boolean)):0),maxSeq:seqs.length?Math.max(...seqs):0};
-    if(state.activeRun&&runPageTarget(state.activeRun,state.selectedRunNode).runId===runId){const host=$('#runDetail');if(host?.dataset.runId===state.activeRun.id)patchRunLive(state.activeRun);else renderRunDetail(state.activeRun)}
-  }catch(e){if(state.runLogs?.runId===runId)state.runLogs.loading=false;toast(e.message,'err')}
+function loadRunLogs(runId,nodeId,more=false){
+  return loadRunPage(runId,nodeId,'',more);
 }
-async function loadRunTelemetry(runId,nodeId,more=false){
-  const adapter=state.runTelemetryAdapter||'live';
-  const current=state.runTelemetry;
-  const same=current?.runId===runId&&current.nodeId===nodeId&&current.adapter===adapter;
+function loadRunTelemetry(runId,nodeId,more=false){
+  return loadRunPage(runId,nodeId,state.runTelemetryAdapter||'live',more);
+}
+async function queryRunPage(page,cursor){
+  const params=new URLSearchParams({limit:'100',...cursor});
+  if(page.nodeId)params.set('nodeId',page.nodeId);
+  if(page.adapter)params.set('adapter',page.adapter);
+  const path=page.adapter?'telemetry':'logs';
+  const data=await api(`/api/runs/${encodeURIComponent(page.runId)}/${path}?${params}`,{silent:true});
+  return {...data,items:(page.adapter?data.events:data.logs)||[]};
+}
+function loadRunPage(runId,nodeId,adapter,more){
+  const key=adapter?'runTelemetry':'runLogs';
+  const current=state[key];
+  const same=current?.runId===runId&&current.nodeId===nodeId&&(current.adapter||'')===adapter;
   const page=same?current:{runId,nodeId,adapter,items:[],nextBefore:0,maxSeq:0};
-  if(page.loading)return;
-  state.runTelemetry=page;
-  page.loading=true;
-  const params=new URLSearchParams({limit:'100',adapter});
-  if(nodeId)params.set('nodeId',nodeId);
-  if(more&&page.nextBefore)params.set('before',String(page.nextBefore));
-  try{
-    const data=await api(`/api/runs/${encodeURIComponent(runId)}/telemetry?${params}`,{silent:true});
-    if(state.runTelemetry!==page)return;
-    const incoming=data.events||[];
-    page.items=more?mergeSeqItems(incoming,page.items,e=>e.sequence):mergeSeqItems(page.items,incoming,e=>e.sequence);
-    const seqs=page.items.map(e=>Number(e.sequence||0)).filter(Boolean);
-    Object.assign(page,{loaded:true,loading:false,hasMore:!!data.hasMore||(!more&&incoming.length>=100),nextBefore:data.nextBefore||(seqs.length?Math.min(...seqs):0),maxSeq:seqs.length?Math.max(...seqs):0});
-    const run=state.activeRun;
-    if(run&&runTracePageTarget(run).runId===runId){const host=$('#runDetail');if(host?.dataset.runId===run.id)patchRunLive(run);else renderRunDetail(run)}
-  }catch(e){if(state.runTelemetry===page)toast(e.message,'err')}
-  finally{page.loading=false}
+  if(page.loading)return page.loading;
+  state[key]=page;
+  const cursor=more&&page.nextBefore?{before:String(page.nextBefore)}:{};
+  page.loading=(async()=>{
+    try{
+      const data=await queryRunPage(page,cursor);
+      if(!currentRunPage(page))return;
+      page.items=more?mergeSeqItems(data.items,page.items,e=>e.sequence):mergeSeqItems(page.items,data.items,e=>e.sequence);
+      page.hasMore=data.hasMore??(!more&&data.items.length>=100);
+      page.nextBefore=data.nextBefore||data.items[0]?.sequence||0;
+      if(!more)page.maxSeq=Math.max(page.maxSeq||0,data.sequence||0,data.items.at(-1)?.sequence||0);
+      page.loaded=true;
+      patchRunLive(state.activeRun);
+    }catch(e){if(currentRunPage(page))toast(e.message,'err')}
+    finally{page.loading=null}
+  })();
+  return page.loading;
+}
+async function drainRunPage(page,through){
+  page.through=Math.max(page.through||0,through||0);
+  if(!page.loaded)await (page.loading||loadRunPage(page.runId,page.nodeId,page.adapter||'',false));
+  if(!currentRunPage(page))return false;
+  if(page.recovery)return page.recovery;
+  if(!page.loaded)throw new Error('Could not load run records');
+  if(through!=null&&page.maxSeq>=page.through)return false;
+  page.recovery=(async()=>{
+    let changed=false;
+    while(currentRunPage(page)){
+      const after=page.maxSeq||0;
+      const data=await queryRunPage(page,{after:String(after)});
+      if(!currentRunPage(page))return false;
+      const next=Number(data.nextAfter||data.items.at(-1)?.sequence||0);
+      if(data.hasMore&&next<=after)throw new Error('Run record cursor did not advance');
+      if(data.items.length){
+        page.items=mergeSeqItems(page.items,data.items,e=>e.sequence);
+        changed=true;
+      }
+      page.maxSeq=Math.max(after,next,data.hasMore?0:data.sequence||0);
+      if(!data.hasMore){
+        if(page.maxSeq<page.through)throw new Error('Run record history is incomplete');
+        return changed;
+      }
+      if(through!=null&&page.maxSeq>=page.through)return changed;
+    }
+    return false;
+  })();
+  try{return await page.recovery}
+  finally{page.recovery=null}
 }
 function ensureRunPages(run){
   if(!run?.id)return;
@@ -1124,7 +1184,7 @@ function watchChildRuns(r){
     if(activeViewName()!=='runs'||$('#runsDetailSection')?.hidden)return;
     if(!run||run.id!==r.id||state.selectedRun!==r.id||!['running','waiting'].includes(run.status)){clearInterval(state.childRunTimer);state.childRunTimer=null;return}
     refreshChildRuns(run);
-    if(runPageTarget(run,state.selectedRunNode).child)refreshRunPagesDelta(run.id);
+    if(runPageTarget(run,state.selectedRunNode).child||runTracePageTarget(run).child)refreshRunPagesDelta(run.id).catch(()=>{});
   },4000);
 }
 function childSOPPanelHTML(r,nodeId){
@@ -1230,7 +1290,7 @@ function renderRunDetail(r){
   const runTabs=['overview:概览','trace:实时轨迹','logs:Worker日志','workspace:工作区'];
   if(previewEnabled)runTabs.push('preview:前端预览');
   runTabs.push('eval:智能评测');
-  host.innerHTML=`<div class="run-detail-main"><header class="run-detail-header"><div class="run-detail-topbar"><button class="button ghost small run-back-inline" data-run-back>← 返回运行列表</button><div class="run-breadcrumb"><span>${issueRef}</span><i>›</i><span>${escapeHTML(wf.name)}</span></div>${r.executionContext?.parentRunId?`<button class="button ghost small" data-open-parent-run="${escapeHTML(r.executionContext.parentRunId)}">↑ 返回父 SOP 运行</button>`:''}<div class="run-header-actions">${issueId?`<button class="button primary small" data-open-issue="${escapeHTML(issueId)}">打开需求</button>`:''}${!r.pauseRequested?refreshRunSOPButtonHTML(r):''}<button class="button ghost small" data-open-flow>查看流程定义</button>${['queued','running','waiting'].includes(r.status)?'<button class="button danger-outline small" data-cancel-run>取消运行</button>':'<button class="button danger-outline small" data-delete-run>删除记录</button>'}</div></div><div class="run-header-main"><div><h2>${escapeHTML(ctx.issue?.title||wf.name)}</h2><p>${escapeHTML(r.input||'无运行输入')}</p></div><div class="run-status-wrap">${workspaceRestoreButtonHTML()}<span class="status ${runDisplayStatusClass(r)}">${runDisplayStatus(r)}</span>${r.status==='failed'&&!gongfengIssueClosed(ctx.issue)?'<button class="button primary small" data-resume-run>↻ 重试运行</button>':''}${canManuallyPassFailedNode(r)&&!gongfengIssueClosed(ctx.issue)?`<button class="button ghost small" data-pass-node="${escapeHTML(r.id)}" data-node="${escapeHTML(failedNodeId(r))}">手动通过</button>`:''}</div></div><div class="run-header-meta"><span class="run-meta-chip run-id-chip" title="${escapeHTML(r.id)}">Run <code>${escapeHTML(r.id.slice(-12))}</code><button type="button" class="run-id-copy" data-copy-run title="复制完整 Run ID" aria-label="复制 Run ID"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5V3.5A1.5 1.5 0 0 0 9 2H3.5A1.5 1.5 0 0 0 2 3.5V9A1.5 1.5 0 0 0 3.5 10.5H5.5"/></svg></button></span>${runModeChipHTML(r,wf)}${runExecutionChipHTML(r)}<span class="run-meta-chip"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>启动于 ${new Date(r.createdAt).toLocaleString()}</span><span class="run-meta-chip" title="${escapeHTML(runTimingTitle(r))}"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px;"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>执行 ${runElapsed(r)}${runWallNote(r)}</span></div></header><div class="run-section-label"><b>执行详情</b><div class="run-section-label-actions"><button class="button ghost small" data-export-logs title="下载本次运行全部节点的 Worker 日志">导出全部日志</button><div class="run-tabs" role="tablist">${runTabs.map(t=>{const[k,label]=t.split(':');return `<button class="run-tab ${runDetailTab===k?'active':''}" data-run-tab="${k}">${label}</button>`}).join('')}</div></div></div><div class="run-pane" data-run-pane="overview" ${runDetailTab==='overview'?'':'hidden'}><section class="run-context-grid">${runProgressCellHTML(r,wf,progress,graphNodes)}<div data-run-usage>${liveUsageHTML(r)}</div><div><span>交付物</span><b>${(r.artifacts||[]).length} 个不可变快照</b><small>按节点和尝试次数保留版本</small></div></section></section>${alignPanelHTML}${runIsGroupMode(r)?`<details class="run-sop-snapshot"><summary><div><b>已冷冻 SOP 快照</b><span>历史协作 · ${graphNodes.length} 个节点可展开审计</span></div></summary>`:''}<section class="run-graph-section"><div class="section-heading"><div><h3>节点执行拓扑</h3><span>点击节点查看该节点的输出、产物和执行事件</span></div><div class="graph-legend"><span><i class="succeeded"></i>完成</span><span><i class="running"></i>运行中</span><span><i class="waiting_approval"></i>待审批</span><span><i></i>未开始</span></div></div><div class="run-graph">${graphNodes.map((n,index)=>{const gv=graphNodeView(r,n.id),meta=nodeMeta(n),arts=(r.artifacts||[]).filter(a=>a.nodeId===n.id).length;return `${index?'<span class="graph-arrow">→</span>':''}<button class="graph-node ${gv.cls} ${state.selectedRunNode===n.id?'selected':''}" data-run-node="${escapeHTML(n.id)}"><span class="node-icon ${meta.kind}">${runNodeIcon(meta.kind)}</span><div><b>${escapeHTML(n.name)}</b><small>${escapeHTML(gv.text)}</small></div>${arts?`<em>${arts} 产物</em>`:''}</button>`}).join('')}</div></section><div class="node-drilldown"><section class="node-inspector"><div class="section-heading"><div class="node-inspector-title"><h3>${escapeHTML(selected?.name||'节点详情')}</h3><span class="node-activity-inline${inspectorRunning?' is-running':''}" ${nr.activity?'':'hidden'}>当前活动：<b>${escapeHTML(nr.activity||'')}</b></span><span class="node-inspector-model">${escapeHTML(nr.provider||'未分配')}${nr.model?` · ${escapeHTML(nr.model)}`:''}</span></div><span class="status node-inspector-status ${nr.status||'pending'}${inspectorRunning?' is-running':''}">${statusText(nr.status)||'待执行'}</span></div><div class="node-facts"><div><span>执行次数</span><b>${nr.attempt||0}</b></div><div><span>返工</span><b>${nr.reworkCount||0}</b></div><div><span>Token</span><b>${formatTokens(nr.usage?.totalTokens)}</b></div><div><span>工具调用</span><b>${nr.toolCalls||0}</b></div></div>${childSOPPanelHTML(r,selected?.id)}${gateResultCardHTML(nr)}${canRerunFromHere(r,selected?.id)?`<div class="node-rerun-row"><button type="button" class="button ghost small" data-rerun-from-here="${escapeHTML(selected.id)}">从这里重跑</button><small>保留上游结果，从本节点及下游重跑</small></div>`:''}${nr.output?`<div class="node-output"><div><b>节点输出</b><button data-copy-output>复制</button></div><pre>${escapeHTML(displayNodeOutput(nr.output))}</pre></div>`:'<div class="node-output empty"><b>节点输出</b><p>节点完成后，结构化输出会显示在这里。</p></div>'}<div class="runtime-details"><span>Sandbox <code>${escapeHTML(nr.sandboxId||'—')}</code></span><span>Session <code>${escapeHTML(nr.sessionId||'—')}</code></span></div></section><section class="node-artifacts"><div class="section-heading"><div><h3>节点交付物</h3><span>${nodeArtifacts.length} 个版本</span></div></div><div class="node-artifact-list">${nodeArtifacts.map(a=>`<button class="node-artifact-card" data-artifact="${escapeHTML(a.id)}"><span class="artifact-file-icon">${a.mediaType==='application/json'?'{}':'MD'}</span><div><b>${escapeHTML(a.name)}</b><span>${escapeHTML(a.path)}</span><small>attempt ${a.attempt} · ${Math.max(1,Math.ceil((a.size||0)/1024))} KB · ${(a.sha256||'').slice(0,10)}</small></div><i>预览 ›</i></button>`).join('')||'<div class="empty-inline"><span>◇</span><p>此节点还没有登记交付物</p></div>'}</div></section></div>${runIsGroupMode(r)?'</details>':''}</div><div class="run-pane" data-run-pane="trace" ${runDetailTab==='trace'?'':'hidden'}><section class="trace-section"><div class="section-heading"><div><h3>${telemetrySectionTitle(telAdapter)}</h3><span>${telPage?`${telemetry.length} 条已加载`:'加载最近 100 条'}</span></div><div class="trace-heading-actions">${runTraceScopeHTML(pickNodes,trace.step)}${telemetrySourceTabs(telAdapter,'data-tel-adapter')}${telPage?.hasMore?`<button class="button ghost small" data-tel-more>加载更早的 100 条</button>`:''}</div></div><div class="telemetry-feed">${telPage?([...telemetry].reverse().map(telemetryItemHTML).join('')||`<div class="empty-inline"><p>${telemetryEmptyHint(telAdapter)}</p></div>`):'<div class="empty-inline"><p>正在加载轨迹…</p></div>'}</div></section></div><div class="run-pane" data-run-pane="logs" ${runDetailTab==='logs'?'':'hidden'}><section class="worker-log-section"><div class="section-heading"><div><h3>Worker 日志</h3><span>${logPage?`${visibleWorkerLogs(logPage.items).length} 条调用`:(logBusy?'正在接收…':'实时加载最近调用')}</span></div><div class="worker-log-heading-actions">${logPage?.hasMore?`<button class="button ghost small" data-logs-more>加载更早的 100 条</button>`:''}</div></div><div class="worker-log-feed">${logPage?(visibleWorkerLogs(logPage.items).map(logLineHTML).join('')||'<div class="empty-inline"><p>该节点没有日志</p></div>'):'<div class="empty-inline"><p>正在加载 Worker 实时日志…</p></div>'}</div></section></div></div>`;  host.querySelector('.run-detail-main')?.insertAdjacentHTML('beforeend',`<div class="run-pane" data-run-pane="workspace" ${runDetailTab==='workspace'?'':'hidden'}>${workspacePaneHTML(r)}</div>${previewEnabled?`<div class="run-pane" data-run-pane="preview" ${runDetailTab==='preview'?'':'hidden'}>${previewPaneHTML(r)}</div>`:''}<div class="run-pane" data-run-pane="eval" ${runDetailTab==='eval'?'':'hidden'}>${runEvalPaneHTML(r)}</div>`);
+  host.innerHTML=`<div class="run-detail-main"><header class="run-detail-header"><div class="run-detail-topbar"><button class="button ghost small run-back-inline" data-run-back>← 返回运行列表</button><div class="run-breadcrumb"><span>${issueRef}</span><i>›</i><span>${escapeHTML(wf.name)}</span></div>${r.executionContext?.parentRunId?`<button class="button ghost small" data-open-parent-run="${escapeHTML(r.executionContext.parentRunId)}">↑ 返回父 SOP 运行</button>`:''}<div class="run-header-actions">${issueId?`<button class="button primary small" data-open-issue="${escapeHTML(issueId)}">打开需求</button>`:''}${!r.pauseRequested?refreshRunSOPButtonHTML(r):''}<button class="button ghost small" data-open-flow>查看流程定义</button>${['queued','running','waiting'].includes(r.status)?'<button class="button danger-outline small" data-cancel-run>取消运行</button>':'<button class="button danger-outline small" data-delete-run>删除记录</button>'}</div></div><div class="run-header-main"><div><h2>${escapeHTML(ctx.issue?.title||wf.name)}</h2><p>${escapeHTML(r.input||'无运行输入')}</p></div><div class="run-status-wrap">${workspaceRestoreButtonHTML()}<span class="status ${runDisplayStatusClass(r)}">${runDisplayStatus(r)}</span>${r.status==='failed'&&!gongfengIssueClosed(ctx.issue)?'<button class="button primary small" data-resume-run>↻ 重试运行</button>':''}${canManuallyPassFailedNode(r)&&!gongfengIssueClosed(ctx.issue)?`<button class="button ghost small" data-pass-node="${escapeHTML(r.id)}" data-node="${escapeHTML(failedNodeId(r))}"${nodeDecisionExpectationAttr(r.nodes?.[failedNodeId(r)])}>手动通过</button>`:''}</div></div><div class="run-header-meta"><span class="run-meta-chip run-id-chip" title="${escapeHTML(r.id)}">Run <code>${escapeHTML(r.id.slice(-12))}</code><button type="button" class="run-id-copy" data-copy-run title="复制完整 Run ID" aria-label="复制 Run ID"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5V3.5A1.5 1.5 0 0 0 9 2H3.5A1.5 1.5 0 0 0 2 3.5V9A1.5 1.5 0 0 0 3.5 10.5H5.5"/></svg></button></span>${runModeChipHTML(r,wf)}${runExecutionChipHTML(r)}<span class="run-meta-chip"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>启动于 ${new Date(r.createdAt).toLocaleString()}</span><span class="run-meta-chip" title="${escapeHTML(runTimingTitle(r))}"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px;"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>执行 ${runElapsed(r)}${runWallNote(r)}</span></div></header><div class="run-section-label"><b>执行详情</b><div class="run-section-label-actions"><button class="button ghost small" data-export-logs title="下载本次运行全部节点的 Worker 日志">导出全部日志</button><div class="run-tabs" role="tablist">${runTabs.map(t=>{const[k,label]=t.split(':');return `<button class="run-tab ${runDetailTab===k?'active':''}" data-run-tab="${k}">${label}</button>`}).join('')}</div></div></div><div class="run-pane" data-run-pane="overview" ${runDetailTab==='overview'?'':'hidden'}><section class="run-context-grid">${runProgressCellHTML(r,wf,progress,graphNodes)}<div data-run-usage>${liveUsageHTML(r)}</div><div><span>交付物</span><b>${(r.artifacts||[]).length} 个不可变快照</b><small>按节点和尝试次数保留版本</small></div></section></section>${alignPanelHTML}${runIsGroupMode(r)?`<details class="run-sop-snapshot"><summary><div><b>已冷冻 SOP 快照</b><span>历史协作 · ${graphNodes.length} 个节点可展开审计</span></div></summary>`:''}<section class="run-graph-section"><div class="section-heading"><div><h3>节点执行拓扑</h3><span>点击节点查看该节点的输出、产物和执行事件</span></div><div class="graph-legend"><span><i class="succeeded"></i>完成</span><span><i class="running"></i>运行中</span><span><i class="waiting_approval"></i>待审批</span><span><i></i>未开始</span></div></div><div class="run-graph">${graphNodes.map((n,index)=>{const gv=graphNodeView(r,n.id),meta=nodeMeta(n),arts=(r.artifacts||[]).filter(a=>a.nodeId===n.id).length;return `${index?'<span class="graph-arrow">→</span>':''}<button class="graph-node ${gv.cls} ${state.selectedRunNode===n.id?'selected':''}" data-run-node="${escapeHTML(n.id)}"><span class="node-icon ${meta.kind}">${runNodeIcon(meta.kind)}</span><div><b>${escapeHTML(n.name)}</b><small>${escapeHTML(gv.text)}</small></div>${arts?`<em>${arts} 产物</em>`:''}</button>`}).join('')}</div></section><div class="node-drilldown"><section class="node-inspector"><div class="section-heading"><div class="node-inspector-title"><h3>${escapeHTML(selected?.name||'节点详情')}</h3><span class="node-activity-inline${inspectorRunning?' is-running':''}" ${nr.activity?'':'hidden'}>当前活动：<b>${escapeHTML(nr.activity||'')}</b></span><span class="node-inspector-model">${escapeHTML(nr.provider||'未分配')}${nr.model?` · ${escapeHTML(nr.model)}`:''}</span></div><span class="status node-inspector-status ${nr.status||'pending'}${inspectorRunning?' is-running':''}">${statusText(nr.status)||'待执行'}</span></div><div class="node-facts"><div><span>执行次数</span><b>${nr.attempt||0}</b></div><div><span>返工</span><b>${nr.reworkCount||0}</b></div><div><span>Token</span><b>${formatTokens(nr.usage?.totalTokens)}</b></div><div><span>工具调用</span><b>${nr.toolCalls||0}</b></div></div>${childSOPPanelHTML(r,selected?.id)}${gateResultCardHTML(nr)}${canRerunFromHere(r,selected?.id)?`<div class="node-rerun-row"><button type="button" class="button ghost small" data-rerun-from-here="${escapeHTML(selected.id)}">从这里重跑</button><small>保留上游结果，从本节点及下游重跑</small></div>`:''}${nr.output?`<div class="node-output"><div><b>节点输出</b><button data-copy-output>复制</button></div><pre>${escapeHTML(displayNodeOutput(nr.output))}</pre></div>`:'<div class="node-output empty"><b>节点输出</b><p>节点完成后，结构化输出会显示在这里。</p></div>'}<div class="runtime-details"><span>Sandbox <code>${escapeHTML(nr.sandboxId||'—')}</code></span><span>Session <code>${escapeHTML(nr.sessionId||'—')}</code></span></div></section><section class="node-artifacts"><div class="section-heading"><div><h3>节点交付物</h3><span>${nodeArtifacts.length} 个版本</span></div></div><div class="node-artifact-list">${nodeArtifacts.map(a=>`<button class="node-artifact-card" data-artifact="${escapeHTML(a.id)}"><span class="artifact-file-icon">${a.mediaType==='application/json'?'{}':'MD'}</span><div><b>${escapeHTML(a.name)}</b><span>${escapeHTML(a.path)}</span><small>attempt ${a.attempt} · ${Math.max(1,Math.ceil((a.size||0)/1024))} KB · ${(a.sha256||'').slice(0,10)}</small></div><i>预览 ›</i></button>`).join('')||'<div class="empty-inline"><span>◇</span><p>此节点还没有登记交付物</p></div>'}</div></section></div>${runIsGroupMode(r)?'</details>':''}</div><div class="run-pane" data-run-pane="trace" ${runDetailTab==='trace'?'':'hidden'}><section class="trace-section"><div class="section-heading"><div><h3>${telemetrySectionTitle(telAdapter)}</h3><span>${telPage?`${telemetry.length} 条已加载`:'加载最近 100 条'}</span></div><div class="trace-heading-actions">${runTraceScopeHTML(pickNodes,trace.step)}${telemetrySourceTabs(telAdapter,'data-tel-adapter')}${telPage?.hasMore?`<button class="button ghost small" data-tel-more>加载更早的 100 条</button>`:''}</div></div><div class="telemetry-feed">${telPage?([...telemetry].reverse().map(telemetryItemHTML).join('')||`<div class="empty-inline"><p>${telemetryEmptyHint(telAdapter)}</p></div>`):'<div class="empty-inline"><p>正在加载轨迹…</p></div>'}</div></section></div><div class="run-pane" data-run-pane="logs" ${runDetailTab==='logs'?'':'hidden'}><section class="worker-log-section"><div class="section-heading"><div><h3>Worker 日志</h3><span>${logPage?`${visibleWorkerLogs(logPage.items).length} 条调用`:(logBusy?'正在接收…':'实时加载最近调用')}</span></div><div class="worker-log-heading-actions">${logPage?.hasMore?`<button class="button ghost small" data-logs-more>加载更早的 100 条</button>`:''}</div></div><div class="worker-log-feed">${logPage?(visibleWorkerLogs(logPage.items).map(logLineHTML).join('')||'<div class="empty-inline"><p>该节点没有日志</p></div>'):'<div class="empty-inline"><p>正在加载 Worker 实时日志…</p></div>'}</div></section></div></div>`;  host.querySelector('.run-detail-main')?.insertAdjacentHTML('beforeend',`<div class="run-pane" data-run-pane="workspace" ${runDetailTab==='workspace'?'':'hidden'}>${workspacePaneHTML(r)}</div>${previewEnabled?`<div class="run-pane" data-run-pane="preview" ${runDetailTab==='preview'?'':'hidden'}>${previewPaneHTML(r)}</div>`:''}<div class="run-pane" data-run-pane="eval" ${runDetailTab==='eval'?'':'hidden'}>${runEvalPaneHTML(r)}</div>`);
   if(keepFrame){const fresh=host.querySelector('iframe[data-vscode-frame]');if(fresh)fresh.replaceWith(existingFrame);}
   if(keepPreview){const fresh=host.querySelector('iframe[data-preview-frame]');if(fresh)fresh.replaceWith(existingPreviewFrame);}
   const headerActions=host.querySelector('.run-header-actions');if(r.status==='running'&&headerActions)headerActions.querySelector('[data-cancel-run]')?.insertAdjacentHTML('beforebegin','<button class="button ghost small" data-pause-run>暂停运行</button>');
@@ -1274,7 +1334,7 @@ function renderRunDetail(r){
     renderRunDetail(state.activeRun||r);
     if(focused)host.querySelector('[data-run-trace-node]')?.focus({preventScroll:true});
   });
-  host.querySelectorAll('[data-run-node]').forEach(b=>b.onclick=()=>selectRunNode(b.dataset.runNode));host.querySelectorAll('[data-tel-adapter]').forEach(b=>b.onclick=()=>{if((state.runTelemetryAdapter||'live')===b.dataset.telAdapter)return;state.runTelemetryAdapter=b.dataset.telAdapter;state.runTelemetry=null;renderRunDetail(state.activeRun||r)});host.querySelector('[data-logs-load]')?.addEventListener('click',()=>loadRunLogs(pg.runId,pg.nodeId,false));host.querySelector('[data-logs-more]')?.addEventListener('click',()=>loadRunLogs(pg.runId,pg.nodeId,true));host.querySelector('[data-tel-load]')?.addEventListener('click',()=>loadRunTelemetry(trace.runId,trace.nodeId,false));host.querySelector('[data-tel-more]')?.addEventListener('click',()=>loadRunTelemetry(trace.runId,trace.nodeId,true));host.querySelector('[data-open-issue]')?.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();openIssueDetail(ev.currentTarget.dataset.openIssue||issueId,'sop')});host.querySelectorAll('[data-rerun-from-here]').forEach(b=>b.onclick=()=>openRerunFromNode(state.activeRun||r,b.dataset.rerunFromHere));host.querySelector('[data-copy-run]')?.addEventListener('click',()=>copyText(r.id,'Run ID 已复制'));host.querySelector('[data-export-logs]')?.addEventListener('click',()=>downloadRunLogs(r.id));host.querySelector('[data-copy-output]')?.addEventListener('click',()=>copyText(displayNodeOutput(nr.output),'节点输出已复制'));host.querySelector('[data-open-flow]')?.addEventListener('click',()=>{state.workflow=clone(state.data.workflows.find(w=>w.id===r.workflowId)||wf);state.selectedNode=selected?.id||null;switchView('flow');renderAll()});host.querySelector('[data-cancel-run]')?.addEventListener('click',async ()=>{if(await afConfirm({title:'取消运行确认',message:r.status==='queued'?'确定取消排队？此运行将不会启动，之后可删除记录。':'确定取消这次运行？正在执行的节点会被终止。',confirmText:r.status==='queued'?'取消排队':'确认取消',isDanger:true}))runAction(r.id,'cancel',{})});host.querySelector('[data-delete-run]')?.addEventListener('click',()=>deleteRun(r.id));host.querySelectorAll('[data-resume-run]').forEach(b=>b.addEventListener('click',ev=>resumeRun(b.dataset.resumeRun||r.id,ev.currentTarget)));host.querySelectorAll('[data-pass-node]').forEach(b=>b.onclick=()=>passFailedNode(b.dataset.passNode,b.dataset.node,b));host.querySelectorAll('[data-artifact]').forEach(b=>b.onclick=()=>previewArtifact(state.activeRun||r,b.dataset.artifact));host.querySelectorAll('[data-approve]').forEach(b=>b.onclick=()=>runAction(r.id,'approve',withHumanContext({nodeId:b.dataset.approve,context:readHumanContext(b)})));host.querySelectorAll('[data-reject]').forEach(b=>b.onclick=async ()=>{const reason=await afPrompt({title:'打回返工',message:'请输入打回原因：',defaultValue:'验证未通过，请修复后重新提交'});if(reason!==null&&reason!==undefined)runAction(r.id,'reject',withHumanContext({nodeId:b.dataset.reject,targetId:b.dataset.target,reason,context:readHumanContext(b)}))});host.querySelectorAll('[data-retry-node]').forEach(b=>b.onclick=()=>retryWaitingNode(r.id,b.dataset.retryNode,b));host.querySelectorAll('[data-decline-retry]').forEach(b=>b.onclick=()=>declineRetry(r.id,b.dataset.declineRetry));host.querySelectorAll('[data-realign-run]').forEach(b=>b.onclick=()=>realignBaseline(b.dataset.realignRun));
+  host.querySelectorAll('[data-run-node]').forEach(b=>b.onclick=()=>selectRunNode(b.dataset.runNode));host.querySelectorAll('[data-tel-adapter]').forEach(b=>b.onclick=()=>{if((state.runTelemetryAdapter||'live')===b.dataset.telAdapter)return;state.runTelemetryAdapter=b.dataset.telAdapter;state.runTelemetry=null;renderRunDetail(state.activeRun||r)});host.querySelector('[data-logs-load]')?.addEventListener('click',()=>loadRunLogs(pg.runId,pg.nodeId,false));host.querySelector('[data-logs-more]')?.addEventListener('click',()=>loadRunLogs(pg.runId,pg.nodeId,true));host.querySelector('[data-tel-load]')?.addEventListener('click',()=>loadRunTelemetry(trace.runId,trace.nodeId,false));host.querySelector('[data-tel-more]')?.addEventListener('click',()=>loadRunTelemetry(trace.runId,trace.nodeId,true));host.querySelector('[data-open-issue]')?.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();openIssueDetail(ev.currentTarget.dataset.openIssue||issueId,'sop')});host.querySelectorAll('[data-rerun-from-here]').forEach(b=>b.onclick=()=>openRerunFromNode(state.activeRun||r,b.dataset.rerunFromHere));host.querySelector('[data-copy-run]')?.addEventListener('click',()=>copyText(r.id,'Run ID 已复制'));host.querySelector('[data-export-logs]')?.addEventListener('click',()=>downloadRunLogs(r.id));host.querySelector('[data-copy-output]')?.addEventListener('click',()=>copyText(displayNodeOutput(nr.output),'节点输出已复制'));host.querySelector('[data-open-flow]')?.addEventListener('click',()=>{state.workflow=clone(state.data.workflows.find(w=>w.id===r.workflowId)||wf);state.selectedNode=selected?.id||null;switchView('flow');renderAll()});host.querySelector('[data-cancel-run]')?.addEventListener('click',async ()=>{if(await afConfirm({title:'取消运行确认',message:r.status==='queued'?'确定取消排队？此运行将不会启动，之后可删除记录。':'确定取消这次运行？正在执行的节点会被终止。',confirmText:r.status==='queued'?'取消排队':'确认取消',isDanger:true}))runAction(r.id,'cancel',{})});host.querySelector('[data-delete-run]')?.addEventListener('click',()=>deleteRun(r.id));host.querySelectorAll('[data-resume-run]').forEach(b=>b.addEventListener('click',ev=>resumeRun(b.dataset.resumeRun||r.id,ev.currentTarget)));host.querySelectorAll('[data-pass-node]').forEach(b=>b.onclick=()=>passFailedNode(b.dataset.passNode,b.dataset.node,b));host.querySelectorAll('[data-artifact]').forEach(b=>b.onclick=()=>previewArtifact(state.activeRun||r,b.dataset.artifact));host.querySelectorAll('[data-approve]').forEach(b=>b.onclick=()=>runAction(r.id,'approve',decisionPayload(b.dataset.approve,b)));host.querySelectorAll('[data-reject]').forEach(b=>b.onclick=async ()=>{const reason=await afPrompt({title:'打回返工',message:'请输入打回原因：',defaultValue:'验证未通过，请修复后重新提交'});if(reason!==null&&reason!==undefined)runAction(r.id,'reject',decisionPayload(b.dataset.reject,b,{targetId:b.dataset.target,reason}))});host.querySelectorAll('[data-retry-node]').forEach(b=>b.onclick=()=>retryWaitingNode(r.id,b.dataset.retryNode,b));host.querySelectorAll('[data-decline-retry]').forEach(b=>b.onclick=()=>declineRetry(r.id,b.dataset.declineRetry,b));host.querySelectorAll('[data-realign-run]').forEach(b=>b.onclick=()=>realignBaseline(b.dataset.realignRun));
   host.querySelector('[data-pause-run]')?.addEventListener('click',()=>pauseRun(r.id));bindPausedResumeActions(host);host.querySelectorAll('[data-refresh-run-sop]').forEach(b=>b.onclick=()=>refreshRunSOP(b.dataset.refreshRunSop));
   host.dataset.runId=r.id;host.dataset.nodeId=state.selectedRunNode||'';host.dataset.controlSignature=runControlSignature(r);
   paintRunActivationProgress(r.id);
@@ -1569,7 +1629,7 @@ async function runAction(id,action,body){
     const run=await syncRunControlState(id);
     await refreshRuns(true);
     toast(action==='cancel'&&run.status==='cancelled'?(run.admissionState==='unstarted'?'已取消排队':'运行已取消'):runControlToast(run,action==='approve'?'已批准，流程继续':action==='reject'?'已打回，开始返工':action==='retry'?'已从中断处继续':'已选择不重试'));
-  }catch(e){toast(e.message)}
+  }catch(e){await showDecisionError(e,id)}
 }
 async function loadRunMachineMetadata(r){
   if(r.executionContext?.executionMode!=='runner')return;

@@ -6,11 +6,14 @@ import (
 	"agentflow/internal/repo"
 	"agentflow/internal/runtime"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 func (e *Engine) execute(ctx context.Context, runID string) {
@@ -21,7 +24,7 @@ func (e *Engine) execute(ctx context.Context, runID string) {
 	}
 	if !e.ownsRun(r) {
 		status, msg, done := settleStatusForCompletedGraph(workflowForRun(e.repo, r), r)
-		if done && !(status == "succeeded" && scheduledIntegratePending(r)) {
+		if done && canSettleUnowned(r, status) {
 			e.finishAt(runID, r.Generation, status, msg)
 		}
 		e.clearRunning(runID)
@@ -127,8 +130,12 @@ func (e *Engine) execute(ctx context.Context, runID string) {
 		}
 		if len(ready) == 0 {
 			if allSucceeded(wf, r) {
-				rework, err := e.integrateScheduledRun(runID)
+				rework, err := e.integrateScheduledRun(ctx, runID)
 				if err != nil {
+					if ctx.Err() != nil {
+						e.finishInterruptedAt(runID, generation)
+						return
+					}
 					e.finishAt(runID, generation, "failed", "合入 integration 失败："+err.Error())
 					return
 				}
@@ -139,16 +146,24 @@ func (e *Engine) execute(ctx context.Context, runID string) {
 				return
 			}
 			if hasWaiting(wf, r) {
-				if alignOnlyRun(r) {
-					e.updateRun(runID, func(current *domain.Run) {
-						if autoSucceedAlignApprovals(current, time.Now().UTC()) {
-							e.event(current, "", "gate.auto_approved", "基线对齐无需人工确认，已自动通过")
-						}
-					})
-					continue
+				waiting := false
+				updated, err := e.updateRunReplayable(runID, func(current *domain.Run) bool {
+					if current.Generation != generation || !e.ownsRun(*current) || current.Status != "running" ||
+						current.CancelRequested || current.PauseRequested || !hasWaiting(wf, *current) || len(readyNodes(wf, *current)) > 0 {
+						return false
+					}
+					waiting = !alignOnlyRun(*current)
+					if waiting {
+						current.Status = "waiting"
+					} else if autoSucceedAlignApprovals(current, time.Now().UTC()) {
+						e.event(current, "", "gate.auto_approved", "基线对齐无需人工确认，已自动通过")
+					}
+					return true
+				})
+				if err != nil || updated && waiting {
+					return
 				}
-				e.updateRun(runID, func(current *domain.Run) { current.Status = "waiting" })
-				return
+				continue
 			}
 			if hasFailed(wf, r) {
 				e.finishAt(runID, generation, "failed", pipelineFailedMessage)
@@ -324,10 +339,12 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 	defer unlock()
 	executionGeneration := currentLease.Generation
 	executionAttempt := 0
+	var attemptNode domain.NodeRun
+	continued := false
 	started := false
-	e.updateRun(runID, func(r *domain.Run) {
+	updated := e.updateRunAt(runID, false, func(r *domain.Run) {
 		nr := r.Nodes[node.ID]
-		if nr.Status != "pending" {
+		if nr == nil || nr.Status != "pending" || r.Generation != executionGeneration || r.CancelRequested || r.PauseRequested {
 			return
 		}
 		if nr.Error != "" && runtime.IsCwdMountFailure(errors.New(nr.Error)) {
@@ -338,15 +355,20 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 		started = true
 		r.Status = "running"
 		nr.Status = "running"
-		if !continuingInterruptedAttempt(nr) {
+		continued = continuingInterruptedAttempt(nr)
+		if !continued {
 			nr.Attempt++
+			nr.RunnerAttemptID = rand.Text()
+			nr.StartedAt = time.Now().UTC()
 		}
 		executionAttempt = nr.Attempt
-		nr.StartedAt = time.Now().UTC()
+		attemptNode = *nr
+		attemptNode.NodeID = node.ID
+		nr.Activity = ""
 		nr.GateResult = nil
 		e.event(r, node.ID, "node.started", node.Name+" 开始执行")
 	})
-	if !started {
+	if !updated || !started {
 		return
 	}
 	ctx, cancelNode := context.WithCancel(ctx)
@@ -359,7 +381,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 		if ctx.Err() != nil {
 			return
 		}
-		if runtime.IsSandboxInterrupt(err) {
+		if runtime.IsSandboxInterrupt(withoutScriptExitDetail(err)) {
 			e.requeueInterruptedNode(runID, node.ID, executionAttempt, executionGeneration)
 			return
 		}
@@ -370,37 +392,31 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 		return
 	}
 	if node.Type == "approval" {
-		auto := false
-		e.updateRun(runID, func(r *domain.Run) {
-			if r.SandboxID != "" {
-				r.Nodes[node.ID].SandboxID = r.SandboxID
-			}
-			if !alignOnlyRun(*r) {
-				return
-			}
-			nr := r.Nodes[node.ID]
-			nr.Status = "succeeded"
-			nr.FinishedAt = time.Now().UTC()
-			e.event(r, node.ID, "gate.auto_approved", "基线对齐无需人工确认，已自动通过")
-			auto = true
-		})
-		if auto {
-			return
-		}
-		reason := "等待人工批准"
-		if r, ok := e.repo.RunState(runID); ok {
-			if why := domain.ApprovalWaitReason(r, node.ID); why != "" {
-				reason += "：" + why
-			}
-		}
-		e.waitApproval(runID, node, reason)
+		e.waitApproval(runID, node, executionGeneration, executionAttempt)
 		return
 	}
 	current, _ := e.repo.RunState(runID)
-	current, err := e.bindPoolRunner(ctx, current, node.ID)
-	if err != nil {
-		failNode(err, false)
-		return
+	runnerAttempt := newWorkflowRunnerAttempt(runID, attemptNode, executionGeneration)
+	if continued {
+		if err := runnerAttempt.load(e.repo); err != nil {
+			failNode(err, false)
+			return
+		}
+	}
+	ctx = context.WithValue(ctx, workflowRunnerAttemptContext{}, runnerAttempt)
+	recoveringRunnerTask := len(runnerAttempt.previous) > 0
+	if recoveringRunnerTask {
+		if runnerID := e.defaultExecutionRunner(current); runnerID == "" || runnerID != runnerAttempt.previous[0].RunnerID {
+			failNode(runnerAttempt.diagnostic("the persisted task belongs to a different runner"), false)
+			return
+		}
+	} else {
+		var err error
+		current, err = e.bindPoolRunner(ctx, current, node.ID)
+		if err != nil {
+			failNode(err, false)
+			return
+		}
 	}
 	profile := domain.SandboxProfile{}
 	if current.WorkflowSnapshot.SandboxSnapshot != nil {
@@ -460,7 +476,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 	// the control-plane sandbox; when the Agent is bound to a CLI Runner
 	// (执行器) it is dispatched to that machine so gates run next to the CLI
 	// output in the runner-side task workspace.
-	gateExec := func(command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
+	gateExec := func(_ string, command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
 		spec, err := runtime.CommandSpecWithCredentialEnv(runtime.CommandSpec{Argv: []string{"sh", "-lc", bindExecutionTarget(command, target)}, Provider: "verification", CredentialBindings: []runtime.CredentialBinding{runtime.BindGit, runtime.BindMCP}}, node.CredentialEnv, sb.credentialSnapshot())
 		if err != nil {
 			return "", err
@@ -510,7 +526,13 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 	}
 	var reported *reportedOutputs
 	artifactContext := ""
-	if runner, ok := e.repo.Runner(e.defaultExecutionRunner(current)); ok && runner.SupportsReportedOutputs() {
+	runner, _ := e.repo.Runner(e.defaultExecutionRunner(current))
+	supportsReportedOutputs := runner.SupportsReportedOutputs()
+	if recoveringRunnerTask {
+		invocation := runnerAttempt.previous[0].Invocation
+		supportsReportedOutputs = invocation != nil && invocation.ReportOutputs
+	}
+	if supportsReportedOutputs {
 		var inputs []domain.RunnerInputFile
 		artifactContext, inputs = runnerArtifactInputs(wf, node, current)
 		reported = sb.beginReportedOutputs(node.ID, inputs)
@@ -551,7 +573,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			return
 		}
 	}
-	if domain.IsPreviewBuildNode(node.ID) {
+	if domain.IsPreviewBuildNode(node.ID) && !recoveringRunnerTask {
 		found, evidence := false, ""
 		if facts, ok := e.RunWorkspaceFacts(runID); reported != nil && ok {
 			found, evidence = facts.Frontend, facts.FrontendEvidence
@@ -566,7 +588,9 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			return
 		}
 	}
-	if repositoryFallback == "" {
+	// Workspace preparation happened before the durable dispatch and can be
+	// fenced by the task still running on the same workspace.
+	if repositoryFallback == "" && !recoveringRunnerTask {
 		_, preparationErr := e.PrepareNodeWorkspace(ctx, current, sb)
 		if preparationErr != nil {
 			// A remote execution machine prepares its own checkout. Let its
@@ -638,13 +662,17 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			if language == "python" {
 				command = "python3 -c " + shellSingleQuote(script)
 			}
+			var exitCode *int
 			rawOutput, runErr := executeForTargets(current, node.ExecutionScope, func(target executionTarget) (string, error) {
+				exitCode = nil
 				bound := bindExecutionTarget(command, target)
 				targetSink := executionTargetSink(sink, target)
 				scriptAssets := e.resolveScriptMCPAssets(current.ExecutionContext.ProjectID, current.ExecutionContext.ResponsibleUserID)
 				if execMachine := e.defaultExecutionRunner(current); execMachine != "" {
 					workspace := runnerWorkspaceRel(current, node.ID)
-					return e.dispatchRunnerScript(ctx, execMachine, current, node.ID, workspace, "shell", bound, target.directory(), effectiveNode.ArtifactOutputs, sb, sb.credentialSnapshot().GitHTTPCredentials["github.com"].Token, sb.credentialSnapshot().GitUserName, sb.credentialSnapshot().GitUserEmail, scriptAssets, targetSink)
+					output, code, err := e.dispatchRunnerScript(ctx, execMachine, current, node.ID, workspace, "shell", bound, target.directory(), effectiveNode.ArtifactOutputs, sb, sb.credentialSnapshot().GitHTTPCredentials["github.com"].Token, sb.credentialSnapshot().GitUserName, sb.credentialSnapshot().GitUserEmail, scriptAssets, targetSink)
+					exitCode = code
+					return output, err
 				}
 				if err := runtime.ProvisionMCPAssets(ctx, sb, sb.Workspace(), scriptAssets, targetSink); err != nil {
 					return "", err
@@ -653,12 +681,36 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				if err != nil {
 					return "", err
 				}
-				return sb.Exec(ctx, scriptSpec, targetSink)
+				var code int
+				var observedExit bool
+				output, execErr := sb.Exec(ctx, scriptSpec, func(event domain.TelemetryEvent) {
+					if event.Name == "process.finished" {
+						code, observedExit = event.Attributes["exitCode"].(int)
+						observedExit = observedExit && code >= 0 && (code != 0 || event.Level != "error")
+					}
+					targetSink(event)
+				})
+				// Exec can fail during sandbox preparation, before the script process starts.
+				var processErr *exec.ExitError
+				cleanupCode, cleanupFailed := runtime.SandboxExitBeforeCleanupFailure(execErr)
+				switch {
+				case cleanupFailed:
+					exitCode = cleanupCode
+					if cleanupCode != nil {
+						execErr = scriptExitError{code: *cleanupCode, detail: execErr.Error()}
+					}
+				case observedExit && code == 0:
+					exitCode = &code
+				case observedExit && errors.As(execErr, &processErr) && processErr.ExitCode() == code:
+					exitCode = &code
+					execErr = fmt.Errorf("%w: %w", scriptExitError{code: code}, execErr)
+				}
+				return output, execErr
 			})
 			if execMachine := e.defaultExecutionRunner(current); execMachine != "" {
 				workspace := runnerWorkspaceRel(current, node.ID)
-				gateExec = func(command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
-					return e.dispatchRunnerCommand(ctx, execMachine, runID, node.ID, workspace, bindExecutionTarget(command, target), gateSink)
+				gateExec = func(gateKey, command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
+					return e.dispatchRunnerCommand(ctx, execMachine, runID, node.ID, workspace, bindExecutionTarget(command, target), gateSink, gateKey)
 				}
 			}
 			if runErr == nil && node.RunOnWorkspaceRebuild {
@@ -671,10 +723,14 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			if runErr != nil {
 				status, level = "失败", "error"
 			}
+			attributes := map[string]any{"language": language, "status": status, "durationMs": duration.Milliseconds(), "outputBytes": len(rawOutput)}
+			if exitCode != nil {
+				attributes["exitCode"] = *exitCode
+			}
 			sink(domain.TelemetryEvent{
 				Category: "script", Name: "script.completed", Phase: "finish", Level: level,
 				Message:    fmt.Sprintf("%s 脚本执行%s · %d ms · 输出 %d bytes", scriptLanguageLabel(language), status, duration.Milliseconds(), len(rawOutput)),
-				Attributes: map[string]any{"language": language, "status": status, "durationMs": duration.Milliseconds(), "outputBytes": len(rawOutput)},
+				Attributes: attributes,
 			})
 			if strings.TrimSpace(rawOutput) == "" {
 				rawOutput = fmt.Sprintf("# 脚本执行结果\n\n- 语言：%s\n- 状态：%s\n- 耗时：%d ms\n- 标准输出：无\n", scriptLanguageLabel(language), status, duration.Milliseconds())
@@ -752,6 +808,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				if resumeFeedback != "" {
 					prompt += "\n\n操作员补充了以下信息，请结合它继续：\n\n" + resumeFeedback
 				}
+				prompt = appendNodeAgentInstructions(prompt, effectiveNode)
 			}
 			if requiresSubmit {
 				prompt = appendSubmitGateInstruction(prompt, node.RejectTo, feedback == gateMissingRetryMarker)
@@ -784,8 +841,8 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				workspace := runnerWorkspaceRel(current, node.ID)
 				result, dispatchErr := e.dispatchRunnerTask(ctx, execMachine, current, effectiveNode, sb, workspace, ex, agent, assets, prompt, invocationID, options, sink)
 				if dispatchErr == nil {
-					gateExec = func(command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
-						return e.dispatchRunnerCommand(ctx, execMachine, runID, node.ID, workspace, bindExecutionTarget(command, target), gateSink)
+					gateExec = func(gateKey, command string, target executionTarget, gateSink runtime.EventSink) (string, error) {
+						return e.dispatchRunnerCommand(ctx, execMachine, runID, node.ID, workspace, bindExecutionTarget(command, target), gateSink, gateKey)
 					}
 				}
 				return result, dispatchErr
@@ -834,10 +891,10 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			}
 		}
 		output, err = runOnce(loopFeedback)
-		if e.dropLostCLISession(runID, node.ID, output, err) {
+		if requiresSubmit && e.dropLostCLISession(runID, node.ID, output, err) {
 			output, err = runOnce("")
 		}
-		if err != nil && strings.Contains(err.Error(), "without a terminal result") {
+		if requiresSubmit && err != nil && strings.Contains(err.Error(), "without a terminal result") {
 			e.observe(runID, node.ID, domain.TelemetryEvent{Category: "orchestration", Name: "agent.loop", Phase: "finish", Message: "执行器未返回 result，按工作区产物继续门禁，不再重跑 Agent", Attributes: map[string]any{"iteration": iteration}})
 			err = nil
 		}
@@ -927,16 +984,17 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			}
 		}
 		if err == nil {
-			for _, candidate := range gates {
+			for gateIndex, candidate := range gates {
 				gate := candidate.gate
 				if strings.EqualFold(gate.Mode, "manual") || strings.EqualFold(gate.Mode, "submit") {
 					continue
 				}
+				gateKey := fmt.Sprintf("%d/%d/%s", iteration, gateIndex, gate.ID)
 				if strings.EqualFold(gate.Mode, domain.VerificationModeMR) {
 					live, _ := e.repo.RunState(runID)
 					mrErr := e.verifyRunMRs(live, gitTok, func(rc domain.RepositoryContext) (pushedWork, error) {
 						target := executionTarget{Scope: domain.ExecutionScopeRepositories, Repository: &rc}
-						out, execErr := gateExec(mrPendingCommand, target, executionTargetSink(func(event domain.TelemetryEvent) {
+						out, execErr := gateExec(gateKey, mrPendingCommand, target, executionTargetSink(func(event domain.TelemetryEvent) {
 							event.Category = "verification"
 							sink(event)
 						}, target))
@@ -984,7 +1042,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 					sink(event)
 				}
 				verifyOutput, verifyErr := executeForTargets(current, gate.ExecutionScope, func(target executionTarget) (string, error) {
-					return gateExec(gateCmd, target, executionTargetSink(gateSink, target))
+					return gateExec(gateKey, gateCmd, target, executionTargetSink(gateSink, target))
 				})
 				if verifyErr != nil {
 					detail := strings.TrimSpace(verifyOutput)
@@ -1003,7 +1061,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 				}
 			}
 		}
-		if err == nil || iteration == maxIterations || ctx.Err() != nil {
+		if err == nil || iteration == maxIterations || ctx.Err() != nil || isRunnerUnavailableBeforeClaim(err) || runnerAttempt.err != nil {
 			break
 		}
 		if failedAction != "loop" {
@@ -1013,32 +1071,33 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 		loopFeedback = err.Error()
 		e.observe(runID, node.ID, domain.TelemetryEvent{Category: "orchestration", Name: "agent.loop", Phase: "progress", Message: fmt.Sprintf("第 %d 轮未通过，进入自修正", iteration), Attributes: map[string]any{"iteration": iteration, "maxIterations": maxIterations, "feedback": loopFeedback}})
 	}
+	if runnerAttempt.err != nil {
+		err = runnerAttempt.err
+	} else if runnerAttempt.next < len(runnerAttempt.previous) {
+		err = runnerAttempt.diagnostic("the workflow did not reach its remaining durable operations")
+	}
 	e.attachLoopRetro(runID, node.ID, retroWorkspace, lastIteration, err, failedAction)
 	if err != nil {
 		e.freezeAvailableArtifacts(runID, effectiveNode, sb.Workspace(), reported, output)
-		if ctx.Err() != nil || runtime.IsSandboxInterrupt(err) {
+		if isRunnerUnavailableBeforeClaim(err) || isRunnerTaskRecoveryError(err) {
+			failNode(err, false)
+			return
+		}
+		if ctx.Err() != nil || runtime.IsSandboxInterrupt(withoutScriptExitDetail(err)) {
 			if ctx.Err() == nil {
 				e.requeueInterruptedNode(runID, node.ID, executionAttempt, executionGeneration)
 			}
 			return
 		}
-		if isMaxTurnsErr(err) {
-			e.updateRun(runID, func(r *domain.Run) {
-				nr := r.Nodes[node.ID]
-				if !shouldCommitNodeOutcome(*r, nr, executionGeneration, executionAttempt, false) {
-					return
-				}
+		if requiresSubmit && isMaxTurnsErr(err) {
+			e.updateNodeOutcome(runID, node.ID, executionGeneration, executionAttempt, false, func(r *domain.Run, nr *domain.NodeRun) {
 				nr.Output, nr.Error, nr.Status, nr.Activity, nr.FinishedAt = output, err.Error(), "waiting_approval", "对话轮次用尽，等待确认是否重试", time.Now().UTC()
 				e.event(r, node.ID, "agent.turns.exhausted", "对话轮次已用尽，请确认是否重试本节点")
 			})
 			return
 		}
 		if failedAction == "human" {
-			e.updateRun(runID, func(r *domain.Run) {
-				nr := r.Nodes[node.ID]
-				if !shouldCommitNodeOutcome(*r, nr, executionGeneration, executionAttempt, false) {
-					return
-				}
+			e.updateNodeOutcome(runID, node.ID, executionGeneration, executionAttempt, false, func(r *domain.Run, nr *domain.NodeRun) {
 				nr.Output, nr.Error, nr.Status, nr.Activity, nr.FinishedAt = output, err.Error(), "waiting_approval", "等待人工确认", time.Now().UTC()
 				message := "Agent 请求人工确认"
 				if nr.GateResult != nil && strings.TrimSpace(nr.GateResult.ActionRequired) != "" {
@@ -1051,11 +1110,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			return
 		}
 		if maxIterations > 1 && loopOnExhausted == "human" {
-			e.updateRun(runID, func(r *domain.Run) {
-				nr := r.Nodes[node.ID]
-				if !shouldCommitNodeOutcome(*r, nr, executionGeneration, executionAttempt, false) {
-					return
-				}
+			e.updateNodeOutcome(runID, node.ID, executionGeneration, executionAttempt, false, func(r *domain.Run, nr *domain.NodeRun) {
 				nr.Output, nr.Error, nr.Status, nr.FinishedAt = output, err.Error(), "waiting_approval", time.Now().UTC()
 				e.event(r, node.ID, "agent.loop.exhausted", "Agent 自修正次数已耗尽，转人工判断："+err.Error())
 			})
@@ -1083,11 +1138,7 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 	if !shouldCommitNodeOutcome(current, current.Nodes[node.ID], executionGeneration, executionAttempt, true) {
 		return
 	}
-	e.updateRun(runID, func(r *domain.Run) {
-		nr := r.Nodes[node.ID]
-		if !shouldCommitNodeOutcome(*r, nr, executionGeneration, executionAttempt, true) {
-			return
-		}
+	updated, _ = e.updateNodeOutcome(runID, node.ID, executionGeneration, executionAttempt, true, func(r *domain.Run, nr *domain.NodeRun) {
 		r.Artifacts = append(r.Artifacts, artifacts...)
 		nr.Output = output
 		nr.Error = ""
@@ -1101,6 +1152,9 @@ func (e *Engine) executeNode(ctx context.Context, runID string, wf domain.Workfl
 			e.event(r, node.ID, "node.succeeded", node.Name+" 已完成")
 		}
 	})
+	if !updated {
+		return
+	}
 	for _, artifact := range artifacts {
 		e.observe(runID, node.ID, domain.TelemetryEvent{Category: "artifact", Name: "artifact.published", Phase: "finish", Message: artifact.Name, Attributes: map[string]any{"artifactId": artifact.ID, "path": artifact.Path, "mediaType": artifact.MediaType, "size": artifact.Size, "sha256": artifact.SHA256}})
 	}
@@ -1135,9 +1189,6 @@ func (e *Engine) completeSkippedPreviewBuild(runID string, node domain.WorkflowN
 	if extra := strings.TrimSpace(evidence); extra != "" {
 		reason = reason + "（" + extra + "）"
 	}
-	if e.preview != nil {
-		e.preview.Skip(current, reason)
-	}
 	output := "# 前端预览\n\n已跳过：工作区没有可构建的前端工程。业务交付不受影响。\n"
 	if extra := strings.TrimSpace(evidence); extra != "" {
 		output += "\n" + extra + "\n"
@@ -1145,17 +1196,16 @@ func (e *Engine) completeSkippedPreviewBuild(runID string, node domain.WorkflowN
 	e.observe(runID, node.ID, domain.TelemetryEvent{
 		Category: "preview", Name: "preview.skipped", Phase: "finish", Message: reason,
 	})
-	e.updateRun(runID, func(r *domain.Run) {
-		nr := r.Nodes[node.ID]
-		if !shouldCommitNodeOutcome(*r, nr, executionGeneration, executionAttempt, true) {
-			return
-		}
+	updated, _ := e.updateNodeOutcome(runID, node.ID, executionGeneration, executionAttempt, true, func(r *domain.Run, nr *domain.NodeRun) {
 		nr.Output = output
 		nr.Error = ""
 		nr.Status = "succeeded"
 		nr.FinishedAt = time.Now().UTC()
 		e.event(r, node.ID, "node.succeeded", node.Name+" 已跳过（非前端仓库）")
 	})
+	if updated && e.preview != nil {
+		e.preview.Skip(current, reason)
+	}
 }
 
 func scriptLanguageLabel(language string) string {
@@ -1211,7 +1261,11 @@ func clipHumanGateDetail(detail string) string {
 	if len(detail) <= limit {
 		return detail
 	}
-	return detail[:limit] + "…"
+	end := limit
+	for end > 0 && !utf8.RuneStart(detail[end]) {
+		end--
+	}
+	return detail[:end] + "…"
 }
 
 // joinGateCommands binds each configured gate command against the node's

@@ -33,15 +33,19 @@ func (e *Engine) persistControlDecision(runID string, r domain.Run, expected ...
 	if err != nil {
 		return err
 	}
-	e.publish(runID)
+	e.resumeAfterDecision(r)
+	return nil
+}
+
+func (e *Engine) resumeAfterDecision(r domain.Run) {
+	e.publish(r.ID)
 	if e.executes() {
-		e.resume(runID)
-		return nil
+		e.resume(r.ID)
+		return
 	}
 	if r.OwnerInstanceID != "" {
-		_ = e.repo.ReleaseRunLease(runID, r.OwnerInstanceID, r.Generation)
+		_ = e.repo.ReleaseRunLease(r.ID, r.OwnerInstanceID, r.Generation)
 	}
-	return nil
 }
 
 func (e *Engine) Cancel(runID string) error {
@@ -98,7 +102,7 @@ func (e *Engine) Cancel(runID string) error {
 	if err != nil {
 		return nil
 	}
-	e.settleOrphan(runID, "运行已被手动终止（调度协程不存在，可能由服务重启导致）")
+	e.finishAt(runID, r.Generation, "cancelled", "运行已被手动终止（调度协程不存在，可能由服务重启导致）")
 	_ = e.repo.ReleaseRunLease(runID, e.instanceID, r.Generation)
 	return nil
 }
@@ -324,10 +328,10 @@ func (e *Engine) Reject(runID string, req domain.RejectRequest, expected ...Node
 				// attempt is abandoned, and the rerun must count as a new attempt
 				// rather than continue the interrupted one.
 				interrupted[id] = true
-				nr.Activity = ""
 			}
 			nr.Status = "pending"
 			nr.Error = ""
+			nr.Activity = ""
 			nr.Output = ""
 			nr.ChildRunID = ""
 			nr.FinishedAt = time.Time{}
@@ -586,6 +590,7 @@ func (e *Engine) retryContext(ctx context.Context, runID, nodeID, reason, humanC
 			}
 			nr.Status = "pending"
 			nr.Error = ""
+			nr.Activity = ""
 			nr.Output = ""
 			nr.ChildRunID = ""
 			if id == nodeID {
@@ -699,6 +704,9 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 	if r.Status != "waiting" || !r.PauseRequested {
 		return fmt.Errorf("run is not paused")
 	}
+	if r.CancelRequested {
+		return repo.ErrRunDecisionStale
+	}
 	if e.executes() && e.workspaceBlocked(r) {
 		return fmt.Errorf("run %s 的工作区绑定在 %s:%s，请在绑定实例上继续", runID, r.WorkspaceHost, r.WorkspaceRoot)
 	}
@@ -709,26 +717,7 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 	if len(activeRunnerTasks) > 0 {
 		return fmt.Errorf("执行机器仍在停止当前任务，请等待远端进程退出后再继续")
 	}
-	paused := make([]string, 0)
-	for id, nr := range r.Nodes {
-		if isUserPausedNode(nr) {
-			paused = append(paused, id)
-		}
-	}
-	// Returning from group mode deliberately leaves a pending SOP node, rather
-	// than an interrupted worker. Recognize that explicit checkpoint, including
-	// records created before this fix, without approving ordinary human gates.
-	if len(paused) == 0 && !r.IsWorkspace() {
-		for i := len(r.Events) - 1; i >= 0; i-- {
-			ev := r.Events[i]
-			if ev.Type == "group.sop_restored" {
-				if nr := r.Nodes[ev.NodeID]; nr != nil && nr.Status == "pending" && nr.Activity == "切回 SOP，等待继续" && replayUpstreamSucceeded(r, ev.NodeID) {
-					paused = append(paused, ev.NodeID)
-				}
-				break
-			}
-		}
-	}
+	paused := pausedResumeNodes(r)
 	if len(paused) == 0 {
 		// Pause can land after the active step has already finished: the last
 		// node succeeded and the scheduler exited, or group collaboration was
@@ -742,10 +731,29 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 		if !resumed {
 			return fmt.Errorf("paused node not found")
 		}
+		releaseLease := false
 		if e.executes() && r.Status == "running" {
 			r, err = e.acquireLease(r)
 			if err != nil {
 				return err
+			}
+			releaseLease = true
+			defer func() {
+				if releaseLease {
+					_ = e.repo.ReleaseRunLease(runID, e.instanceID, r.Generation)
+				}
+			}()
+			if err := checkNodeExpectation(r, expected); err != nil {
+				return err
+			}
+			if r.Status != "waiting" || !r.PauseRequested || r.CancelRequested {
+				return repo.ErrRunDecisionStale
+			}
+			if resumed, err := resumeUnpausedGraph(&r); err != nil || !resumed {
+				if err != nil {
+					return err
+				}
+				return repo.ErrRunDecisionStale
 			}
 		}
 		message := "人工确认直接继续运行"
@@ -754,16 +762,42 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 		}
 		e.event(&r, "", "run.resumed", message)
 		appendControlTelemetry(&r, "", "run.resumed", message)
+		if releaseLease {
+			err = e.repo.PutLeasedRunAtRevision(r, e.instanceID)
+		} else {
+			err = e.repo.PutRunAtRevision(r, r.Revision)
+		}
+		if err != nil {
+			return err
+		}
+		releaseLease = false
 		if r.Status == "running" {
 			markRunRelationsRunning(e.repo, r)
 		}
-		return e.persistControlDecision(runID, r, expected...)
+		e.resumeAfterDecision(r)
+		return nil
 	}
+	releaseLease := false
 	if e.executes() {
-		var err error
 		r, err = e.acquireLease(r)
 		if err != nil {
 			return err
+		}
+		releaseLease = true
+		defer func() {
+			if releaseLease {
+				_ = e.repo.ReleaseRunLease(runID, e.instanceID, r.Generation)
+			}
+		}()
+		if err := checkNodeExpectation(r, expected); err != nil {
+			return err
+		}
+		if r.Status != "waiting" || !r.PauseRequested || r.CancelRequested {
+			return repo.ErrRunDecisionStale
+		}
+		paused = pausedResumeNodes(r)
+		if len(paused) == 0 {
+			return repo.ErrRunDecisionStale
 		}
 	}
 	sort.Strings(paused)
@@ -808,8 +842,18 @@ func (e *Engine) resumePaused(runID, humanContext string, expected ...NodeExpect
 	}
 	e.event(&r, paused[0], "run.resumed", message)
 	appendControlTelemetry(&r, paused[0], "run.resumed", message)
+	if releaseLease {
+		err = e.repo.PutLeasedRunAtRevision(r, e.instanceID)
+	} else {
+		err = e.repo.PutRunAtRevision(r, r.Revision)
+	}
+	if err != nil {
+		return err
+	}
+	releaseLease = false
 	markRunRelationsRunning(e.repo, r)
-	return e.persistControlDecision(runID, r, expected...)
+	e.resumeAfterDecision(r)
+	return nil
 }
 
 // RefreshRunSOP replaces a stopped Run's frozen graph with the latest
@@ -866,6 +910,30 @@ func (e *Engine) RefreshRunSOP(runID string) error {
 	}
 	e.publish(runID)
 	return nil
+}
+
+func pausedResumeNodes(r domain.Run) []string {
+	paused := make([]string, 0)
+	for id, nr := range r.Nodes {
+		if isUserPausedNode(nr) {
+			paused = append(paused, id)
+		}
+	}
+	// Returning from group mode deliberately leaves a pending SOP node, rather
+	// than an interrupted worker. Recognize that explicit checkpoint, including
+	// records created before this fix, without approving ordinary human gates.
+	if len(paused) == 0 && !r.IsWorkspace() {
+		for i := len(r.Events) - 1; i >= 0; i-- {
+			ev := r.Events[i]
+			if ev.Type == "group.sop_restored" {
+				if nr := r.Nodes[ev.NodeID]; nr != nil && nr.Status == "pending" && nr.Activity == "切回 SOP，等待继续" && replayUpstreamSucceeded(r, ev.NodeID) {
+					paused = append(paused, ev.NodeID)
+				}
+				break
+			}
+		}
+	}
+	return paused
 }
 
 func isUserPausedNode(nr *domain.NodeRun) bool {

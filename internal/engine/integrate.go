@@ -3,8 +3,12 @@ package engine
 import (
 	"agentflow/internal/domain"
 	"agentflow/internal/gitwork"
+	"agentflow/internal/repo"
+	"agentflow/internal/runtime"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -50,29 +54,39 @@ func lockIntegration(locks IntegrationLocker, id string) (func(), error) {
 // integrateScheduledRun merges each repository's work branch into its
 // integration branch once a scheduled run succeeded. It reports true when a
 // conflict sent the run back to a repair node.
-func (e *Engine) integrateScheduledRun(id string) (bool, error) {
+func (e *Engine) integrateScheduledRun(ctx context.Context, id string) (bool, error) {
 	r, ok := e.repo.RunState(id)
-	if !ok || strings.TrimSpace(r.ExecutionContext.ScheduleJobID) == "" {
+	if !ok || !scheduledIntegratePending(r) {
 		return false, nil
 	}
-	repositories := r.RepositoryContexts()
-	if len(repositories) == 0 {
-		return false, nil
+	if r.PauseRequested || r.CancelRequested {
+		return false, context.Canceled
 	}
-	e.runEnvMu.Lock()
-	env := e.runEnvs[id]
-	e.runEnvMu.Unlock()
-	if env == nil {
-		return false, fmt.Errorf("run sandbox missing")
-	}
-	credentials := env.credentialSnapshot()
-	ctx := withGitIdentity(context.Background(), credentials.GitUserName, credentials.GitUserEmail)
-	ctx = withRunGitCredentials(ctx, credentials)
-	ctx = gitwork.WithSSHKeys(ctx, credentials.GitSSHKeys)
 	runner, onRunner, err := e.integrationRunner(r)
 	if err != nil {
 		return false, err
 	}
+	e.runEnvMu.Lock()
+	env := e.runEnvs[id]
+	e.runEnvMu.Unlock()
+	if env == nil && !onRunner {
+		// Integration uses the existing checkout directly, without restarting
+		// the workflow's process sandbox on a new owner.
+		profile := domain.SandboxProfile{ID: "local", Driver: "local"}
+		env, _, err = e.acquireRunEnvironment(ctx, r, profile, runtime.SandboxRequirements{})
+		if err != nil {
+			return false, fmt.Errorf("restore integration workspace: %w", err)
+		}
+	}
+	var credentials runtime.RunCredentials
+	if env != nil {
+		credentials = env.credentialSnapshot()
+	} else {
+		credentials = e.resolveRunCredentials(r)
+	}
+	ctx = withGitIdentity(ctx, credentials.GitUserName, credentials.GitUserEmail)
+	ctx = withRunGitCredentials(ctx, credentials)
+	ctx = gitwork.WithSSHKeys(ctx, credentials.GitSSHKeys)
 	if !onRunner {
 		if missing := e.verifyDeliveryCompleteness(r, env.Workspace()); len(missing) > 0 {
 			e.updateRun(id, func(c *domain.Run) {
@@ -80,7 +94,7 @@ func (e *Engine) integrateScheduledRun(id string) (bool, error) {
 			})
 		}
 	}
-	for _, rc := range repositories {
+	for _, rc := range r.RepositoryContexts() {
 		ctx := withRepositoryGit(ctx, rc)
 		b, w := strings.TrimSpace(rc.IntegrateBranch), strings.TrimSpace(rc.WorkBranch)
 		if b == "" || w == "" {
@@ -88,6 +102,10 @@ func (e *Engine) integrateScheduledRun(id string) (bool, error) {
 		}
 		unlock, err := lockIntegration(e.repo, rc.RepositoryID)
 		if err != nil {
+			return false, err
+		}
+		if err := ctx.Err(); err != nil {
+			unlock()
 			return false, err
 		}
 		var conflicts []string
@@ -100,6 +118,10 @@ func (e *Engine) integrateScheduledRun(id string) (bool, error) {
 			}
 		} else {
 			workspace := repositoryWorkspacePath(env.Workspace(), rc)
+			if _, err := os.Stat(filepath.Join(workspace, ".git")); err != nil {
+				unlock()
+				return false, fmt.Errorf("integration checkout %s: %w", rc.RepositoryID, err)
+			}
 			conflicts, err = integrateLocally(ctx, r, workspace, rc)
 			pushDirect = func() error {
 				_, err := gitC(ctx, workspace, "push", "origin", "HEAD:refs/heads/"+b)
@@ -107,7 +129,7 @@ func (e *Engine) integrateScheduledRun(id string) (bool, error) {
 			}
 		}
 		if err == nil && len(conflicts) > 0 {
-			err = e.requeueIntegrationConflict(id, rc.IntegrateBranch, conflicts)
+			err = e.requeueIntegrationConflict(r, rc.IntegrateBranch, conflicts)
 			unlock()
 			return err == nil, err
 		}
@@ -239,11 +261,7 @@ func mergeLatestRemoteBranch(ctx context.Context, w, branch string) ([]string, e
 	return gitwork.MergeLatestRemoteBranch(ctx, w, branch)
 }
 
-func (e *Engine) requeueIntegrationConflict(id, targetBranch string, files []string) error {
-	r, ok := e.repo.RunState(id)
-	if !ok {
-		return fmt.Errorf("run not found")
-	}
+func (e *Engine) requeueIntegrationConflict(r domain.Run, targetBranch string, files []string) error {
 	if r.Repository.IntegrationReworks >= maxIntegrationReworks {
 		return fmt.Errorf("integration conflict unresolved after %d attempts: %s", maxIntegrationReworks, strings.Join(files, ","))
 	}
@@ -251,22 +269,28 @@ func (e *Engine) requeueIntegrationConflict(id, targetBranch string, files []str
 	if target == "" || r.Nodes[target] == nil {
 		return fmt.Errorf("workflow has no repair agent")
 	}
-	reset := descendants(r.WorkflowSnapshot, target)
-	reset[target] = true
 	targetBranch = strings.TrimSpace(targetBranch)
 	if targetBranch == "" {
 		targetBranch = r.Repository.IntegrateBranch
 	}
 	feedback := fmt.Sprintf("合入 %s 时发生冲突（第 %d/%d 次）：%s。请保留前序需求的有效实现，解决全部 Git 冲突并完成 git add/commit；下游评审、测试和 MR 会重新执行。", targetBranch, r.Repository.IntegrationReworks+1, maxIntegrationReworks, strings.Join(files, ","))
 	var stale []string
-	e.updateRun(id, func(c *domain.Run) {
+	updated, err := e.updateRunReplayable(r.ID, func(c *domain.Run) bool {
+		if c.Generation != r.Generation || c.OwnerInstanceID != r.OwnerInstanceID || c.Status != "running" ||
+			c.PauseRequested || c.CancelRequested || c.Repository.IntegrationReworks != r.Repository.IntegrationReworks ||
+			!allSucceeded(c.WorkflowSnapshot, *c) || integrationRepairNode(c.WorkflowSnapshot) != target {
+			return false
+		}
 		stale = stale[:0]
+		reset := descendants(c.WorkflowSnapshot, target)
+		reset[target] = true
 		c.Repository.IntegrationReworks++
 		for n := range reset {
 			if nr := c.Nodes[n]; nr != nil {
 				stale = append(stale, nr.ChildRunID)
 				nr.Status = "pending"
 				nr.Error = ""
+				nr.Activity = ""
 				nr.Output = ""
 				nr.ChildRunID = ""
 				nr.FinishedAt = time.Time{}
@@ -281,7 +305,14 @@ func (e *Engine) requeueIntegrationConflict(id, targetBranch string, files []str
 		c.Status = "running"
 		e.event(c, target, "integration.conflict", feedback)
 		appendControlTelemetry(c, target, "integration.conflict", feedback)
+		return true
 	})
+	if err != nil {
+		return err
+	}
+	if !updated {
+		return repo.ErrRunDecisionStale
+	}
 	e.cancelLiveChildRuns(stale)
 	return nil
 }

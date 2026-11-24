@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"path"
 	"strings"
 	"sync"
@@ -15,14 +16,13 @@ import (
 	"agentflow/internal/runtime"
 )
 
-// runSandboxIdleTTL closes a shared sandbox no task has used for this long:
-// failed runs that are never deleted get no cleanup_run. A later task of the
-// run recreates it over the same workspace.
+// runSandboxIdleTTL releases compute resources for a shared sandbox after
+// this much inactivity. Docker retains its writable layer for the next task.
 const runSandboxIdleTTL = 30 * time.Minute
 
 // runSandbox is a sandbox shared by every task of one run with the same
 // sandbox definition, like the persistent per-run container of the cloud
-// path. cleanup_run, the idle reaper or daemon shutdown closes it.
+// path. cleanup_run and daemon shutdown close it.
 type runSandbox struct {
 	runID    string
 	mu       sync.Mutex
@@ -69,13 +69,17 @@ func (d *Daemon) acquireTaskSandbox(ctx context.Context, task domain.RunnerTask)
 	}
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
+	workspace := d.taskWorkspace(task)
 	if entry.sandbox == nil {
-		sandbox, err := runtime.OpenRemoteSandbox(ctx, id, d.taskWorkspace(task), task.Sandbox.Profile, requirements, resources)
+		sandbox, err := runtime.OpenRemoteSandbox(ctx, id, workspace, task.Sandbox.Profile, requirements, resources)
 		if err != nil {
 			release()
 			return nil, nil, err
 		}
 		entry.sandbox = sandbox
+	} else if entry.sandbox.Workspace() != workspace {
+		release()
+		return nil, nil, fmt.Errorf("shared sandbox %s is bound to a different run workspace", entry.sandbox.ID())
 	}
 	return entry.sandbox, release, nil
 }
@@ -85,24 +89,77 @@ func (d *Daemon) closeRunSandboxes(ctx context.Context, runID string) {
 	d.closeSharedSandboxes(ctx, func(entry *runSandbox) bool { return entry.runID == runID })
 }
 
-// touchRunSandboxes counts operating the panel browser as use, so the idle
-// reaper does not close a sandbox whose browser a person is driving.
-func (d *Daemon) touchRunSandboxes(runID string) {
+// holdRunSandboxes keeps a panel browser action from racing idle cleanup.
+func (d *Daemon) holdRunSandboxes(runID string) func() {
 	d.runSandboxMu.Lock()
-	defer d.runSandboxMu.Unlock()
+	var entries []*runSandbox
 	for _, entry := range d.runSandboxes {
-		if entry.runID == runID && !entry.lastUsed.IsZero() {
-			entry.lastUsed = time.Now()
+		if entry.runID == runID {
+			entry.active++
+			entries = append(entries, entry)
+		}
+	}
+	d.runSandboxMu.Unlock()
+	for _, entry := range entries {
+		entry.mu.Lock()
+		entry.mu.Unlock()
+	}
+	return func() {
+		d.runSandboxMu.Lock()
+		defer d.runSandboxMu.Unlock()
+		now := time.Now()
+		for _, entry := range entries {
+			entry.active--
+			entry.lastUsed = now
 		}
 	}
 }
 
-// reapIdleRunSandboxes closes shared sandboxes unused for longer than idle.
+// reapIdleRunSandboxes parks Docker containers and closes other idle sandboxes.
 func (d *Daemon) reapIdleRunSandboxes(ctx context.Context, idle time.Duration) {
 	cutoff := time.Now().Add(-idle)
-	d.closeSharedSandboxes(ctx, func(entry *runSandbox) bool {
-		return entry.active == 0 && !entry.lastUsed.IsZero() && entry.lastUsed.Before(cutoff)
-	})
+	d.runSandboxMu.Lock()
+	candidates := make(map[string]*runSandbox)
+	for key, entry := range d.runSandboxes {
+		if entry.idleBefore(cutoff) {
+			candidates[key] = entry
+		}
+	}
+	d.runSandboxMu.Unlock()
+	for key, entry := range candidates {
+		if ctx.Err() != nil {
+			return
+		}
+		d.parkIdleRunSandbox(ctx, key, entry, cutoff)
+	}
+}
+
+// idleBefore is read under runSandboxMu.
+func (entry *runSandbox) idleBefore(cutoff time.Time) bool {
+	return entry.active == 0 && !entry.lastUsed.IsZero() && entry.lastUsed.Before(cutoff)
+}
+
+func (d *Daemon) parkIdleRunSandbox(ctx context.Context, key string, entry *runSandbox, cutoff time.Time) {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	d.runSandboxMu.Lock()
+	if d.runSandboxes[key] != entry || !entry.idleBefore(cutoff) {
+		d.runSandboxMu.Unlock()
+		return
+	}
+	if sandbox, ok := entry.sandbox.(interface{ Park(context.Context) error }); ok {
+		d.runSandboxMu.Unlock()
+		if err := sandbox.Park(ctx); err != nil {
+			log.Printf("park run %s sandbox: %v", entry.runID, err)
+		}
+		return
+	}
+	delete(d.runSandboxes, key)
+	d.runSandboxMu.Unlock()
+	if entry.sandbox != nil {
+		_ = entry.sandbox.Close(ctx)
+		entry.sandbox = nil
+	}
 }
 
 // closeAllRunSandboxes runs on shutdown: a restarted daemon no longer knows
@@ -236,7 +293,7 @@ func (d *Daemon) acquireExistingTaskSandbox(task domain.RunnerTask) (runtime.San
 	entry.mu.Lock()
 	sb := entry.sandbox
 	entry.mu.Unlock()
-	if sb == nil {
+	if sb == nil || sb.Workspace() != d.taskWorkspace(task) {
 		release()
 		return nil, nil
 	}

@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,8 +13,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// CLI Runner connection store (cli-connect.md). Task state is always
-// durable: a runner disconnect only affects delivery, never the task itself.
+// CLI Runner connection store (cli-connect.md). Task state is durable.
 
 var (
 	ErrRunnerTaskNotClaimable = errors.New("runner task is not claimable")
@@ -26,12 +26,14 @@ type runnerTaskPayload struct {
 	Workspace         string                           `json:"workspace,omitempty"`
 	Args              []string                         `json:"args,omitempty"`
 	ExitCode          *int                             `json:"exitCode,omitempty"`
+	ExitCodeObserved  bool                             `json:"exitCodeObserved,omitempty"`
 	Result            string                           `json:"result,omitempty"`
 	Error             string                           `json:"error,omitempty"`
 	StartedAt         *runnerTaskTime                  `json:"startedAt,omitempty"`
 	CompletedAt       *runnerTaskTime                  `json:"completedAt,omitempty"`
 	RunID             string                           `json:"runId,omitempty"`
 	NodeID            string                           `json:"nodeId,omitempty"`
+	WorkflowOperation string                           `json:"workflowOperation,omitempty"`
 	Invocation        *domain.RunnerInvocation         `json:"invocation,omitempty"`
 	Sandbox           *domain.RunnerSandboxSpec        `json:"sandbox,omitempty"`
 	Command           string                           `json:"command,omitempty"`
@@ -42,8 +44,14 @@ type runnerTaskPayload struct {
 	// Artifacts holds artifact content uploaded by the runner at completion
 	// (name → file content) so the engine can write them into the run
 	// workspace and reuse the existing verification/handoff pipeline.
-	Artifacts map[string]string         `json:"artifacts,omitempty"`
-	Outputs   *domain.RunnerTaskOutputs `json:"outputs,omitempty"`
+	Artifacts  map[string]string            `json:"artifacts,omitempty"`
+	Outputs    *domain.RunnerTaskOutputs    `json:"outputs,omitempty"`
+	Completion *runnerTaskCompletionReceipt `json:"completion,omitempty"`
+}
+
+type runnerTaskCompletionReceipt struct {
+	RunnerID string `json:"runnerId"`
+	Digest   string `json:"digest"`
 }
 
 // runnerTaskTime decodes timestamps written by both write paths: Go struct
@@ -110,12 +118,14 @@ func runnerTaskFromRow(row runnerTaskRow) domain.RunnerTask {
 		t.Workspace = p.Workspace
 		t.Args = p.Args
 		t.ExitCode = p.ExitCode
+		t.ExitCodeObserved = p.ExitCodeObserved
 		t.Result = p.Result
 		t.Error = p.Error
 		t.StartedAt = p.StartedAt.toTime()
 		t.CompletedAt = p.CompletedAt.toTime()
 		t.RunID = p.RunID
 		t.NodeID = p.NodeID
+		t.WorkflowOperation = p.WorkflowOperation
 		t.Invocation = p.Invocation
 		t.Sandbox = p.Sandbox
 		t.Command = p.Command
@@ -130,20 +140,24 @@ func runnerTaskFromRow(row runnerTaskRow) domain.RunnerTask {
 }
 
 func runnerTaskPayloadBytes(v domain.RunnerTask) []byte {
+	return mustJSON(runnerTaskPayloadFor(v))
+}
+
+func runnerTaskPayloadFor(v domain.RunnerTask) runnerTaskPayload {
 	if v.Invocation != nil && (len(v.Invocation.GitSSHKeys) > 0 || v.Invocation.GitHTTPCredentials != nil) {
 		invocation := *v.Invocation
 		invocation.GitSSHKeys = nil
 		invocation.GitHTTPCredentials = nil
 		v.Invocation = &invocation
 	}
-	return mustJSON(runnerTaskPayload{
-		Prompt: v.Prompt, Workspace: v.Workspace, Args: v.Args, ExitCode: v.ExitCode,
+	return runnerTaskPayload{
+		Prompt: v.Prompt, Workspace: v.Workspace, Args: v.Args, ExitCode: v.ExitCode, ExitCodeObserved: v.ExitCodeObserved,
 		Result: v.Result, Error: v.Error, StartedAt: newRunnerTaskTime(v.StartedAt),
-		CompletedAt: newRunnerTaskTime(v.CompletedAt), RunID: v.RunID, NodeID: v.NodeID,
+		CompletedAt: newRunnerTaskTime(v.CompletedAt), RunID: v.RunID, NodeID: v.NodeID, WorkflowOperation: v.WorkflowOperation,
 		Invocation: v.Invocation, Sandbox: v.Sandbox, Command: v.Command, Action: v.Action,
 		PreviewArchive: v.PreviewArchive, WorkBranchMessage: v.WorkBranchMessage, Artifacts: v.Artifacts,
 		Outputs: v.Outputs, IntegrationLabel: v.IntegrationLabel,
-	})
+	}
 }
 
 func runnerTaskRowValues(v domain.RunnerTask) map[string]any {
@@ -220,15 +234,20 @@ func (r *RunnersRepo) SetRunnerRunLimit(id string, limit int) error {
 }
 
 func (r *RunnersRepo) Runner(id string) (domain.Runner, bool) {
-	return r.runnerRow(id)
+	runner, err := r.ReadRunner(id)
+	return runner, err == nil
 }
 
-func (r *RunnersRepo) runnerRow(id string) (domain.Runner, bool) {
+// ReadRunner distinguishes an absent registration from a storage failure.
+func (r *RunnersRepo) ReadRunner(id string) (domain.Runner, error) {
 	var row runnerRow
 	if err := r.DB.Where("id = ?", id).Take(&row).Error; err != nil {
-		return domain.Runner{}, false
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			err = ErrRunnerNotFound
+		}
+		return domain.Runner{}, err
 	}
-	return runnerFromRow(row), true
+	return runnerFromRow(row), nil
 }
 
 func runnerFromRow(row runnerRow) domain.Runner {
@@ -299,7 +318,7 @@ func (r *RunnersRepo) RunnerSessionByHash(hash string) (domain.Runner, bool) {
 // server-side disabled flag survives: a CLI disabled from the 执行器 page
 // stays disabled even though the daemon keeps reporting it online.
 func (r *RunnersRepo) RunnerHeartbeat(id string, runtimes []domain.RunnerRuntime, version string, now, sessionExpiresAt time.Time) error {
-	current, ok := r.runnerRow(id)
+	current, ok := r.Runner(id)
 	disabled := map[string]bool{}
 	authModes := map[string]string{}
 	if ok {
@@ -397,7 +416,7 @@ func (r *RunnersRepo) SetRunnerRuntimeStatus(runnerID, provider, status string, 
 }
 
 func (r *RunnersRepo) updateRunnerRuntimes(runnerID string, mutate func([]domain.RunnerRuntime) (bool, error), now time.Time) error {
-	current, ok := r.runnerRow(runnerID)
+	current, ok := r.Runner(runnerID)
 	if !ok {
 		return ErrRunnerNotFound
 	}
@@ -416,6 +435,8 @@ func (r *RunnersRepo) updateRunnerRuntimes(runnerID string, mutate func([]domain
 		"runtimes": string(raw), "updated_at": now,
 	}).Error
 }
+
+const RunnerOfflineThreshold = 90 * time.Second
 
 // MarkOfflineRunners flags runners whose heartbeat is older than threshold.
 // Callers decide their own thresholds; the store only persists the state.
@@ -651,33 +672,75 @@ func (r *RunnersRepo) RenewRunnerTaskLease(id, runnerID string, ttl time.Duratio
 // artifacts (legacy, by contract name) and outputs carry what the runner
 // reported about its workspace; either may be nil.
 func (r *RunnersRepo) CompleteRunnerTask(id, runnerID, status string, exitCode *int, result, errMsg string, artifacts map[string]string, outputs *domain.RunnerTaskOutputs, now time.Time) error {
-	if status != domain.RunnerTaskSuccess && status != domain.RunnerTaskFailed && status != domain.RunnerTaskCanceled {
-		return fmt.Errorf("invalid final task status %q", status)
+	_, err := r.completeRunnerTask(id, runnerID, domain.RunnerTaskCompletion{
+		Status: status, ExitCode: exitCode, Result: result, Error: errMsg, Artifacts: artifacts, Outputs: outputs,
+	}, now, false)
+	return err
+}
+
+// CompleteRunnerTaskAttempt records a runner's report and its receipt together.
+// The returned bool is true only for the report that transitions the task.
+func (r *RunnersRepo) CompleteRunnerTaskAttempt(id, runnerID string, report domain.RunnerTaskCompletion, now time.Time) (bool, error) {
+	return r.completeRunnerTask(id, runnerID, report, now, true)
+}
+
+func (r *RunnersRepo) completeRunnerTask(id, runnerID string, report domain.RunnerTaskCompletion, now time.Time, fromRunner bool) (bool, error) {
+	if report.Status != domain.RunnerTaskSuccess && report.Status != domain.RunnerTaskFailed && report.Status != domain.RunnerTaskCanceled {
+		return false, fmt.Errorf("invalid final task status %q", report.Status)
 	}
-	return r.DB.Transaction(func(tx *gorm.DB) error {
-		row, ok := r.takeRunnerTaskForLease(tx, id, runnerID)
-		if !ok {
+	var receipt *runnerTaskCompletionReceipt
+	if fromRunner && report.Attempt > 0 {
+		body, err := json.Marshal(report)
+		if err != nil {
+			return false, err
+		}
+		receipt = &runnerTaskCompletionReceipt{RunnerID: runnerID, Digest: fmt.Sprintf("%x", sha256.Sum256(body))}
+	}
+	changed := false
+	err := r.DB.Transaction(func(tx *gorm.DB) error {
+		var row runnerTaskRow
+		res := r.locking(tx).Where("id = ?", id).Find(&row)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
 			return ErrRunnerTaskLeaseLost
 		}
-		task := runnerTaskFromRow(row)
-		task.Status = status
-		task.ExitCode = exitCode
-		task.Result = result
-		task.Error = errMsg
-		if artifacts != nil {
-			task.Artifacts = artifacts
+		// Older runner binaries report under the lease owner alone.
+		if report.Attempt != 0 && report.Attempt != row.Attempt {
+			return ErrRunnerTaskLeaseLost
 		}
-		if outputs != nil {
-			task.Outputs = outputs
+		if row.Status != domain.RunnerTaskLeased && row.Status != domain.RunnerTaskRunning {
+			var payload runnerTaskPayload
+			if receipt != nil && row.Status == report.Status && json.Unmarshal(row.Payload, &payload) == nil && payload.Completion != nil && *payload.Completion == *receipt {
+				return nil
+			}
+			return ErrRunnerTaskLeaseLost
+		}
+		if row.LeaseOwner != runnerID || fromRunner && (row.LeaseUntil == nil || row.LeaseUntil.Before(now)) {
+			return ErrRunnerTaskLeaseLost
+		}
+
+		task := runnerTaskFromRow(row)
+		task.ExitCode, task.Result, task.Error = report.ExitCode, report.Result, report.Error
+		task.ExitCodeObserved = report.ExitCodeObserved && report.ExitCode != nil && *report.ExitCode >= 0
+		if report.Artifacts != nil {
+			task.Artifacts = report.Artifacts
+		}
+		if report.Outputs != nil {
+			task.Outputs = report.Outputs
 		}
 		scrubRunnerTaskCredentials(&task)
-		completed := now
-		task.CompletedAt = &completed
-		task.LeaseOwner = ""
-		task.LeaseUntil = nil
-		task.UpdatedAt = now
-		return tx.Model(&runnerTaskRow{}).Where("id = ?", id).Updates(runnerTaskRowValues(task)).Error
+		task.CompletedAt = &now
+		payload := runnerTaskPayloadFor(task)
+		payload.Completion = receipt
+		res = tx.Model(&runnerTaskRow{}).Where("id = ?", id).Updates(map[string]any{
+			"status": report.Status, "lease_owner": "", "lease_until": nil, "updated_at": now, "payload": mustJSON(payload),
+		})
+		changed = res.RowsAffected == 1
+		return res.Error
 	})
+	return changed && err == nil, err
 }
 
 func scrubRunnerTaskCredentials(task *domain.RunnerTask) {
@@ -736,9 +799,54 @@ func (r *RunnersRepo) CancelRunnerTask(id string, now time.Time) error {
 	})
 }
 
+// FailQueuedRunnerTaskIfUnavailable settles an unclaimed task whose bound runner
+// is missing, offline, or silent past the heartbeat cutoff.
+func (r *RunnersRepo) FailQueuedRunnerTaskIfUnavailable(id, runnerID string, now time.Time) (bool, error) {
+	if runnerID == "" {
+		return false, nil
+	}
+	cutoff := now.Add(-RunnerOfflineThreshold)
+	online := func(db *gorm.DB) (bool, error) {
+		var runner runnerRow
+		res := db.Select("status", "last_seen_at").Where("id = ?", runnerID).Find(&runner)
+		return res.RowsAffected == 1 && runner.Status == domain.RunnerStatusOnline &&
+			(runner.LastSeenAt == nil || !runner.LastSeenAt.Before(cutoff)), res.Error
+	}
+	if live, err := online(r.DB); live || err != nil {
+		return false, err
+	}
+
+	queued := func(db *gorm.DB) *gorm.DB {
+		return db.Where("id = ? AND runner_id = ? AND status = ?", id, runnerID, domain.RunnerTaskQueued)
+	}
+	failed := false
+	err := r.DB.Transaction(func(tx *gorm.DB) error {
+		var row runnerTaskRow
+		if res := queued(r.locking(tx)).Find(&row); res.Error != nil || res.RowsAffected == 0 {
+			return res.Error
+		}
+		if live, err := online(r.locking(tx)); live || err != nil {
+			return err
+		}
+
+		task := runnerTaskFromRow(row)
+		task.Status = domain.RunnerTaskFailed
+		task.Error = fmt.Sprintf("runner %q is unavailable before claim for task %s. To continue, reconnect that runner and retry", runnerID, id)
+		task.LeaseOwner, task.DesiredState = "", ""
+		task.LeaseUntil, task.ExitCode = nil, nil
+		task.ExitCodeObserved = false
+		task.CompletedAt, task.UpdatedAt = &now, now
+		scrubRunnerTaskCredentials(&task)
+		res := queued(tx.Model(&runnerTaskRow{})).Updates(runnerTaskRowValues(task))
+		failed = res.RowsAffected == 1
+		return res.Error
+	})
+	return failed && err == nil, err
+}
+
 // ExpireRunnerTasks recovers tasks whose lease was never renewed (runner
-// slept, crashed, or lost network). Retryable tasks go back to QUEUED;
-// exhausted tasks fail. Returns the recovered tasks for observability.
+// slept, crashed, or lost network). Pending cancellations settle first;
+// retryable tasks go back to QUEUED and exhausted tasks fail.
 func (r *RunnersRepo) ExpireRunnerTasks(now time.Time) ([]domain.RunnerTask, error) {
 	var recovered []domain.RunnerTask
 	err := r.DB.Transaction(func(tx *gorm.DB) error {
@@ -750,13 +858,17 @@ func (r *RunnersRepo) ExpireRunnerTasks(now time.Time) ([]domain.RunnerTask, err
 		}
 		for _, row := range rows {
 			task := runnerTaskFromRow(row)
-			if task.Attempt < task.MaxAttempts {
+			switch {
+			case task.DesiredState == domain.RunnerTaskDesiredCancel:
+				task.Status = domain.RunnerTaskCanceled
+			case task.Attempt < task.MaxAttempts:
 				task.Status = domain.RunnerTaskQueued
-			} else {
+			default:
 				task.Status = domain.RunnerTaskFailed
 				task.Error = "lease expired"
-				completed := now
-				task.CompletedAt = &completed
+			}
+			if task.Status != domain.RunnerTaskQueued {
+				task.CompletedAt = &now
 				scrubRunnerTaskCredentials(&task)
 			}
 			task.LeaseOwner = ""
@@ -824,10 +936,8 @@ func (r *RunnersRepo) RunnerTaskEventsAfter(taskID string, after int64) []domain
 	return out
 }
 
-// DeregisterRunner removes a runner and everything that points at it: the
-// machine record, default-execution-machine selections that target it, and
-// its queued tasks (running tasks recover through lease expiry). Called when
-// the daemon uninstalls or stops gracefully.
+// DeregisterRunner removes a machine, clears its default selections and
+// cancels its unclaimed tasks. Leased tasks recover through lease expiry.
 func (r *RunnersRepo) DeregisterRunner(id string, now time.Time) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -835,19 +945,22 @@ func (r *RunnersRepo) DeregisterRunner(id string, now time.Time) error {
 	}
 	return r.DB.Transaction(func(tx *gorm.DB) error {
 		var rows []runnerTaskRow
+		// The per-task update fences concurrent claims without locking the index range.
 		if err := tx.Where("runner_id = ? AND status = ?", id, domain.RunnerTaskQueued).Find(&rows).Error; err != nil {
 			return err
 		}
 		for _, row := range rows {
 			task := runnerTaskFromRow(row)
 			task.Status = domain.RunnerTaskCanceled
-			task.LeaseOwner = ""
-			task.LeaseUntil = nil
+			task.Error = fmt.Sprintf("runner %q was removed before claiming task %s", id, task.ID)
+			task.LeaseOwner, task.DesiredState = "", ""
+			task.LeaseUntil, task.ExitCode = nil, nil
+			task.ExitCodeObserved = false
 			scrubRunnerTaskCredentials(&task)
-			completed := now
-			task.CompletedAt = &completed
-			task.UpdatedAt = now
-			if err := tx.Model(&runnerTaskRow{}).Where("id = ?", task.ID).Updates(runnerTaskRowValues(task)).Error; err != nil {
+			task.CompletedAt, task.UpdatedAt = &now, now
+			if err := tx.Model(&runnerTaskRow{}).
+				Where("id = ? AND runner_id = ? AND status = ? AND attempt = ?", task.ID, id, domain.RunnerTaskQueued, row.Attempt).
+				Updates(runnerTaskRowValues(task)).Error; err != nil {
 				return err
 			}
 		}

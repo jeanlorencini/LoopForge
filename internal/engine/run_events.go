@@ -1,9 +1,13 @@
 package engine
 
 import (
+	"agentflow/internal/apperr"
 	"agentflow/internal/domain"
 	"agentflow/internal/observability"
+	"agentflow/internal/repo"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -55,6 +59,8 @@ func (e *Engine) IngestWorkerEnvelope(runID string, envelope domain.WorkerEnvelo
 	if envelope.SpecVersion != domain.ObservabilitySpecVersion {
 		return fmt.Errorf("unsupported observability spec %q", envelope.SpecVersion)
 	}
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
 	run, ok := e.repo.RunState(runID)
 	if !ok {
 		return fmt.Errorf("run not found")
@@ -76,9 +82,7 @@ func (e *Engine) IngestWorkerEnvelope(runID string, envelope domain.WorkerEnvelo
 				return fmt.Errorf("node not found in run")
 			}
 		}
-		e.observe(runID, nodeID, *envelope.Observation)
-		e.flushAllObservations()
-		return nil
+		return e.ingestWorkerObservation(run, nodeID, *envelope.Observation)
 	case "log":
 		if envelope.Log == nil {
 			return fmt.Errorf("log is required")
@@ -98,31 +102,70 @@ func (e *Engine) IngestWorkerEnvelope(runID string, envelope domain.WorkerEnvelo
 				return fmt.Errorf("node not found in run")
 			}
 		}
-		e.updateRun(runID, func(r *domain.Run) {
-			now := time.Now().UTC()
-			r.LogSequence++
-			log.SpecVersion = domain.ObservabilitySpecVersion
-			log.ID = fmt.Sprintf("log-%d", now.UnixNano())
-			log.Sequence = r.LogSequence
-			if log.Timestamp.IsZero() {
-				log.Timestamp = now
-			}
-			log.Context.RunID = runID
-			log.Context.TraceID = runID
-			if log.Level == "" {
-				log.Level = "info"
-			}
-			if log.Stream == "" {
-				log.Stream = "worker"
-			}
-			r.Logs = append(r.Logs, log)
-			if len(r.Logs) > 8000 {
-				r.Logs = append([]domain.LogRecord(nil), r.Logs[len(r.Logs)-8000:]...)
-			}
-		})
-		return nil
+		now := time.Now().UTC()
+		log.SpecVersion = domain.ObservabilitySpecVersion
+		log.ID = fmt.Sprintf("log-%d", now.UnixNano())
+		if log.Timestamp.IsZero() {
+			log.Timestamp = now
+		}
+		log.Context.RunID = runID
+		log.Context.TraceID = runID
+		if log.Level == "" {
+			log.Level = "info"
+		}
+		if log.Stream == "" {
+			log.Stream = "worker"
+		}
+		run.Logs = []domain.LogRecord{log}
+		return e.workerSignalResult(run.ID, e.repo.AppendRunSignals(run, ""))
 	default:
 		return fmt.Errorf("type must be observation or log")
+	}
+}
+
+func (e *Engine) ingestWorkerObservation(run domain.Run, nodeID string, observation domain.TelemetryEvent) error {
+	for attempt := 0; attempt < 3; attempt++ {
+		if domain.TerminalRunStatus(run.Status) && observation.Name != "sandbox.closed" {
+			if e.repo.TelemetryEventExists(run.ID, observation.ID) {
+				return nil
+			}
+			return apperr.New(apperr.Conflict, "run is finished")
+		}
+		e.applyObservation(&run, nodeID, observation)
+		if len(run.Telemetry) == 0 {
+			return nil // The observation already exists with this producer ID.
+		}
+		err := e.repo.AppendRunSignals(run, nodeID)
+		if !errors.Is(err, repo.ErrRunDecisionStale) || attempt == 2 {
+			return e.workerSignalResult(run.ID, err)
+		}
+		latest, ok := e.repo.RunState(run.ID)
+		if !ok {
+			return e.workerSignalResult(run.ID, repo.ErrRunNotFound)
+		}
+		before, after := run.Nodes[nodeID], latest.Nodes[nodeID]
+		if latest.Generation != run.Generation || before != nil && (after == nil || before.Attempt != after.Attempt || before.ReworkCount != after.ReworkCount) {
+			return e.workerSignalResult(run.ID, err)
+		}
+		run = latest
+	}
+	return e.workerSignalResult(run.ID, repo.ErrRunDecisionStale)
+}
+
+func (e *Engine) workerSignalResult(runID string, err error) error {
+	switch {
+	case err == nil:
+		if current, ok := e.repo.RunStreamView(runID); ok {
+			e.publishRun(current)
+		}
+		return nil
+	case errors.Is(err, repo.ErrRunNotFound):
+		return apperr.New(apperr.NotFound, "run not found")
+	case errors.Is(err, repo.ErrRunDecisionStale):
+		return apperr.New(apperr.Conflict, "run changed while storing the signal")
+	default:
+		log.Printf("append run %s signals: %v", runID, err)
+		return apperr.New(apperr.Unavailable, "could not persist run signal")
 	}
 }
 

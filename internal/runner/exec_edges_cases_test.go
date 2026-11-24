@@ -157,7 +157,11 @@ func TestReplaceCheckoutContentsAndRunSandboxTouch(t *testing.T) {
 		"a": {runID: "run", lastUsed: old},
 		"b": {runID: "other", lastUsed: old},
 	}}
-	d.touchRunSandboxes("run")
+	release := d.holdRunSandboxes("run")
+	if d.runSandboxes["a"].active != 1 || d.runSandboxes["b"].active != 0 {
+		t.Fatal("browser did not reserve the run sandbox")
+	}
+	release()
 	if !d.runSandboxes["a"].lastUsed.After(old) || !d.runSandboxes["b"].lastUsed.Equal(old) {
 		t.Fatal("sandbox touch")
 	}

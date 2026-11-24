@@ -21,7 +21,7 @@ func TestIndependentReportFrozenAcrossSendRetries(t *testing.T) {
 	run.Nodes["n"].Status = "succeeded"
 	run.Nodes["n"].Output = "最终验证通过"
 	run.Artifacts = []domain.Artifact{{ID: "old", Name: "验证报告", Attempt: 1, Content: "旧尝试发现错误"}, {ID: "final", Name: "验证报告", Attempt: 2, Content: "最新验证无错误"}}
-	run.Events = []domain.RunEvent{{ID: "complete", Type: "run.succeeded", Timestamp: time.Now().UTC()}}
+	run.Events = append(run.Events, domain.RunEvent{ID: "complete", Type: "run.succeeded", Timestamp: time.Now().UTC()})
 	if err := svc.Store.PutRun(run); err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestIndependentReportFailureUsesStandardMessage(t *testing.T) {
 	run.Status = "succeeded"
 	run.Nodes["n"].Status = "succeeded"
 	run.Nodes["n"].Output = "不应当作整体报告发送的节点输出"
-	run.Events = []domain.RunEvent{{ID: "complete", Type: "run.succeeded", Timestamp: time.Now().UTC()}}
+	run.Events = append(run.Events, domain.RunEvent{ID: "complete", Type: "run.succeeded", Timestamp: time.Now().UTC()})
 	if err := svc.Store.PutRun(run); err != nil {
 		t.Fatal(err)
 	}

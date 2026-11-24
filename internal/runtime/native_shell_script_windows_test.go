@@ -44,17 +44,79 @@ func TestWindowsHostShellPreservesLongSourceAndInput(t *testing.T) {
 	}
 }
 
-func TestWindowsHostShellLeavesSmallCommandsAndProviders(t *testing.T) {
-	for _, argv := range [][]string{{windowsTestShell(t), "-lc", "printf ok"}, {"codex", "exec", strings.Repeat("x", 25000)}} {
-		command := CommandSpec{Argv: argv}
-		got, cleanup, err := PrepareHostShellCommand(command)
-		if err != nil {
-			t.Fatal(err)
-		}
-		cleanup()
-		if !reflect.DeepEqual(got.Argv, argv) {
-			t.Fatal("small shell or provider invocation was changed")
-		}
+func TestWindowsHostShellKeepsSmallScriptsInlineAndLeavesProvidersAlone(t *testing.T) {
+	command := CommandSpec{Argv: []string{windowsTestShell(t), "-lc", "printf ok"}}
+	got, cleanup, err := PrepareHostShellCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+	if !strings.HasSuffix(got.Argv[2], command.Argv[2]) || got.Argv[1] != command.Argv[1] {
+		t.Fatal("small script or flags were lost")
+	}
+	provider := CommandSpec{Argv: []string{"codex", "exec", strings.Repeat("x", 25000)}}
+	got, cleanup, err = PrepareHostShellCommand(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+	if !reflect.DeepEqual(got.Argv, provider.Argv) {
+		t.Fatal("provider invocation was changed")
+	}
+}
+
+func TestWindowsGitShellPreservesNativeLinkerPrecedence(t *testing.T) {
+	_ = windowsTestShell(t)
+	toolchain := filepath.Join(t.TempDir(), "fixture MSVC tools")
+	if err := os.MkdirAll(toolchain, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(toolchain, "link.exe"), []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", toolchain+";"+os.Getenv("PATH"))
+	t.Setenv("MSYS2_PATH_TYPE", "inherit")
+	t.Setenv("ORIGINAL_PATH", "")
+	if err := os.Unsetenv("ORIGINAL_PATH"); err != nil {
+		t.Fatal(err)
+	}
+	sandbox := &localSandbox{workspace: t.TempDir()}
+	for _, flags := range []string{"-lc", "-c"} {
+		t.Run(flags, func(t *testing.T) {
+			out, err := sandbox.Exec(t.Context(), CommandSpec{Argv: []string{"sh", flags, "command -v link.exe && command -v cygpath"}}, nil)
+			if err != nil || !strings.Contains(out, "/fixture MSVC tools/link.exe") {
+				t.Fatalf("shell did not pick the Windows toolchain linker and expose Git tools: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+func TestWindowsGitShellUsesTERMOnlyAsFallback(t *testing.T) {
+	shell := windowsTestShell(t)
+	for _, tc := range []struct {
+		name, inherited, want string
+		profile, command      map[string]string
+	}{
+		{name: "absent", want: "dumb"},
+		{name: "inherited", inherited: "fixture-host", want: "fixture-host"},
+		{name: "profile", profile: map[string]string{"TERM": "fixture-profile"}, want: "fixture-profile"},
+		{name: "command", inherited: "fixture-host", profile: map[string]string{"TERM": "fixture-profile"}, command: map[string]string{"TERM": "fixture-command"}, want: "fixture-command"},
+		{name: "explicit-empty", command: map[string]string{"TERM": ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TERM", tc.inherited)
+			if tc.inherited == "" {
+				if err := os.Unsetenv("TERM"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sandbox := &localSandbox{workspace: t.TempDir(), environment: tc.profile}
+			command := WithCommandEnvironment(CommandSpec{Argv: []string{shell, "-lc", `printf '<%s>' "$TERM"`}}, tc.command)
+			out, err := sandbox.Exec(t.Context(), command, nil)
+			if err != nil || strings.TrimSuffix(out, "\n") != "<"+tc.want+">" {
+				t.Fatalf("shell TERM: got %q, want %q, error=%v", out, tc.want, err)
+			}
+		})
 	}
 }
 

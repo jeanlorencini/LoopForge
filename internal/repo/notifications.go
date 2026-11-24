@@ -3,6 +3,7 @@ package repo
 import (
 	"agentflow/internal/domain"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -311,24 +312,27 @@ func (r *NotificationsRepo) enqueueNotification(tx *gorm.DB, key string, binding
 	} else if err != nil {
 		return err
 	}
-	var bot domain.NotificationBot
-	if err := json.Unmarshal(row.Payload, &bot); err != nil {
-		return err
-	}
-	if !bot.Enabled || bot.Target == nil || bot.ProjectID != item.ProjectID {
+	if row.ProjectID != item.ProjectID {
 		return nil
 	}
-	item.ID = hexSHA256(key)
-	item.TargetID = bot.Target.ID
-	item.TargetName = bot.Target.Name
-	item.TargetType = bot.Target.Type
-	content, source, renderErr := domain.RenderNotification(binding, context)
-	item.WaitingPolicy = binding.WaitingPolicy
-	if item.WaitingPolicy == "" {
-		item.WaitingPolicy = "actionable"
+	var bot domain.NotificationBot
+	var renderErr error
+	if err := json.Unmarshal(row.Payload, &bot); err != nil {
+		renderErr = errors.New("Configuração persistida do bot de aviso inválida")
+	} else {
+		if !bot.Enabled || bot.Target == nil || bot.ProjectID != item.ProjectID {
+			return nil
+		}
+		item.TargetID = bot.Target.ID
+		item.TargetName = bot.Target.Name
+		item.TargetType = bot.Target.Type
+		item.Content, item.ContentSource, renderErr = domain.RenderNotification(binding, context)
 	}
-	item.Content = content
-	item.ContentSource = source
+	item.ID = hexSHA256(key)
+	item.WaitingPolicy = "actionable"
+	if binding.WaitingPolicy == "event" {
+		item.WaitingPolicy = "event"
+	}
 	item.Status = "pending"
 	if renderErr != nil {
 		item.Status = "failed"

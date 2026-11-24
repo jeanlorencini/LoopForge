@@ -2,6 +2,7 @@ package repo
 
 import (
 	"agentflow/internal/domain"
+	"errors"
 	"fmt"
 	"gorm.io/gorm"
 	"os"
@@ -30,23 +31,22 @@ func TestNotificationOutboxAtomicAndIdempotent(t *testing.T) {
 	}
 	defer s.Close()
 	bot, run := notificationFixture(t, s, "atomic")
-	// An invalid persisted Bot forces enqueue failure, rolling back the run event and header.
-	if err = s.DB.Model(&notificationBotRow{}).Where("id = ?", bot.ID).Update("payload", []byte(`not-json`)).Error; err != nil {
+	outboxErr := errors.New("outbox write failed")
+	create := s.DB.Callback().Create()
+	if err := create.Before("gorm:create").Register("fail_notification_outbox", func(tx *gorm.DB) {
+		if tx.Statement.Table == "notification_deliveries" {
+			tx.AddError(outboxErr)
+		}
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.PutRun(run); err == nil {
-		t.Fatal("expected rollback")
+	if err = s.PutRun(run); !errors.Is(err, outboxErr) {
+		t.Fatalf("expected outbox write failure, got %v", err)
 	}
 	if _, ok := s.RunState(run.ID); ok {
 		t.Fatal("run committed despite outbox failure")
 	}
-	if err = s.SaveNotificationBot(bot, ""); err == nil {
-		t.Fatal("corrupt bot should not be silently overwritten")
-	}
-	if err = s.DB.Where("id = ?", bot.ID).Delete(&notificationBotRow{}).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err = s.SaveNotificationBot(bot, ""); err != nil {
+	if err = create.Remove("fail_notification_outbox"); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
@@ -97,6 +97,49 @@ func TestNotificationOutboxAtomicAndIdempotent(t *testing.T) {
 	items, _ = s.NotificationDeliveries(bot.ProjectID)
 	if items[0].Status != "sent" {
 		t.Fatal("current owner could not finish")
+	}
+}
+
+func TestNotificationInvalidSavedConfigLetsApprovalWait(t *testing.T) {
+	s, err := OpenTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	bot, run := notificationFixture(t, s, "invalid-config")
+	if err := s.DB.Model(&notificationBotRow{}).Where("id = ?", bot.ID).Update("payload", []byte(`{"target":"invalid-target-shape"}`)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveNotificationBot(bot, ""); err == nil {
+		t.Fatal("corrupt bot should not be silently overwritten")
+	}
+	run.Status = "waiting"
+	run.Nodes["agent"].Status = "waiting_approval"
+	run.Events[0].Type = "approval.waiting"
+	for i := 0; i < 2; i++ {
+		if err := s.PutRun(run); err != nil {
+			t.Fatalf("persist approval wait with invalid bot setup: %v", err)
+		}
+	}
+	got, ok := s.RunState(run.ID)
+	if !ok || got.Status != "waiting" || got.Nodes["agent"].Status != "waiting_approval" || len(got.Events) != 1 {
+		t.Fatalf("approval wait did not persist: %+v", got)
+	}
+	items, err := s.NotificationDeliveries(bot.ProjectID)
+	if err != nil || len(items) != 1 || items[0].Status != "failed" || items[0].ContentSource != "invalid" ||
+		items[0].LastError == "" || items[0].RunID != run.ID || items[0].NodeID != "agent" || items[0].EventType != "waiting" {
+		t.Fatalf("invalid config should produce one diagnosed delivery: %v %+v", err, items)
+	}
+	if item, err := s.ClaimNotification(time.Now(), "worker"); item != nil || err != nil {
+		t.Fatalf("invalid notification was claimable: %v %+v", err, item)
+	}
+	run.ID = "other-project-run"
+	run.ExecutionContext.ProjectID = "other-project"
+	if err := s.PutRun(run); err != nil {
+		t.Fatal(err)
+	}
+	if items, err = s.NotificationDeliveries("other-project"); err != nil || len(items) != 0 {
+		t.Fatalf("cross-project configuration produced a delivery: %v %+v", err, items)
 	}
 }
 func TestWorkflowNotificationValidation(t *testing.T) {

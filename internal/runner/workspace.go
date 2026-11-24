@@ -99,13 +99,13 @@ func (d *Daemon) handleRunnerWorkspaceBrowser(ctx context.Context, request domai
 	if request.Browser == nil {
 		return domain.RunnerWorkspaceResponse{Status: 400, Error: "invalid browser request"}
 	}
+	if !runnerBrowserReads[request.Browser.Operation] {
+		defer d.holdRunSandboxes(request.RunID)()
+	}
 	if request.Browser.Ensure && !runtime.BrowserRunning(ctx, request.RunID) {
 		if reason := d.ensureRunnerBrowser(ctx, request); reason != "" {
 			return runnerWorkspacePayload(domain.BrowserState{Reason: reason})
 		}
-	}
-	if !runnerBrowserReads[request.Browser.Operation] {
-		d.touchRunSandboxes(request.RunID)
 	}
 	state, err := runtime.HandleBrowser(ctx, request.RunID, *request.Browser)
 	if err != nil {

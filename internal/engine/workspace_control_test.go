@@ -97,12 +97,16 @@ func TestWorkspaceControlFailureDoesNotRetryOrRejectUpstream(t *testing.T) {
 	t.Parallel()
 	e, st := newRecoveryEngine(t)
 	node := domain.WorkflowNode{ID: "design", MaxAttempts: 8, RejectTo: "env", MaxReworks: 3}
-	run := domain.Run{ID: "control-failed", Status: "running", Generation: 1, WorkflowSnapshot: domain.WorkflowDefinition{Nodes: []domain.WorkflowNode{{ID: "env"}, node}}, Nodes: map[string]*domain.NodeRun{"env": {NodeID: "env", Status: "succeeded", Attempt: 1}, "design": {NodeID: "design", Status: "running", Attempt: 1, StartedAt: time.Now()}}}
+	run := domain.Run{ID: "control-failed", Status: "running", WorkflowSnapshot: domain.WorkflowDefinition{Nodes: []domain.WorkflowNode{{ID: "env"}, node}}, Nodes: map[string]*domain.NodeRun{"env": {NodeID: "env", Status: "succeeded", Attempt: 1}, "design": {NodeID: "design", Status: "running", Attempt: 1, StartedAt: time.Now()}}}
 	if err := st.PutRun(run); err != nil {
 		t.Fatal(err)
 	}
+	owned, err := e.acquireLease(run)
+	if err != nil {
+		t.Fatal(err)
+	}
 	failure := fmt.Errorf("prepare: %w", ErrWorkspaceControlConfiguration)
-	e.nodeFailedAt(run.ID, node, 1, 1, failure, true)
+	e.nodeFailedAt(run.ID, node, 1, owned.Generation, failure, true)
 	got, _ := st.RunState(run.ID)
 	if got.Nodes["design"].Status != "failed" || got.Nodes["design"].Attempt != 1 || got.Nodes["env"].Status != "succeeded" || got.Nodes["env"].ReworkCount != 0 {
 		t.Fatalf("configuration failure retried or rejected: %+v", got.Nodes)
@@ -120,7 +124,7 @@ func TestWorkspaceControlFailureDoesNotRetryOrRejectUpstream(t *testing.T) {
 	if err := st.PutRun(got); err != nil {
 		t.Fatal(err)
 	}
-	e.nodeFailedAt(run.ID, node, 1, 1, failure, true)
+	e.nodeFailedAt(run.ID, node, 1, owned.Generation, failure, true)
 	got, _ = st.RunState(run.ID)
 	if got.Nodes["design"].Status != "failed" || got.Nodes["env"].ReworkCount != 3 {
 		t.Fatal("configuration error was treated as a rework verdict")

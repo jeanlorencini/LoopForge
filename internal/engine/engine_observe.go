@@ -13,6 +13,7 @@ import (
 type pendingObservation struct {
 	runID, nodeID string
 	event         domain.TelemetryEvent
+	nodeAtRead    *domain.NodeRun
 }
 
 const (
@@ -106,6 +107,10 @@ func (e *Engine) takePendingObservations(runID string) []pendingObservation {
 }
 
 func (e *Engine) applyObservation(r *domain.Run, nodeID string, observation domain.TelemetryEvent) {
+	e.applyObservationWithHistory(r, nodeID, observation, nil, true)
+}
+
+func (e *Engine) applyObservationWithHistory(r *domain.Run, nodeID string, observation domain.TelemetryEvent, original *domain.NodeRun, coalesce bool) {
 	if domain.TerminalRunStatus(r.Status) && observation.Name != "sandbox.closed" {
 		return
 	}
@@ -139,7 +144,11 @@ func (e *Engine) applyObservation(r *domain.Run, nodeID string, observation doma
 	}
 	clarifyProcessLog(&observation)
 	nr := r.Nodes[nodeID]
-	observation.Context = e.observationContext(*r, nodeID, nr, observation)
+	contextNode := nr
+	if original != nil {
+		contextNode, nr = original, nil
+	}
+	observation.Context = e.observationContext(*r, nodeID, contextNode, observation)
 	if observation.Source.Layer == "" {
 		layer := "orchestrator"
 		if observation.Category == "sandbox" || observation.Category == "process" {
@@ -192,7 +201,7 @@ func (e *Engine) applyObservation(r *domain.Run, nodeID string, observation doma
 			}
 		}
 	}
-	coalesced := coalesceProgressTelemetry(&r.Telemetry, observation)
+	coalesced := coalesce && coalesceProgressTelemetry(&r.Telemetry, observation)
 	if !coalesced {
 		r.Telemetry = append(r.Telemetry, observation)
 	}
