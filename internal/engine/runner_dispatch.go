@@ -890,6 +890,11 @@ func bridgeRunnerEventsToSink(task domain.RunnerTask, events []domain.RunnerTask
 			if observation.Provider == "" {
 				observation.Provider = task.Provider
 			}
+			// Accounting events keep individual IDs even when streaming fragments are coalesced.
+			if strings.TrimSpace(observation.ID) == "" && (observation.Usage != nil ||
+				observation.Category == "tool" && observation.Name == "tool.call" && observation.Phase == "finish") {
+				observation.ID = fmt.Sprintf("runner-event:%s:%d", task.ID, event.Seq)
+			}
 			sink(observation)
 			continue
 		}
