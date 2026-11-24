@@ -268,6 +268,15 @@ func (s *dockerSandbox) execOnce(ctx context.Context, command CommandSpec, sink 
 	if err != nil {
 		return "", err
 	}
+	if goruntime.GOOS == "windows" && command.Provider == "script" && command.Stdin == nil &&
+		len(command.Argv) == 3 && command.Argv[0] == "sh" && command.Argv[1] == "-lc" {
+		if strings.IndexByte(command.Argv[2], 0) >= 0 {
+			return "", errors.New("Docker shell script contains a NUL byte")
+		}
+		// Keep the script off the Windows process command line.
+		command.Stdin = strings.NewReader(command.Argv[2])
+		command.Argv = []string{"sh", "-lc", dockerShellScriptFromStdin}
+	}
 	args := []string{"exec"}
 	if command.Stdin != nil || isManagedClaude(command) {
 		args = append(args, "-i")
@@ -339,6 +348,14 @@ func (s *dockerSandbox) execOnce(ctx context.Context, command CommandSpec, sink 
 	}
 	return out, err
 }
+
+// The read status suffix preserves trailing newlines, and positional
+// parameters avoid changing an inherited environment variable.
+const dockerShellScriptFromStdin = `set -- "$(cat; printf '.%d' "$?")"
+case "$1" in
+  *.0) exec sh -c "${1%.0}" </dev/null ;;
+  *) exit 1 ;;
+esac`
 
 // dockerWorkspaceExecArgv runs argv inside /workspace without docker exec -w.
 // runc treats a failed getcwd after -w as exit 126 ("cwd outside mount namespace").
