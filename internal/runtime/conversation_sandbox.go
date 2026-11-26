@@ -107,6 +107,11 @@ func (s *dockerSandbox) conversationCommand(command CommandSpec) CommandSpec {
 	for key, value := range command.environment {
 		env[key] = conversationDockerValue(value, root)
 	}
+	// Windows Codex checksums its SQLite migrations over CRLF text, so Linux Codex
+	// rejects a state DB the native CLI created in this shared home.
+	if command.Provider == "codex" && env["CODEX_SQLITE_HOME"] == "" && env["CODEX_HOME"] != command.environment["CODEX_HOME"] {
+		env["CODEX_SQLITE_HOME"] = env["CODEX_HOME"] + "/sqlite-linux"
+	}
 	command.environment = env
 	command.WorkingDir = conversationDockerValue(command.WorkingDir, root)
 	return command

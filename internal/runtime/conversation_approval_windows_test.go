@@ -129,3 +129,16 @@ func TestWindowsPlatformApprovalPreservesExistingPolicy(t *testing.T) {
 		}
 	}
 }
+
+func TestWindowsDockerConversationCodexUsesLinuxSQLiteHome(t *testing.T) {
+	root := t.TempDir()
+	s := &dockerSandbox{requirements: SandboxRequirements{ConversationRoot: root}}
+	command := s.conversationCommand(CommandSpec{Provider: "codex", Argv: []string{"codex"}, environment: map[string]string{"CODEX_HOME": filepath.Join(root, "home", ".codex")}})
+	if got := command.environment["CODEX_SQLITE_HOME"]; got != "/loopforge/conversation/home/.codex/sqlite-linux" {
+		t.Fatalf("Linux Codex shares the native state DB: %q", got)
+	}
+	other := s.conversationCommand(CommandSpec{Provider: "claude-code", Argv: []string{"claude"}, environment: map[string]string{"CODEX_HOME": filepath.Join(root, "home", ".codex")}})
+	if _, ok := other.environment["CODEX_SQLITE_HOME"]; ok {
+		t.Fatal("non-Codex command got CODEX_SQLITE_HOME")
+	}
+}
