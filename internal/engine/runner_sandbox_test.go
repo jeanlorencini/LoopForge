@@ -134,6 +134,45 @@ func TestDefaultExecutionRunnerUsesFrozenTarget(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunnerTagOverridesDefault(t *testing.T) {
+	t.Parallel()
+	s, err := repo.OpenTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, r := range []domain.Runner{
+		{ID: "runner-pc", Name: "pc", OwnerUserID: 42, Status: domain.RunnerStatusOnline},
+		{ID: "runner-box-old", Name: "box", OwnerUserID: 42, Status: "offline"},
+		{ID: "runner-box", Name: "box", OwnerUserID: 42, Status: domain.RunnerStatusOnline},
+		{ID: "runner-alone", Name: "alone", OwnerUserID: 42, Status: "offline"},
+		{ID: "runner-other", Name: "box", OwnerUserID: 7, Status: domain.RunnerStatusOnline},
+	} {
+		if err := s.PutRunner(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SetDefaultRunner(42, "runner-pc", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	e := New(s, runtime.NewManager(filepath.Join(t.TempDir(), "workspaces")))
+	for _, tc := range []struct {
+		tags []string
+		user int64
+		want string
+	}{
+		{nil, 42, "runner-pc"},
+		{[]string{"windows", " runner:box "}, 42, "runner-box"},
+		{[]string{"runner:alone"}, 42, "runner-alone"}, // offline still wins: the run waits for retry instead of using the PC
+		{[]string{"runner:missing"}, 42, "runner-pc"},
+		{[]string{"runner:box"}, 9, ""}, // never another user's machine
+	} {
+		if got := e.workflowRunner(domain.WorkflowDefinition{Tags: tc.tags}, tc.user); got != tc.want {
+			t.Fatalf("tags %q user %d: runner %q, want %q", tc.tags, tc.user, got, tc.want)
+		}
+	}
+}
+
 func TestResumePausedWaitsForActiveRunnerTask(t *testing.T) {
 	t.Parallel()
 	s, err := repo.OpenTest()

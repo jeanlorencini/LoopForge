@@ -8,6 +8,29 @@ import (
 	"time"
 )
 
+// workflowRunner sends a run of an SOP tagged "runner:<name>" to the user's
+// runner of that name (an SOP that must build on a Windows sandbox), even
+// while it is offline, so the run never lands on the default machine. A user
+// without a runner of that name keeps their default.
+func (e *Engine) workflowRunner(wf domain.WorkflowDefinition, userID int64) string {
+	for _, tag := range wf.Tags {
+		name, ok := strings.CutPrefix(strings.TrimSpace(tag), "runner:")
+		if !ok || userID <= 0 {
+			continue
+		}
+		id := ""
+		for _, runner := range e.repo.Runners() {
+			if runner.OwnerUserID == userID && runner.Name == strings.TrimSpace(name) && (id == "" || runner.Status == domain.RunnerStatusOnline) {
+				id = runner.ID
+			}
+		}
+		if id != "" {
+			return id
+		}
+	}
+	return e.repo.DefaultRunner(userID)
+}
+
 // assignWorkBranches gives every repository without a branch the first
 // repository's work branch, else a generated one. A branch the caller
 // explicitly continues or creates belongs to its own repository, and a
@@ -133,7 +156,7 @@ func (e *Engine) startWorkflowDefinition(wf domain.WorkflowDefinition, input str
 	}
 	executionContext.RunID, executionContext.TraceID, executionContext.WorkflowID, executionContext.WorkflowVersion = id, id, workflowID, wf.Version
 	if executionContext.ParentRunID == "" && !executionContext.ExecutionPinned {
-		executionContext.ExecutionRunnerID = e.repo.DefaultRunner(executionContext.ResponsibleUserID)
+		executionContext.ExecutionRunnerID = e.workflowRunner(wf, executionContext.ResponsibleUserID)
 		executionContext.WorkspaceRunID = ""
 	}
 	if executionContext.ExecutionRunnerID == "" && !executionContext.ExecutionPinned {
