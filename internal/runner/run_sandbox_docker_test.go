@@ -146,10 +146,24 @@ func TestIdleSharedDockerSandboxRetainsLayer(t *testing.T) {
 	if runtime.EnsureSandboxBrowser(ctx, next.sandbox, workspace, task.RunID, nil) == nil || !exists("browser") {
 		t.Fatal("browser sidecar could not resume")
 	}
+	// A conversation opening the parked workspace needs new mounts. The
+	// replacement container must start from the committed writable layer.
 	next.release()
 	d.reapIdleRunSandboxes(ctx, 0)
+	if exists("running") {
+		t.Fatal("idle sandbox was not parked before the conversation opened it")
+	}
+	t.Setenv("AGENTFLOW_CONVERSATION_RELAY_HOST", "relay.fixture")
+	t.Setenv("AGENTFLOW_CONVERSATION_DOCKER_NETWORK", "fixture-net")
+	conversation, releaseConversation := acquire()
+	if err := runtime.ConfigureConversationSandbox(ctx, conversation, t.TempDir()); err != nil {
+		t.Fatalf("conversation could not open the parked workspace: %v", err)
+	}
+	readSentinels(conversation)
+	releaseConversation()
+	d.reapIdleRunSandboxes(ctx, 0)
 	task.Workspace = "runs/park-fixture"
-	if result := d.executeRunCleanup(ctx, task); result.status != domain.RunnerTaskSuccess || exists("id") || exists("layer") || exists("browser") {
+	if result := d.executeRunCleanup(ctx, task); result.status != domain.RunnerTaskSuccess || exists("id") || exists("layer") || exists("browser") || exists("image-layer") {
 		t.Fatalf("cleanup retained the stopped environment: %s %s", result.status, result.errMsg)
 	}
 	if _, err := os.Stat(workspace); !os.IsNotExist(err) {
@@ -174,7 +188,7 @@ inspect)
     *'.Mounts'*) printf '[{"Destination":"/workspace","Source":"/vm/guest/workspace"}]\n' ;;
     *'.Id'*) cat "$s/id" ;;
     *'agentflow.workspace'*) cat "$s/label" ;;
-    *'.Config.Image'*) echo fixture-image ;;
+    *'.Config.Image'*) cat "$s/image" 2>/dev/null || echo fixture-image ;;
     *) exit 1 ;;
   esac
   ;;
@@ -198,6 +212,14 @@ exec)
   esac
   ;;
 image|pull) exit 0 ;;
+commit) cp "$s/layer" "$s/image-layer" ;;
+rmi) rm -f "$s/image-layer" ;;
+create)
+  test ! -f "$s/id" || { echo 'fixture container name in use' >&2; exit 1; }
+  for arg; do case "$arg" in agentflow-tmp-*) echo "$arg" >"$s/image"; cp "$s/image-layer" "$s/layer" ;; esac; done
+  echo replacement-container >"$s/id"
+  echo "$AF_TEST_PARK_WORKSPACE" >"$s/label"
+  ;;
 run) test -f "$s/running"; touch "$s/browser" ;;
 rm)
   case "$last" in

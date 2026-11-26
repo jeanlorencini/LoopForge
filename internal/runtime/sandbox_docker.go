@@ -897,11 +897,24 @@ func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
 	if s.started && !recreate {
 		return nil
 	}
+	layerImage := ""
 	if s.retainedContainerID != "" {
-		if recreate {
-			return fmt.Errorf("Docker sandbox %s retains run data. Recover its workspace before replacing the container", s.name)
+		if !recreate {
+			return s.resume(ctx)
 		}
-		return s.resume(ctx)
+		// New mounts (a conversation opening the run workspace) need a new
+		// container. Commit the parked writable layer so its run data survives.
+		layerImage = tempDockerImageName(s.id)
+		id, err := s.containerForResume(ctx)
+		if err != nil && !dockerImageExists(ctx, layerImage) {
+			return err
+		}
+		// Without a container, an earlier replacement already committed the layer.
+		if err == nil {
+			if out, err := exec.CommandContext(ctx, "docker", "commit", id, layerImage).CombinedOutput(); err != nil {
+				return fmt.Errorf("save Docker sandbox %s before replacing it: %w: %s", s.name, err, strings.TrimSpace(string(out)))
+			}
+		}
 	}
 	s.started = false
 	name, workspace, p := s.name, s.workspace, s.profile
@@ -922,12 +935,13 @@ func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
 			}
 		}
 	}
-	built, err := ensureDockerImage(ctx, workspace, s.dockerfile)
-	if err != nil {
-		return err
+	image := layerImage
+	if image == "" {
+		if image, err = ensureDockerImage(ctx, workspace, s.dockerfile); err != nil {
+			return err
+		}
 	}
-	image := built
-	args := []string{"create", "--name", name, "--init", "--cap-drop=ALL", "--security-opt", "no-new-privileges", "--label", DockerWorkspaceLabel + "=" + workspace, "-v", workspace + ":/workspace"}
+	args :=[]string{"create", "--name", name, "--init", "--cap-drop=ALL", "--security-opt", "no-new-privileges", "--label", DockerWorkspaceLabel + "=" + workspace, "-v", workspace + ":/workspace"}
 	// Native installs own private (0700) workspaces as the service user.
 	// A root image without DAC capabilities cannot access another UID's bind.
 	// Run default/root images as that user; retain explicit non-root image users.
@@ -978,7 +992,8 @@ func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
 	if p.ReadOnlyRootFS {
 		args = append(args, "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m")
 	}
-	if image == isolatedRuntimeImage(s.dockerfile) {
+	// docker commit keeps the old container's entrypoint and command.
+	if layerImage != "" || image == isolatedRuntimeImage(s.dockerfile) {
 		args = append(args, "--entrypoint", "sh", image, "-lc", "trap : TERM INT; sleep infinity & wait")
 	} else {
 		args = append(args, image, "sh", "-lc", "trap : TERM INT; sleep infinity & wait")
@@ -990,16 +1005,22 @@ func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
 			return err
 		}
 	}
-	s.builtImage = built
+	// Close and workspace cleanup remove a layer image. A failed replacement
+	// keeps it below, so the next attempt starts from it again.
+	s.builtImage = image
 	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
-		dropEphemeralDockerImage(s.builtImage)
-		s.builtImage = ""
+		if layerImage == "" {
+			dropEphemeralDockerImage(s.builtImage)
+			s.builtImage = ""
+		}
 		return fmt.Errorf("docker create: %w: %s", err, out)
 	}
 	if out, err := exec.CommandContext(ctx, "docker", "start", name).CombinedOutput(); err != nil {
 		_ = exec.CommandContext(ctx, "docker", "rm", "-f", name).Run()
-		dropEphemeralDockerImage(s.builtImage)
-		s.builtImage = ""
+		if layerImage == "" {
+			dropEphemeralDockerImage(s.builtImage)
+			s.builtImage = ""
+		}
 		return fmt.Errorf("docker start: %w: %s", err, out)
 	}
 	if err := waitDockerWorkspaceReady(ctx, name); err != nil {
@@ -1007,6 +1028,7 @@ func (s *dockerSandbox) start(ctx context.Context, recreate bool) error {
 		s.started = false
 		return err
 	}
+	s.retainedContainerID, s.parked = "", false
 	s.started = true
 	return nil
 }
